@@ -63,19 +63,21 @@ interface ResponseMessage {
     error?: string;
 }
 
-interface ActorEventEmitMessage {
-    type: 'EVENT';
-    eventName: string;
+interface ActorBroadcastEmitMessage {
+    type: 'BROADCAST' | 'EVENT'; // EVENT kept as legacy alias
+    broadcastName?: string;
+    eventName?: string; // legacy alias
     args: any;
     worldId?: string;
 }
 
-interface ActorEventBroadcastMessage {
-    type: 'ACTOR_EVENT';
+interface ActorBroadcastMessage {
+    type: 'ACTOR_BROADCAST' | 'ACTOR_EVENT'; // ACTOR_EVENT kept as legacy alias
     actorName: string;
     actorId?: string;
     worldId: string;
-    eventName: string;
+    broadcastName?: string;
+    eventName?: string; // legacy alias
     args: any;
     timestamp: string;
 }
@@ -201,18 +203,25 @@ class Actor {
     }
 
     /**
-     * Emit an ad-hoc event from this actor to agents in the same world.
+     * Emit an ad-hoc broadcast from this actor to agents in the same world.
      * Intended to be called when authenticated as this actor.
      */
-    event(eventName: string, args: any): void {
-        this.vitrus.emitActorEvent(this.name, eventName, args);
+    broadcast(broadcastName: string, args: any): void {
+        this.vitrus.emitActorBroadcast(this.name, broadcastName, args);
     }
 
     /**
-     * Listen for ad-hoc events from this actor (agent-side handle).
+     * Legacy alias for broadcast().
      */
-    listen(eventName: string, handler: (args: any) => void): Actor {
-        this.vitrus.registerActorEventHandler(this.name, eventName, handler);
+    event(eventName: string, args: any): void {
+        this.broadcast(eventName, args);
+    }
+
+    /**
+     * Listen for ad-hoc broadcasts from this actor (agent-side handle).
+     */
+    listen(broadcastName: string, handler: (args: any) => void): Actor {
+        this.vitrus.registerActorBroadcastHandler(this.name, broadcastName, handler);
         this.vitrus.ensureConnectedAsAgent();
         return this;
     }
@@ -309,13 +318,15 @@ class Vitrus {
     private actorCommandHandlers: Map<string, Map<string, Function>> = new Map();
     private actorCommandSignatures: Map<string, Map<string, Array<string>>> = new Map();
     private actorMetadata: Map<string, any> = new Map();
-    private actorEventHandlers: Map<string, Map<string, Function[]>> = new Map();
+    private actorBroadcastHandlers: Map<string, Map<string, Function[]>> = new Map();
     private baseUrl: string;
     private debug: boolean;
     private actorName?: string;
     private connectionPromise: Promise<void> | null = null;
     private _connectionReject: ((reason?: any) => void) | null = null; // To store the reject of connectionPromise
     private redisChannel?: string;
+    private static _instances = new Set<Vitrus>();
+    private static _cleanupHooksInstalled = false;
 
     // WebSocket readyState constants
     private static readonly OPEN = 1;
@@ -340,6 +351,32 @@ class Vitrus {
             console.log(`[Vitrus v${SDK_VERSION}] Initializing with options:`, { apiKey, world, baseUrl, debug });
         }
         // Don't connect automatically - wait for authenticate() or explicit connect()
+
+        Vitrus._instances.add(this);
+        this.installCleanupHooks();
+    }
+
+    private installCleanupHooks(): void {
+        // Only in Node/Bun
+        if (Vitrus._cleanupHooksInstalled) return;
+        if (typeof process === 'undefined' || typeof (process as any).on !== 'function') return;
+        Vitrus._cleanupHooksInstalled = true;
+
+        const shutdown = () => {
+            for (const inst of Vitrus._instances) {
+                try {
+                    inst.close();
+                } catch {
+                    // ignore
+                }
+            }
+        };
+
+        // Best-effort cleanup on exit signals.
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+        process.on('beforeExit', shutdown);
+        process.on('exit', shutdown);
     }
 
     /**
@@ -735,8 +772,8 @@ class Vitrus {
             return;
         }
 
-        if (type === 'ACTOR_EVENT') {
-            this.handleActorEvent(message as ActorEventBroadcastMessage);
+        if (type === 'ACTOR_BROADCAST' || type === 'ACTOR_EVENT') {
+            this.handleActorBroadcast(message as ActorBroadcastMessage);
             return;
         }
 
@@ -799,10 +836,12 @@ class Vitrus {
         }
     }
 
-    private handleActorEvent(message: ActorEventBroadcastMessage): void {
-        const { actorName, eventName, args } = message;
-        const byActor = this.actorEventHandlers.get(actorName);
-        const handlers = byActor?.get(eventName) || [];
+    private handleActorBroadcast(message: ActorBroadcastMessage): void {
+        const { actorName, args } = message;
+        const broadcastName = message.broadcastName || message.eventName || '';
+        if (!broadcastName) return;
+        const byActor = this.actorBroadcastHandlers.get(actorName);
+        const handlers = byActor?.get(broadcastName) || [];
         for (const handler of handlers) {
             try {
                 handler(args);
@@ -819,14 +858,14 @@ class Vitrus {
         });
     }
 
-    emitActorEvent(actorName: string, eventName: string, args: any): void {
+    emitActorBroadcast(actorName: string, broadcastName: string, args: any): void {
         if (!this.authenticated || this.actorName !== actorName) {
-            if (this.debug) console.log(`[Vitrus] Not emitting event '${eventName}' - not authenticated as actor '${actorName}'.`);
+            if (this.debug) console.log(`[Vitrus] Not broadcasting '${broadcastName}' - not authenticated as actor '${actorName}'.`);
             return;
         }
-        const msg: ActorEventEmitMessage = { type: 'EVENT', eventName, args };
+        const msg: ActorBroadcastEmitMessage = { type: 'BROADCAST', broadcastName, eventName: broadcastName, args };
         this.sendMessage(msg).catch((e) => {
-            if (this.debug) console.log('[Vitrus] Failed to send EVENT:', e);
+            if (this.debug) console.log('[Vitrus] Failed to send BROADCAST:', e);
         });
     }
 
@@ -939,15 +978,20 @@ class Vitrus {
         actorSignatures.set(commandName, parameterTypes);
     }
 
+    registerActorBroadcastHandler(actorName: string, broadcastName: string, handler: Function): void {
+        if (!this.actorBroadcastHandlers.has(actorName)) {
+            this.actorBroadcastHandlers.set(actorName, new Map());
+        }
+        const byName = this.actorBroadcastHandlers.get(actorName)!;
+        if (!byName.has(broadcastName)) {
+            byName.set(broadcastName, []);
+        }
+        byName.get(broadcastName)!.push(handler);
+    }
+
+    // Backwards-compatible alias
     registerActorEventHandler(actorName: string, eventName: string, handler: Function): void {
-        if (!this.actorEventHandlers.has(actorName)) {
-            this.actorEventHandlers.set(actorName, new Map());
-        }
-        const byEvent = this.actorEventHandlers.get(actorName)!;
-        if (!byEvent.has(eventName)) {
-            byEvent.set(eventName, []);
-        }
-        byEvent.get(eventName)!.push(handler);
+        this.registerActorBroadcastHandler(actorName, eventName, handler);
     }
 
     /**
@@ -1181,6 +1225,17 @@ class Vitrus {
                 console.log(`[Vitrus] disconnectIfActor: WebSocket for '${actorName}' not open or available. No action taken.`);
             }
         }
+    }
+
+    /**
+     * Close the underlying WebSocket (agent or actor).
+     */
+    close(): void {
+        if (this.ws && this.ws.readyState === Vitrus.OPEN) {
+            if (this.debug) console.log('[Vitrus] Closing WebSocket...');
+            this.ws.close();
+        }
+        Vitrus._instances.delete(this);
     }
 }
 
