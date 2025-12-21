@@ -147,6 +147,20 @@ const resp = await actor.run("walk", {
 });
 ```
 
+## Actor → Agent events
+
+Ad-hoc events let an **actor** notify **agents** about local state changes.
+
+```ts
+// actor side
+actor.event("voice_activity", { data: true });
+
+// agent side
+actor.listen("voice_activity", (args) => {
+  console.log("voice activity:", args);
+});
+```
+
 ---
 
 # How Vitrus works internally

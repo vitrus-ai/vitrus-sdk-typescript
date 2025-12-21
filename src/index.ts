@@ -63,6 +63,23 @@ interface ResponseMessage {
     error?: string;
 }
 
+interface ActorEventEmitMessage {
+    type: 'EVENT';
+    eventName: string;
+    args: any;
+    worldId?: string;
+}
+
+interface ActorEventBroadcastMessage {
+    type: 'ACTOR_EVENT';
+    actorName: string;
+    actorId?: string;
+    worldId: string;
+    eventName: string;
+    args: any;
+    timestamp: string;
+}
+
 interface RegisterCommandMessage {
     type: 'REGISTER_COMMAND';
     actorName: string;
@@ -184,6 +201,23 @@ class Actor {
     }
 
     /**
+     * Emit an ad-hoc event from this actor to agents in the same world.
+     * Intended to be called when authenticated as this actor.
+     */
+    event(eventName: string, args: any): void {
+        this.vitrus.emitActorEvent(this.name, eventName, args);
+    }
+
+    /**
+     * Listen for ad-hoc events from this actor (agent-side handle).
+     */
+    listen(eventName: string, handler: (args: any) => void): Actor {
+        this.vitrus.registerActorEventHandler(this.name, eventName, handler);
+        this.vitrus.ensureConnectedAsAgent();
+        return this;
+    }
+
+    /**
      * Get actor metadata
      */
     getMetadata(): any {
@@ -275,6 +309,7 @@ class Vitrus {
     private actorCommandHandlers: Map<string, Map<string, Function>> = new Map();
     private actorCommandSignatures: Map<string, Map<string, Array<string>>> = new Map();
     private actorMetadata: Map<string, any> = new Map();
+    private actorEventHandlers: Map<string, Map<string, Function[]>> = new Map();
     private baseUrl: string;
     private debug: boolean;
     private actorName?: string;
@@ -700,6 +735,11 @@ class Vitrus {
             return;
         }
 
+        if (type === 'ACTOR_EVENT') {
+            this.handleActorEvent(message as ActorEventBroadcastMessage);
+            return;
+        }
+
         // --- Handle RESPONSE from Actor --- 
         if (type === 'RESPONSE') {
             const { requestId, result, error } = message as ResponseMessage;
@@ -757,6 +797,37 @@ class Vitrus {
         for (const handler of handlers) {
             handler(message);
         }
+    }
+
+    private handleActorEvent(message: ActorEventBroadcastMessage): void {
+        const { actorName, eventName, args } = message;
+        const byActor = this.actorEventHandlers.get(actorName);
+        const handlers = byActor?.get(eventName) || [];
+        for (const handler of handlers) {
+            try {
+                handler(args);
+            } catch (e) {
+                console.error('[Vitrus] Error in actor event handler:', e);
+            }
+        }
+    }
+
+    ensureConnectedAsAgent(): void {
+        if (this.authenticated) return;
+        this.authenticate().catch((e) => {
+            if (this.debug) console.log('[Vitrus] Failed to auto-authenticate as agent for listen():', e);
+        });
+    }
+
+    emitActorEvent(actorName: string, eventName: string, args: any): void {
+        if (!this.authenticated || this.actorName !== actorName) {
+            if (this.debug) console.log(`[Vitrus] Not emitting event '${eventName}' - not authenticated as actor '${actorName}'.`);
+            return;
+        }
+        const msg: ActorEventEmitMessage = { type: 'EVENT', eventName, args };
+        this.sendMessage(msg).catch((e) => {
+            if (this.debug) console.log('[Vitrus] Failed to send EVENT:', e);
+        });
     }
 
     private handleCommand(message: CommandMessage): void {
@@ -866,6 +937,17 @@ class Vitrus {
         }
         const actorSignatures = this.actorCommandSignatures.get(actorName)!;
         actorSignatures.set(commandName, parameterTypes);
+    }
+
+    registerActorEventHandler(actorName: string, eventName: string, handler: Function): void {
+        if (!this.actorEventHandlers.has(actorName)) {
+            this.actorEventHandlers.set(actorName, new Map());
+        }
+        const byEvent = this.actorEventHandlers.get(actorName)!;
+        if (!byEvent.has(eventName)) {
+            byEvent.set(eventName, []);
+        }
+        byEvent.get(eventName)!.push(handler);
     }
 
     /**
