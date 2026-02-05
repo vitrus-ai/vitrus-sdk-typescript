@@ -1,6 +1,6 @@
 {
   "name": "vitrus",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "description": "TypeScript client for interfacing with the Vitrus SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
