@@ -37,6 +37,5 @@
     "typescript": "^5.0.0",
     "ws": "^8.0.0"
   },
-  "peerDependencies": {},
-  "optionalDependencies": {}
+  "dependencies": {}
 }

@@ -21,6 +21,10 @@ npm install vitrus
 bun add vitrus
 ```
 
+## Communication
+
+Agent–actor traffic (commands, responses, broadcasts, events) uses **Zenoh** as the core transport. The client connects to the DAO over WebSocket once for handshake (API key, world ID) and receives `routerUrl`; all further communication uses Zenoh. The DAO must be started with `ZENOH_ROUTER_URL` set so the handshake returns the router URL.
+
 ## Authentication
 
 [Get an API Key](https://app.vitrus.ai)

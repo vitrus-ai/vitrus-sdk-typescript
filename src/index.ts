@@ -1,8 +1,11 @@
 /**
  * Vitrus SDK
- * 
- * A TypeScript client for interfacing with the Vitrus WebSocket server.
- * Provides an Actor/Agent communication model with workflow orchestration.
+ *
+ * TypeScript client for the Vitrus DAO. Actor/Agent communication model with workflow orchestration.
+ *
+ * Communication: All agent–actor traffic (commands, responses, broadcasts, events) goes through
+ * the DAO WebSocket. No Zenoh in the TS SDK (avoids WASM/Node issues). Python SDK uses Zenoh
+ * for Python↔Python; DAO bridges WebSocket ↔ Zenoh for cross-language.
  */
 
 // Load version dynamically - avoiding JSON import which requires TypeScript config changes
@@ -21,12 +24,18 @@ try {
 }
 
 // Types for message handling
+type ClientType = 'actor' | 'agent' | 'unknown';
+
 interface HandshakeMessage {
     type: 'HANDSHAKE';
-    apiKey: string;
+    clientType?: ClientType;
     worldId?: string;
+    apiKey: string;
     actorName?: string;
+    actorId?: string;
+    registeredCommands?: Array<{ name: string; parameterTypes: Array<string> }>;
     metadata?: any; // Actor metadata for registration
+    agentName?: string;
 }
 
 interface HandshakeResponseMessage {
@@ -35,8 +44,13 @@ interface HandshakeResponseMessage {
     clientId: string;
     userId?: string;
     error_code?: string;
-    redisChannel?: string;
     message?: string;
+    routerUrl?: string;
+    /** WebSocket endpoint for Zenoh (TS SDK uses this to avoid WASM) */
+    routerUrlWs?: string;
+    actorId?: string;
+    serverIp?: string;
+    worldExists?: boolean;
     actorInfo?: {
         metadata: any;
         registeredCommands: Array<{
@@ -48,17 +62,22 @@ interface HandshakeResponseMessage {
 
 interface CommandMessage {
     type: 'COMMAND';
-    targetActorName: string;
+    senderType: ClientType;
+    senderName: string;
+    targetType: ClientType | 'broadcast';
+    targetName?: string;
     commandName: string;
     args: any;
     requestId: string;
     sourceChannel?: string; // Channel to reply to
+    worldId?: string;
 }
 
 interface ResponseMessage {
     type: 'RESPONSE';
     targetChannel: string;
     requestId: string;
+    commandId: string;
     result?: any;
     error?: string;
 }
@@ -70,8 +89,8 @@ interface RegisterCommandMessage {
     parameterTypes: Array<string>; // Array of parameter types
 }
 
-interface WorkflowMessage {
-    type: 'WORKFLOW';
+interface WorkflowInvocationMessage {
+    type: 'WORKFLOW_INVOCATION';
     workflowName: string;
     args: any;
     requestId: string;
@@ -107,6 +126,31 @@ interface WorkflowDefinition {
     function: OpenAITool; // Use OpenAITool
 }
 
+// --- Get Actor Info (from Supabase via DAO) ---
+interface GetActorInfoMessage {
+    type: 'GET_ACTOR_INFO';
+    worldId: string;
+    actorName: string;
+    requestId: string;
+}
+
+interface GetActorInfoResponseMessage {
+    type: 'GET_ACTOR_INFO_RESPONSE';
+    requestId: string;
+    actor?: {
+        id: string;
+        name: string;
+        world_id: string;
+        info: any;
+        device_id: string | null;
+        state: string;
+        created_at: string;
+        updated_at: string;
+        registeredCommands?: Array<{ name: string; parameterTypes: Array<string> }>;
+    };
+    error?: string;
+}
+
 // --- Workflow Listing Messages ---
 interface ListWorkflowsMessage {
     type: 'LIST_WORKFLOWS';
@@ -118,6 +162,21 @@ interface WorkflowListMessage {
     requestId: string;
     workflows?: WorkflowDefinition[]; // Use WorkflowDefinition[]
     error?: string;
+}
+
+interface ActorBroadcastEmitMessage {
+    type: 'BROADCAST' | 'EVENT';
+    eventName?: string;
+    broadcastName?: string;
+    args: any;
+}
+
+interface ActorBroadcastMessage {
+    type: 'ACTOR_BROADCAST' | 'ACTOR_EVENT';
+    actorName: string;
+    eventName?: string;
+    broadcastName?: string;
+    args: any;
 }
 
 // Utility for extracting parameter types from function signatures
@@ -141,18 +200,47 @@ function getParameterTypes(func: Function): Array<string> {
     });
 }
 
+/** Supabase-backed actor record (id, info, device_id, state, etc.) */
+export interface ActorRecord {
+    id: string;
+    name: string;
+    world_id: string;
+    info: any;
+    device_id?: string | null;
+    state: string;
+    created_at: string;
+    updated_at: string;
+    registeredCommands?: Array<{ name: string; parameterTypes: Array<string> }>;
+}
+
 // Actor/Player class
 class Actor {
     private vitrus: Vitrus;
-    private name: string;
+    private _name: string;
     private metadata: any;
     private commandHandlers: Map<string, Function> = new Map();
+    /** Supabase actor record (id, info, device_id, state, etc.) when fetched via actor(name) as agent */
+    private record: ActorRecord | null = null;
 
-    constructor(vitrus: Vitrus, name: string, metadata: any = {}) {
+    constructor(vitrus: Vitrus, name: string, metadata: any = {}, record?: ActorRecord | null) {
         this.vitrus = vitrus;
-        this.name = name;
-        this.metadata = metadata;
+        this._name = name;
+        this.metadata = record?.info != null ? { ...record.info, ...metadata } : metadata;
+        this.record = record ?? null;
     }
+
+    /** Actor name (always set) */
+    get name(): string { return this._name; }
+    /** Actor ID from Supabase (when fetched via actor(name)) */
+    get id(): string | undefined { return this.record?.id; }
+    /** Actor info/metadata from Supabase */
+    get info(): any { return this.record?.info ?? this.metadata; }
+    /** Associated device ID from Supabase */
+    get deviceId(): string | null | undefined { return this.record?.device_id; }
+    /** Actor state from Supabase (e.g. connected, disconnected) */
+    get state(): string | undefined { return this.record?.state; }
+    /** Registered commands from DAO/Supabase */
+    get registeredCommands(): Array<{ name: string; parameterTypes: Array<string> }> | undefined { return this.record?.registeredCommands; }
 
     /**
      * Register a command handler
@@ -164,13 +252,13 @@ class Actor {
         const parameterTypes = getParameterTypes(handler);
 
         // Register with Vitrus (local handler map)
-        this.vitrus.registerActorCommandHandler(this.name, commandName, handler, parameterTypes);
+        this.vitrus.registerActorCommandHandler(this._name, commandName, handler, parameterTypes);
 
         // Register command with server *only if* currently connected as this actor
-        if (this.vitrus.getIsAuthenticated() && this.vitrus.getActorName() === this.name) {
-            this.vitrus.registerCommand(this.name, commandName, parameterTypes);
+        if (this.vitrus.getIsAuthenticated() && this.vitrus.getActorName() === this._name) {
+            this.vitrus.registerCommand(this._name, commandName, parameterTypes);
         } else if (this.vitrus.getDebug()) {
-            console.log(`[Vitrus SDK - Actor.on] Not sending REGISTER_COMMAND for ${commandName} on ${this.name} as SDK is not authenticated as this actor.`);
+            console.log(`[Vitrus SDK - Actor.on] Not sending REGISTER_COMMAND for ${commandName} on ${this._name} as SDK is not authenticated as this actor.`);
         }
 
         return this;
@@ -180,7 +268,30 @@ class Actor {
      * Run a command on an actor
      */
     async run(commandName: string, ...args: any[]): Promise<any> {
-        return this.vitrus.runCommand(this.name, commandName, args);
+        return this.vitrus.runCommand(this._name, commandName, args);
+    }
+
+    /**
+     * Broadcast an event to all agents subscribed to this actor's event (actor-side only).
+     * Call when connected as this actor.
+     */
+    async broadcast(eventName: string, data: any): Promise<void> {
+        return this.vitrus.broadcastActorEvent(this._name, eventName, data);
+    }
+
+    /**
+     * Subscribe to this actor's broadcast events (agent-side). Callback receives event data.
+     */
+    event(eventName: string, callback: (data: any) => void): Actor {
+        this.vitrus.subscribeActorEvent(this._name, eventName, callback);
+        return this;
+    }
+
+    /**
+     * Alias for event(). Subscribe to this actor's broadcasts (agent-side). e.g. actor.listen('telemetry', (data) => { ... })
+     */
+    listen(eventName: string, callback: (data: any) => void): Actor {
+        return this.event(eventName, callback);
     }
 
     /**
@@ -262,7 +373,7 @@ interface EventEmitter {
     readonly readyState: number;
 }
 
-// Main Vitrus class
+/** Vitrus client. All agent/actor traffic over DAO WebSocket (no Zenoh in TS). */
 class Vitrus {
     private ws: EventEmitter | null = null;
     private apiKey: string;
@@ -278,9 +389,12 @@ class Vitrus {
     private baseUrl: string;
     private debug: boolean;
     private actorName?: string;
+    private actorIds: Map<string, string> = new Map();
+    private actorEventListeners: Map<string, Map<string, Function[]>> = new Map(); // actorName -> eventName -> callbacks
     private connectionPromise: Promise<void> | null = null;
     private _connectionReject: ((reason?: any) => void) | null = null; // To store the reject of connectionPromise
-    private redisChannel?: string;
+    private serverIp?: string;
+    private worldExists?: boolean;
 
     // WebSocket readyState constants
     private static readonly OPEN = 1;
@@ -302,7 +416,7 @@ class Vitrus {
         this.debug = debug;
 
         if (this.debug) {
-            console.log(`[Vitrus v${SDK_VERSION}] Initializing with options:`, { apiKey, world, baseUrl, debug });
+            console.log(`[Vitrus v${SDK_VERSION}] Initializing with options:`, { apiKey: '***', world, baseUrl, debug });
         }
         // Don't connect automatically - wait for authenticate() or explicit connect()
     }
@@ -368,11 +482,17 @@ class Vitrus {
             if (this.debug) console.log('[Vitrus] Connected to WebSocket server (onopen)');
             
             // Send HANDSHAKE message
+            const registeredCommands = this.actorName
+                ? this.getRegisteredCommands(this.actorName)
+                : undefined;
             const handshakeMsg: HandshakeMessage = {
                 type: 'HANDSHAKE',
+                clientType: this.actorName ? 'actor' : 'agent',
                 apiKey: this.apiKey,
                 worldId: this.worldId,
                 actorName: this.actorName,
+                actorId: this.actorName ? this.actorIds.get(this.actorName) : undefined,
+                registeredCommands,
                 metadata: this.actorName ? this.actorMetadata.get(this.actorName) : undefined
             };
             if (this.debug) console.log('[Vitrus] Sending HANDSHAKE message:', handshakeMsg);
@@ -531,8 +651,16 @@ class Vitrus {
                     const response = message as HandshakeResponseMessage;
                     if (response.success) {
                         this.clientId = response.clientId;
-                        this.redisChannel = response.redisChannel;
                         this.authenticated = true;
+                        if (response.actorId && this.actorName) {
+                            this.actorIds.set(this.actorName, response.actorId);
+                        }
+                        if (response.serverIp) {
+                            this.serverIp = response.serverIp;
+                        }
+                        if (typeof response.worldExists === 'boolean') {
+                            this.worldExists = response.worldExists;
+                        }
 
                         // If actor info was included, restore it
                         if (response.actorInfo && this.actorName) {
@@ -665,8 +793,17 @@ class Vitrus {
             const response = message as HandshakeResponseMessage;
             if (response.success) {
                 this.clientId = response.clientId;
-                this.redisChannel = response.redisChannel;
                 this.authenticated = true;
+                if (response.actorId && this.actorName) {
+                    this.actorIds.set(this.actorName, response.actorId);
+                }
+                if (response.serverIp) {
+                    this.serverIp = response.serverIp;
+                }
+                if (typeof response.worldExists === 'boolean') {
+                    this.worldExists = response.worldExists;
+                }
+                if (this.debug) console.log('[Vitrus] Agent/actor communication: WebSocket (DAO)');
 
                 // Process actor info if available
                 if (response.actorInfo && this.actorName) {
@@ -693,30 +830,35 @@ class Vitrus {
             return;
         }
 
-        // Handle command from another client
+        // COMMAND: actor receives from DAO over WebSocket
         if (type === 'COMMAND') {
-            if (this.debug) console.log('[Vitrus] Received command:', message);
-            this.handleCommand(message);
+            this.handleCommand(message as CommandMessage);
             return;
         }
-
-        // --- Handle RESPONSE from Actor --- 
+        // RESPONSE: agent receives from DAO over WebSocket (result of runCommand)
         if (type === 'RESPONSE') {
-            const { requestId, result, error } = message as ResponseMessage;
-            if (this.debug) console.log(`[Vitrus] Received response for requestId: ${requestId}`, { result, error });
-
-            const pending = this.pendingRequests.get(requestId);
+            const resp = message as ResponseMessage;
+            const pending = this.pendingRequests.get(resp.requestId);
             if (pending) {
-                if (error) {
-                    pending.reject(new Error(error));
-                } else {
-                    pending.resolve(result); // Resolve the promise from actor.run()
-                }
-                this.pendingRequests.delete(requestId);
+                this.pendingRequests.delete(resp.requestId);
+                if (resp.error) pending.reject(new Error(resp.error));
+                else pending.resolve(resp.result);
             }
             return;
         }
-        // --- End Handle RESPONSE ---
+        // ACTOR_BROADCAST: agent receives from DAO over WebSocket (actor event)
+        if (type === 'ACTOR_BROADCAST' || type === 'ACTOR_EVENT') {
+            const actorName = message.actorName;
+            const eventName = message.eventName ?? message.broadcastName;
+            const data = message.args ?? {};
+            const callbacks = this.actorEventListeners.get(actorName)?.get(eventName) ?? [];
+            for (const cb of callbacks) {
+                try { cb(data); } catch (err) {
+                    if (this.debug) console.log('[Vitrus] Actor event callback error:', err);
+                }
+            }
+            return;
+        }
 
         // Handle workflow results
         if (type === 'WORKFLOW_RESULT') {
@@ -752,6 +894,18 @@ class Vitrus {
             return;
         }
 
+        // Handle get actor info response (Supabase-backed actor record)
+        if (type === 'GET_ACTOR_INFO_RESPONSE') {
+            const resp = message as GetActorInfoResponseMessage;
+            const pending = this.pendingRequests.get(resp.requestId);
+            if (pending) {
+                this.pendingRequests.delete(resp.requestId);
+                if (resp.error) pending.reject(new Error(resp.error));
+                else pending.resolve(resp.actor ?? null);
+            }
+            return;
+        }
+
         // Handle custom messages
         const handlers = this.messageHandlers.get(type) || [];
         for (const handler of handlers) {
@@ -760,11 +914,21 @@ class Vitrus {
     }
 
     private handleCommand(message: CommandMessage): void {
-        const { commandName, args, requestId, targetActorName, sourceChannel } = message;
+        const { commandName, args, requestId, targetType, targetName, sourceChannel } = message;
+        const resolvedActorName = targetType === 'actor'
+            ? targetName
+            : targetType === 'broadcast'
+                ? this.actorName
+                : (message as any).targetActorName;
 
-        if (this.debug) console.log('[Vitrus] Handling command:', { commandName, targetActorName, requestId });
+        if (!resolvedActorName) {
+            if (this.debug) console.log('[Vitrus] Ignoring command without actor target:', { targetType, targetName });
+            return;
+        }
 
-        const actorHandlers = this.actorCommandHandlers.get(targetActorName);
+        if (this.debug) console.log('[Vitrus] Handling command:', { commandName, targetType, targetName: resolvedActorName, requestId });
+
+        const actorHandlers = this.actorCommandHandlers.get(resolvedActorName);
         if (actorHandlers) {
             const handler = actorHandlers.get(commandName);
             if (handler) {
@@ -778,6 +942,7 @@ class Vitrus {
                             type: 'RESPONSE',
                             targetChannel: sourceChannel || '',
                             requestId,
+                            commandId: requestId,
                             result,
                         });
                     })
@@ -787,6 +952,7 @@ class Vitrus {
                             type: 'RESPONSE',
                             targetChannel: sourceChannel || '',
                             requestId,
+                            commandId: requestId,
                             error: error.message,
                         });
                     });
@@ -794,7 +960,7 @@ class Vitrus {
                 console.log('[Vitrus] No handler found for command:', commandName);
             }
         } else if (this.debug) {
-            console.log('[Vitrus] No actor found with name:', targetActorName);
+            console.log('[Vitrus] No actor found with name:', resolvedActorName);
         }
     }
 
@@ -868,11 +1034,69 @@ class Vitrus {
         actorSignatures.set(commandName, parameterTypes);
     }
 
+    private getRegisteredCommands(actorName: string): Array<{ name: string; parameterTypes: Array<string> }> {
+        const signatures = this.actorCommandSignatures.get(actorName);
+        if (!signatures) {
+            return [];
+        }
+        return Array.from(signatures.entries()).map(([name, parameterTypes]) => ({ name, parameterTypes }));
+    }
+
+    /**
+     * Actor broadcasts an event to subscribed agents (actor-side). Sent to DAO over WebSocket.
+     */
+    async broadcastActorEvent(actorName: string, eventName: string, data: any): Promise<void> {
+        if (!this.authenticated || this.actorName !== actorName) {
+            throw new Error('Must be authenticated as this actor to broadcast');
+        }
+        const payload = {
+            type: 'ACTOR_BROADCAST',
+            actorName,
+            eventName,
+            args: data ?? {},
+            worldId: this.worldId,
+        };
+        await this.sendMessage(payload);
+        if (this.debug) console.log('[Vitrus] Broadcast via WebSocket (event=' + eventName + ')');
+    }
+
+    /**
+     * Agent subscribes to an actor's event (agent-side). Sent to DAO over WebSocket; DAO forwards ACTOR_BROADCAST to this client.
+     */
+    subscribeActorEvent(actorName: string, eventName: string, callback: (data: any) => void): void {
+        if (!this.actorEventListeners.has(actorName)) {
+            this.actorEventListeners.set(actorName, new Map());
+        }
+        const eventMap = this.actorEventListeners.get(actorName)!;
+        const list = eventMap.get(eventName) ?? [];
+        list.push(callback);
+        eventMap.set(eventName, list);
+        this.sendMessage({ type: 'SUBSCRIBE_ACTOR_EVENT', actorName, eventName }).catch(() => {});
+    }
+
     /**
      * Create or get an actor
      * If options (metadata) are provided, connects and authenticates as this actor.
      * If only name is provided, returns a handle for an agent to interact with.
      */
+    /** Fetch actor record from DAO/Supabase (id, info, device_id, state, registeredCommands). Agent-only. */
+    async getActorInfo(actorName: string): Promise<ActorRecord | null> {
+        if (!this.worldId) throw new Error('Vitrus SDK requires a worldId to fetch actor info.');
+        if (!this.authenticated) await this.authenticate();
+        const requestId = this.generateRequestId();
+        const msg: GetActorInfoMessage = { type: 'GET_ACTOR_INFO', worldId: this.worldId, actorName, requestId };
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.delete(requestId)) reject(new Error('GET_ACTOR_INFO timeout'));
+            }, 10000);
+            this.pendingRequests.set(requestId, {
+                resolve: (r: ActorRecord | null) => { clearTimeout(timeout); resolve(r); },
+                reject: (e: Error) => { clearTimeout(timeout); reject(e); }
+            });
+            this.sendMessage(msg).catch((e) => { this.pendingRequests.delete(requestId); clearTimeout(timeout); reject(e); });
+        });
+    }
+
     async actor(name: string, options?: any): Promise<Actor> {
         if (this.debug) console.log('[Vitrus] Creating/getting actor handle:', name, options);
 
@@ -881,12 +1105,24 @@ class Vitrus {
             throw new Error('Vitrus SDK requires a worldId to create/authenticate as an actor.');
         }
 
-        // Store actor metadata immediately if provided
+        // When options provided, set actor name before first connect so handshake is sent as actor
         if (options !== undefined) {
             this.actorMetadata.set(name, options);
+            this.actorName = name;
         }
 
-        const actor = new Actor(this, name, options !== undefined ? options : {});
+        let record: ActorRecord | null = null;
+        // Fetch actor record only in agent mode (when options undefined). In actor mode skip to start fast.
+        if (this.worldId && options === undefined) {
+            if (!this.authenticated) await this.authenticate();
+            try {
+                record = await this.getActorInfo(name);
+            } catch (e) {
+                if (this.debug) console.log(`[Vitrus] Could not fetch actor info for ${name}:`, e);
+            }
+        }
+
+        const actor = new Actor(this, name, options !== undefined ? options : {}, record);
 
         // If options are provided (even an empty object), it implies intent to *be* this actor,
         // so authenticate (and wait for it) if necessary.
@@ -932,25 +1168,42 @@ class Vitrus {
         }
 
         const requestId = this.generateRequestId();
-
+        if (this.debug) {
+            console.log('[Vitrus] Sending command via WebSocket (actor=' + actorName + ', command=' + commandName + ')');
+        }
+        const command: CommandMessage = {
+            type: 'COMMAND',
+            senderType: 'agent',
+            senderName: this.clientId || 'agent',
+            targetType: 'actor',
+            targetName: actorName,
+            commandName,
+            args,
+            requestId,
+            worldId: this.worldId
+        };
         return new Promise((resolve, reject) => {
-            this.pendingRequests.set(requestId, { resolve, reject });
-
-            const command: CommandMessage = {
-                type: 'COMMAND',
-                targetActorName: actorName,
-                commandName,
-                args,
-                requestId,
-                // worldId needs to be added to CommandMessage if DAO requires it
-            };
-
-            this.sendMessage(command)
-                .catch((error) => {
-                    if (this.debug) console.log('[Vitrus] Failed to send command:', error);
-                    this.pendingRequests.delete(requestId);
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.delete(requestId)) {
+                    reject(new Error('Command timeout'));
+                }
+            }, 30000);
+            this.pendingRequests.set(requestId, {
+                resolve: (r: any) => {
+                    clearTimeout(timeout);
+                    resolve(r);
+                },
+                reject: (e: Error) => {
+                    clearTimeout(timeout);
+                    reject(e);
+                }
+            });
+            this.sendMessage(command).catch((error) => {
+                if (this.pendingRequests.delete(requestId)) {
+                    clearTimeout(timeout);
                     reject(error);
-                });
+                }
+            });
         });
     }
 
@@ -975,8 +1228,8 @@ class Vitrus {
         return new Promise((resolve, reject) => {
             this.pendingRequests.set(requestId, { resolve, reject });
 
-            const workflow: WorkflowMessage = {
-                type: 'WORKFLOW',
+            const workflow: WorkflowInvocationMessage = {
+                type: 'WORKFLOW_INVOCATION',
                 workflowName,
                 args,
                 requestId,
