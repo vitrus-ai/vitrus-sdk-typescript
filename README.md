@@ -13,7 +13,7 @@ npm install vitrus
 ```ts
 import Vitrus from "vitrus";
 
-const droid = await Vitrus.Droid.connect("VTRS-R05-2607-ABCDZ", {
+const droid = await Vitrus.Droid.connect("VTRS-R06-2607-R2D2X", {
   apiKey: process.env.VITRUS_API_KEY!,
 });
 
