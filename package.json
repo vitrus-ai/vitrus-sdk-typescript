@@ -32,7 +32,7 @@
     "ai-actors"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "LicenseRef-Vitrus-Internal-Research-1.0",
   "devDependencies": {
     "bun-types": "latest",
     "typescript": "^5.0.0",

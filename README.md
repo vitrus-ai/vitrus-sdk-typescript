@@ -39,3 +39,9 @@ await droid.motion.sendTargets(
 ```
 
 Control requires an authorized API key and a lease. The Vitrus service validates commands before the robot receives them.
+
+## License
+
+Vitrus and its affiliates may use this SDK commercially. Other recipients may
+use it only for non-commercial research. Commercial use by another organization
+requires written permission from Vitrus. See [LICENSE](LICENSE).

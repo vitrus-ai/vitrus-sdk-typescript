@@ -1,21 +1,68 @@
-MIT License
+VITRUS INTERNAL AND RESEARCH LICENSE
+Version 1.0 — July 2026
 
-Copyright (c) 2025 Vitrus
+Copyright (c) 2026 Vitrus. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Definitions
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+"Software" means this repository and its source code, documentation, examples,
+and associated files.
+
+"Vitrus" means Vitrus and its controlled affiliates.
+
+"Research Use" means non-commercial use solely to conduct, reproduce, validate,
+or publish academic or non-commercial research. Research Use excludes operation
+of a production service, provision of a service to a third party, internal
+business operations, commercial product development, commercialization, or use
+for the benefit of a for-profit organization other than Vitrus.
+
+2. License Grant
+
+(a) Vitrus Use. Vitrus grants Vitrus and its controlled affiliates a worldwide,
+royalty-free license to use, copy, modify, distribute, and create derivative
+works of the Software for internal and commercial purposes.
+
+(b) Research Use. Subject to this License, Vitrus grants all other recipients a
+non-exclusive, non-transferable, revocable license to use, copy, and modify the
+Software solely for Research Use.
+
+3. Restrictions
+
+Except as expressly permitted in Section 2, no recipient may:
+
+- use the Software for commercial purposes;
+- use the Software in a product, service, hosted offering, or production system;
+- sell, license, sublicense, distribute, or make the Software available to a
+  third party;
+- use the Software for the benefit of a for-profit organization other than
+  Vitrus;
+- remove or alter copyright, trademark, or license notices; or
+- represent that Vitrus endorses the recipient or its work.
+
+A commercial license for organizations other than Vitrus requires prior written
+permission from Vitrus.
+
+4. Research Attribution
+
+Public research outputs that materially use the Software must include the
+following attribution: "Uses the Vitrus SDK under the Vitrus Internal and
+Research License."
+
+5. Ownership
+
+Vitrus retains all right, title, and interest in the Software and all associated
+intellectual property rights. No trademark license is granted by this License.
+
+6. Termination
+
+This License terminates automatically if a recipient breaches its terms. Upon
+termination, the recipient must stop using and delete all copies of the Software
+under its control.
+
+7. Disclaimer
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW, VITRUS
+WILL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE
+SOFTWARE OR THIS LICENSE.
