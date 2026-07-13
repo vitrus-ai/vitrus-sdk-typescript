@@ -1,5 +1,38 @@
 # Vitrus
 
+## Droids
+
+`Vitrus.Droid` is the device-first API for connecting an application to a
+registered Vitrus robot. Use a serial number and an organization API key.
+
+```ts
+import Vitrus from "vitrus";
+
+const droid = await Vitrus.Droid.connect("VTRS-R05-2607-ABCDZ", {
+  apiKey: process.env.VITRUS_API_KEY!,
+});
+
+const identity = await droid.identity.get();
+const description = await droid.description.get();
+const telemetry = await droid.telemetry.snapshot();
+const frame = await droid.camera.getFrame("head_camera");
+```
+
+Control requires an API key with the appropriate scope and a short-lived lease:
+
+```ts
+const lease = await droid.control.acquire({ durationMs: 5_000 });
+
+await droid.motion.sendTargets(
+  [{ jointName: "ARM_JOINT", displayDeg: 5 }],
+  { leaseId: lease.id },
+);
+```
+
+The service validates every command before it reaches the robot. No hardware
+protocols, internal networking details, or device implementation are exposed by
+the SDK.
+
 [![latest version](https://badgen.net/npm/v/vitrus?label=latest)](https://www.npmjs.com/package/vitrus)
 [![install size](https://badgen.net/packagephobia/install/vitrus?label=npm+install)](https://packagephobia.now.sh/result?p=vitrus)
 [![NPM downloads weekly](https://badgen.net/npm/dw/vitrus?label=npm+downloads&color=purple)](https://www.npmjs.com/package/vitrus)
@@ -23,7 +56,7 @@ bun add vitrus
 
 ## Communication
 
-Agent–actor traffic (commands, responses, broadcasts, events) uses **Zenoh** as the core transport. The client connects to the DAO over WebSocket once for handshake (API key, world ID) and receives `routerUrl`; all further communication uses Zenoh. The DAO must be started with `ZENOH_ROUTER_URL` set so the handshake returns the router URL.
+Agent–actor traffic (commands, responses, broadcasts, events) uses **Websockets** as the core transport. The client connects to AI agents over WebSocket once for handshake (API key, world ID).
 
 ## Authentication
 
@@ -42,8 +75,6 @@ const vitrus = new Vitrus({
 
 # Workflows
 
-**Workflows** have a similar schema as AI tools, so it connects perfectly with [OpenAI function Calling](https://platform.openai.com/docs/guides/function-calling?api-mode=chat). Making Workflows great to compose complex physical tasks with AI Agents. The following is a simple example of how to run a workflow:
-
 ```typescript
 // running a basic workflow
 const result = await vitrus.workflow("hello-world", {
@@ -53,7 +84,7 @@ const result = await vitrus.workflow("hello-world", {
 console.log(result);
 ```
 
-Workflows are executed in Cloud GPUs (e.g. `Nvidia A100`), and combine multiple AI models for complex tasks.
+Workflows are processed in server-side GPUs (e.g. `Nvidia A100`), and are custom per server.
 
 ## Available Workflows
 
@@ -63,37 +94,6 @@ We are continously updating the available workflows, and keeping them up to date
 const workflows = vitrus.list_workflows();
 console.log(workflows);
 ```
-
-<details><summary>Example JSON Response</summary>
-
-```json
-[
-  {
-    "type": "function",
-    "function": {
-      "name": "perception-encoder",
-      "description": "Encodes perception data based on specified parameters.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "inputData": {
-            "type": "object",
-            "description": "The raw data to encode.",
-            "additionalProperties": true
-          },
-          "encodingType": {
-            "type": "string",
-            "description": "The encoding method to use (e.g., 'base64', 'json')."
-          }
-        },
-        "required": ["inputData"]
-      }
-    }
-  }
-]
-```
-
-</details>
 
 <br/>
 
@@ -107,29 +107,32 @@ import Vitrus from "vitrus";
 // Initialize the client
 const vitrus = new Vitrus({
   apiKey: "your-api-key",
-  baseUrl: "ws://localhost:3001", //hosted Vitrus URL
+ // baseUrl: "ws://<dao-server>:<port>" defines an alternate server
 });
 ```
 
-## Actors
+## Actors actions
 
 ```ts
 import Vitrus from "vitrus";
 
 const vitrus = new Vitrus({
   apiKey: "<your-api-key>",
-  world: "<world-id>",
+  world: "<selected-world-id>",
 });
 
 const actor = await vitrus.actor("forest", {
-  human: "Tom Hanks",
-  eyes: "green",
+  droid: "r2d2",
+  weapon: "that little electric thing!",
+  purpose: `find Luke to give him the princess' hologram message about the death star`
 });
 
 actor.on("walk", (args: any) => {
   console.log("received", args);
-  return "run forest, run!";
+  return "I roll";
 });
+
+actor.broadcast("status" , { alive: true });
 ```
 
 ## Agents

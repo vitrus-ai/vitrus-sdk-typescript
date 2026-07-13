@@ -1,3 +1,7 @@
+import { Droid } from './droid.js';
+
+export * from './droid.js';
+
 /**
  * Vitrus SDK
  *
@@ -375,6 +379,11 @@ interface EventEmitter {
 
 /** Vitrus client. All agent/actor traffic over DAO WebSocket (no Zenoh in TS). */
 class Vitrus {
+    /**
+     * Modern device-first API. It intentionally does not use the legacy
+     * DAO actor protocol: Droid requests target the Vitrus data plane.
+     */
+    static readonly Droid = Droid;
     private ws: EventEmitter | null = null;
     private apiKey: string;
     private worldId?: string;
