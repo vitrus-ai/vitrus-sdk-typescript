@@ -27,6 +27,30 @@ console.log(await droid.telemetry.snapshot());
 const frame = await droid.camera.getFrame("head_camera");
 ```
 
+## Read camera calibration
+
+```ts
+const calibration = await droid.camera.getCalibration("head_camera");
+
+if (calibration) {
+  console.log(calibration.calibrated);
+  console.log(calibration.intrinsics?.matrix);
+  console.log(calibration.intrinsics?.distortion);
+  console.log(calibration.intrinsics?.rectifiedMatrix);
+  console.log(calibration.extrinsics?.parentFrame);
+  console.log(calibration.extrinsics?.translationM);
+  console.log(calibration.extrinsics?.rotationQuaternionXyzw);
+}
+```
+
+`getCalibration()` combines the live VitrusOS camera calibration with the camera
+entry in the active Clay robot description. When available, intrinsics include
+the calibrated `K`, fisheye `D`, rectified `new_K`, image size, reprojection
+error, and checkerboard metadata. Extrinsics include the parent robot frame,
+translation in meters, and XYZW quaternion. Fields that have not been published
+by VitrusOS are left undefined. The method returns `null` when no calibration or
+camera-description metadata exists.
+
 ## Request motion
 
 ```ts
