@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Droid } from "./droid.js";
+import { Droid } from "./droid-live.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -155,5 +155,147 @@ describe("Droid camera calibration", () => {
     });
 
     expect(await droid.camera.getCalibration("uncalibrated")).toBeNull();
+  });
+});
+
+describe("Droid realtime and control sessions", () => {
+  test("sends motion with the Golden Dora joint-target contract", async () => {
+    let command: Record<string, unknown> | null = null;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          displayName: "R-06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/v1/droids/control/joint-targets") {
+        command = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({ requestId: "1", status: "queued", route: "relay" });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+    });
+    await droid.motion.sendTargets(
+      [{ jointName: "LEFT_ELBOW", displayDeg: 12, maxVelocityDegS: 30 }],
+      { leaseId: "lease-1", timeoutMs: 400 },
+    );
+
+    expect(command).toMatchObject({
+      schema: "vitrus.control.joint_targets",
+      schema_version: "0.1.0",
+      robot_id: "droid-1",
+      lease_id: "lease-1",
+      sequence: 1,
+      ttl_ms: 400,
+      safety: { requires_calibration: true, respect_limits: true },
+      targets: [{ joint_name: "LEFT_ELBOW", position_deg: 12, velocity_deg_s: 30 }],
+    });
+  });
+
+  test("lists registered droids using the configured API key", async () => {
+    let authorization = "";
+    globalThis.fetch = async (_input, init) => {
+      authorization = new Headers(init?.headers).get("authorization") ?? "";
+      return jsonResponse([{
+        id: "droid-1",
+        serialNumber: "VTRS-R06-2607-R2D2X",
+        model: "R06",
+        displayName: "Assembly R-06",
+        organizationId: "org-1",
+        status: "online",
+        enrollmentState: "enrolled",
+      }]);
+    };
+
+    const droids = await Droid.list({ apiKey: "test-key", endpoint: "https://relay.test" });
+
+    expect(authorization).toBe("Bearer test-key");
+    expect(droids[0].serialNumber).toBe("VTRS-R06-2607-R2D2X");
+  });
+
+  test("lists robot devices from the deployed Bridge compatibility contract", async () => {
+    const requestedPaths: string[] = [];
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      requestedPaths.push(url.pathname);
+      if (url.pathname === "/v1/droids") return jsonResponse({ detail: "Not Found" }, 404);
+      if (url.pathname === "/devices") return jsonResponse({ devices: [
+        { id: "device-r06", key: "r06-edge", name: "R-06 Factory", kind: "robot", status: "online", metadata: { serialNumber: "VTRS-R06-2607-R2D2X" } },
+        { id: "device-gpu", key: "gpu-box", name: "GPU Box", kind: "computer", status: "online", metadata: {} },
+      ] });
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droids = await Droid.list({ apiKey: "test-key", endpoint: "https://vitrus-dataplane.onrender.com" });
+
+    expect(requestedPaths).toEqual(["/v1/droids", "/devices"]);
+    expect(droids).toHaveLength(1);
+    expect(droids[0]).toMatchObject({ id: "device-r06", serialNumber: "VTRS-R06-2607-R2D2X", status: "online" });
+  });
+
+  test("uses typed media sessions and complete lease lifecycle", async () => {
+    const requests: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      requests.push({ method: init?.method ?? "GET", path: url.pathname, body });
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      if (url.pathname === "/v1/droids/cameras/sessions" && init?.method === "POST") {
+        return jsonResponse({ id: "media-1", droidId: "droid-1", camera: "head_camera", expiresAt: "2026-07-16T01:00:00Z", transport: "webrtc", route: "relay", offerUrl: "https://relay.test/offer", iceServers: [{ urls: ["turn:turn.test"] }] });
+      }
+      if (url.pathname === "/v1/droids/control/leases" && init?.method === "POST") return jsonResponse({ id: "lease-1", droidId: "droid-1", owner: body.owner, expiresAt: "2026-07-16T01:00:00Z" });
+      if (url.pathname.endsWith("/renew")) return jsonResponse({ id: "lease-1", droidId: "droid-1", owner: "clay-test", expiresAt: "2026-07-16T01:00:10Z" });
+      if (init?.method === "DELETE") return jsonResponse({ closed: true, released: true });
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", { apiKey: "test-key", endpoint: "https://relay.test", clientId: "clay-test" });
+    const media = await droid.camera.openSession("head_camera");
+    expect(media.transport).toBe("webrtc");
+    expect(media.iceServers?.[0].urls).toEqual(["turn:turn.test"]);
+    await droid.camera.closeSession(media.id);
+    const lease = await droid.control.acquire({ durationMs: 5_000 });
+    expect(lease.owner).toBe("clay-test");
+    await droid.control.renew(lease.id, { durationMs: 5_000 });
+    await droid.control.release(lease.id);
+    expect(requests.some((request) => request.method === "DELETE" && request.path.includes("media-1"))).toBe(true);
+    expect(requests.some((request) => request.method === "DELETE" && request.path.includes("lease-1"))).toBe(true);
+  });
+
+  test("filters Bridge realtime telemetry to the connected droid", async () => {
+    class FakeSocket extends EventTarget {
+      sent: string[] = [];
+      send(value: string) { this.sent.push(value); }
+      close() { this.dispatchEvent(new CloseEvent("close")); }
+      emit(type: string, data?: unknown) {
+        this.dispatchEvent(type === "message" ? new MessageEvent(type, { data: JSON.stringify(data) }) : new Event(type));
+      }
+    }
+    const socket = new FakeSocket();
+    globalThis.fetch = async () => jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      webSocketFactory: () => socket as unknown as WebSocket,
+    });
+    const received: string[] = [];
+    const subscription = await droid.telemetry.subscribe((telemetry) => received.push(String(telemetry.raw.robot)));
+    socket.emit("open");
+    socket.emit("message", { type: "droid.telemetry", droid: { id: "other", serialNumber: "VTRS-R05-2607-ABCDZ" }, telemetry: { robot: "other" } });
+    socket.emit("message", { type: "droid.telemetry", droid: { id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" }, telemetry: { schema: "vitrus.telemetry.state.v1", timestamp: "2026-07-16T00:00:00Z", robot: "R-06" } });
+    expect(received).toEqual(["R-06"]);
+    expect(JSON.parse(socket.sent[0])).toEqual({ type: "subscribe", topics: ["droids"] });
+    subscription.close();
+    expect(subscription.state).toBe("closed");
   });
 });

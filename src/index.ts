@@ -1,6 +1,8 @@
-import { Droid } from './droid.js';
+import { Droid } from './droid-live.js';
 
-export * from './droid.js';
+export * from './droid-live.js';
+export * from './contracts.js';
+export * from './golden-edge.js';
 
 /**
  * Vitrus SDK
