@@ -3,6 +3,7 @@ import { Droid } from './droid-live.js';
 export * from './droid-live.js';
 export * from './contracts.js';
 export * from './golden-edge.js';
+export * from './zenoh-edge.js';
 
 /**
  * Vitrus SDK

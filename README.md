@@ -44,6 +44,35 @@ await droid.motion.sendTargets(
 
 Control requires an authorized API key and a lease. The Vitrus service validates commands before the robot receives them.
 
+The default Web/JS control path is the authenticated Bridge. The Bridge and the VitrusOS relay use Zenoh behind the API boundary, so browser clients never need robot IPs or Zenoh endpoints.
+
+For low-latency local control, configure the Golden Edge gateway explicitly:
+
+```ts
+const droid = await Vitrus.Droid.connect("VTRS-<MODEL>-<YYMM>-<UNIQUE_ID>", {
+  apiKey: process.env.VITRUS_API_KEY!,
+  endpoint: "https://vitrus-dataplane.onrender.com",
+  edgeEndpoint: "http://r05-edge:8782",
+  motionTransport: "edge",
+});
+```
+
+This keeps identity and leases on the Bridge while publishing the canonical joint-target contract directly to the edge gateway. Edge mode is opt-in and does not silently retry through the Bridge, preventing duplicate motion commands when the gateway response is ambiguous.
+
+For a Zenoh Remote API WebSocket on the edge, use the same control contract with a persistent Zenoh session:
+
+```ts
+const droid = await Vitrus.Droid.connect("VTRS-<MODEL>-<YYMM>-<UNIQUE_ID>", {
+  apiKey: process.env.VITRUS_API_KEY!,
+  endpoint: "https://vitrus-dataplane.onrender.com",
+  motionTransport: "zenoh",
+  zenohEndpoint: "ws://r05-edge:7448",
+  zenohTopic: "vitrus/servo/targets",
+});
+```
+
+Zenoh is loaded lazily, so Bridge and Dora users do not initialize the Zenoh WASM runtime. The edge Remote API must be enabled separately; the R-05 currently exposes the native Zenoh peer/router on TCP `7447` and the existing Python Zenoh-to-motor bridge.
+
 ## License
 
 Vitrus and its affiliates may use this SDK commercially. Other recipients may

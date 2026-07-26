@@ -184,6 +184,7 @@ describe("Droid realtime and control sessions", () => {
     const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
       apiKey: "test-key",
       endpoint: "https://relay.test",
+      motionTransport: "bridge",
     });
     await droid.motion.sendTargets(
       [{ jointName: "LEFT_ELBOW", displayDeg: 12, maxVelocityDegS: 30 }],
@@ -200,6 +201,83 @@ describe("Droid realtime and control sessions", () => {
       safety: { requires_calibration: true, respect_limits: true },
       targets: [{ joint_name: "LEFT_ELBOW", position_deg: 12, velocity_deg_s: 30 }],
     });
+  });
+
+  test("sends motion through the explicit local Golden Edge transport", async () => {
+    const requestedPaths: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      requestedPaths.push(url.pathname);
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          displayName: "R-06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/api/dora/joint-targets") {
+        const command = JSON.parse(String(init?.body)) as { sequence: number };
+        return jsonResponse({ ok: true, transport: "dora", stream: "joint_targets", sequence: command.sequence });
+      }
+      return jsonResponse({ detail: "unexpected bridge request" }, 500);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      edgeEndpoint: "http://r06-edge:8782",
+      motionTransport: "edge",
+    });
+    const result = await droid.motion.sendTargets(
+      [{ jointName: "NECK_HEAD", displayDeg: 5 }],
+      { leaseId: "lease-1", timeoutMs: 250 },
+    );
+    const second = await droid.motion.sendTargets(
+      [{ jointName: "NECK_HEAD", displayDeg: 6 }],
+      { leaseId: "lease-1", timeoutMs: 250 },
+    );
+
+    expect(result).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
+    expect(second.requestId).toBe("2");
+    expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/joint-targets", "/api/dora/joint-targets"]);
+  });
+
+  test("publishes motion through a persistent Zenoh session", async () => {
+    const published: Array<{ topic: string; payload: Record<string, unknown> }> = [];
+    let opens = 0;
+    globalThis.fetch = async (input) => {
+      if (new URL(String(input)).pathname === "/v1/droids/resolve") {
+        return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      }
+      return jsonResponse({ detail: "unexpected bridge request" }, 500);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      motionTransport: "zenoh",
+      zenohEndpoint: "ws://r05-edge:7448",
+      zenohSessionFactory: async () => {
+        opens += 1;
+        return {
+          put: async (topic, payload) => published.push({ topic, payload: JSON.parse(payload) }),
+          close: async () => undefined,
+        };
+      },
+    });
+
+    const first = await droid.motion.sendTargets([{ jointName: "NECK_HEAD", displayDeg: 5 }], { leaseId: "lease-1" });
+    const second = await droid.motion.sendTargets([{ jointName: "NECK_HEAD", displayDeg: 6 }], { leaseId: "lease-1" });
+
+    expect(opens).toBe(1);
+    expect(first).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
+    expect(second.requestId).toBe("2");
+    expect(published).toHaveLength(2);
+    expect(published[0]).toMatchObject({ topic: "vitrus/servo/targets", payload: { lease_id: "lease-1", seq: 1, target: { joint_name: "NECK_HEAD", display_deg: 5 } } });
   });
 
   test("lists registered droids using the configured API key", async () => {

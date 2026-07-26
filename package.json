@@ -38,5 +38,7 @@
     "typescript": "^5.0.0",
     "ws": "^8.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@eclipse-zenoh/zenoh-ts": "^1.9.0"
+  }
 }

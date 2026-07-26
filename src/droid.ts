@@ -1,4 +1,6 @@
 import { createJointTargetsMessage, type ControlJointTargetsMessage } from "./contracts.js";
+import { GoldenEdgeClient } from "./golden-edge.js";
+import { ZenohEdgeClient, type ZenohEdgeSession } from "./zenoh-edge.js";
 
 export type DroidRef = string | { serialNumber?: string; droidId?: string; alias?: string };
 
@@ -10,6 +12,7 @@ export type DroidIdentity = {
   organizationId: string;
   status: "online" | "offline" | "degraded" | "unknown";
   enrollmentState: "manufactured" | "unclaimed" | "claiming" | "enrolled" | "transferring" | "suspended" | "retired";
+  transports?: Record<string, unknown>;
 };
 
 export type DroidDescription = {
@@ -148,10 +151,17 @@ export type DroidConnectionOptions = {
   apiKey: string;
   relayUrl?: string;
   endpoint?: string;
+  edgeEndpoint?: string;
+  motionTransport?: "bridge" | "edge" | "zenoh";
+  zenohEndpoint?: string;
+  zenohTopic?: string;
+  zenohSessionFactory?: () => Promise<ZenohEdgeSession>;
   timeoutMs?: number;
   clientId?: string;
   webSocketFactory?: (url: string) => WebSocket;
 };
+
+const DEFAULT_ZENOH_WS_ENDPOINT = "ws://127.0.0.1:7448";
 
 function cleanUrl(url: string): string {
   return url.replace(/\/+$/, "");
@@ -237,11 +247,16 @@ export class Droid {
 
   private sequence = 0;
   private identityCache: DroidIdentity | null = null;
+  private edgeClient: GoldenEdgeClient | null = null;
+  private edgeLeaseId: string | null = null;
+  private zenohClient: ZenohEdgeClient | null = null;
+  private zenohLeaseId: string | null = null;
   private readonly clientId: string;
 
   private constructor(private readonly ref: DroidRef, private readonly options: DroidConnectionOptions) {
     this.clientId = options.clientId?.trim() || `vitrus-sdk-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
     this.identity = { get: async () => {
+      if (this.identityCache) return this.identityCache;
       const identity = await this.get<DroidIdentity>("/v1/droids/resolve");
       this.identityCache = identity;
       return identity;
@@ -392,6 +407,52 @@ export class Droid {
         ...(target.maxVelocityDegS == null ? {} : { velocity_deg_s: target.maxVelocityDegS }),
       })),
     });
+    const motionTransport = this.options.motionTransport ?? "bridge";
+    if (motionTransport === "edge") {
+      if (!this.options.edgeEndpoint) {
+        throw new Error("Droid edge motion transport requires edgeEndpoint");
+      }
+      if (!this.edgeClient) {
+        this.edgeClient = new GoldenEdgeClient({
+          endpoint: this.options.edgeEndpoint,
+          robotId: identity.id,
+          leaseId: request.leaseId,
+          source: command.source,
+        });
+        this.edgeLeaseId = request.leaseId;
+      } else if (this.edgeLeaseId !== request.leaseId) {
+        this.edgeClient.setLease(request.leaseId);
+        this.edgeLeaseId = request.leaseId;
+      }
+      const result = await this.edgeClient.publish(command);
+      return {
+        requestId: String(result.sequence ?? command.sequence),
+        status: "acknowledged",
+        route: "local",
+        result: result as unknown as Record<string, unknown>,
+      };
+    }
+    if (motionTransport === "zenoh") {
+      const zenohEndpoint = this.options.zenohEndpoint
+        ?? zenohTransportEndpoint(identity.transports)
+        ?? DEFAULT_ZENOH_WS_ENDPOINT;
+      if (!this.zenohClient) {
+        this.zenohClient = new ZenohEdgeClient({
+          endpoint: zenohEndpoint,
+          topic: this.options.zenohTopic,
+          sessionFactory: this.options.zenohSessionFactory,
+          robotId: identity.id,
+          leaseId: request.leaseId,
+          source: command.source,
+        });
+        this.zenohLeaseId = request.leaseId;
+      } else if (this.zenohLeaseId !== request.leaseId) {
+        this.zenohClient.setLease(request.leaseId);
+        this.zenohLeaseId = request.leaseId;
+      }
+      const result = await this.zenohClient.publish(command);
+      return { requestId: String(result.sequence), status: "acknowledged", route: "local", result };
+    }
     return this.post<DroidCommandResult>("/v1/droids/control/joint-targets", command);
   }
 
@@ -464,4 +525,13 @@ export class Droid {
       clearTimeout(timeout);
     }
   }
+}
+
+function zenohTransportEndpoint(transports: Record<string, unknown> | undefined): string | undefined {
+  if (!transports) return undefined;
+  for (const key of ["zenohWs", "zenoh_ws", "zenohWebSocket", "zenoh_websocket"]) {
+    const value = transports[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
 }
