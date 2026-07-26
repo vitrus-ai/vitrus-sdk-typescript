@@ -1,0 +1,146 @@
+## Conversion Process: Vitrus TypeScript SDK to Python SDK
+
+This document outlines the process undertaken to convert the Vitrus SDK from its original TypeScript implementation to a new Python version, suitable for publishing on PyPI.
+
+**Phase 1: Understanding the TypeScript SDK (`vitrus-sdk`)**
+
+The first crucial step was to thoroughly understand the existing TypeScript SDK's functionality, structure, and public API. This involved:
+
+1.  **Reviewing `package.json`:**
+    *   **Purpose:** To identify dependencies, build processes, entry points, and general package information.
+    *   **Key Findings:**
+        *   Package name: `vitrus`.
+        *   Build tool: `tsc` (TypeScript Compiler).
+        *   Main entry points: `dist/index.js` (compiled JavaScript) and `dist/index.d.ts` (TypeScript definition file). This indicated source code likely resided in an `src/` directory.
+        *   Dependencies: Notably, the `ws` package for WebSocket communication.
+
+2.  **Analyzing `README.md`:**
+    *   **Purpose:** To grasp the SDK's public API from a user's perspective and understand its core use cases.
+    *   **Key Functionalities Identified:**
+        *   **Initialization:** `new Vitrus({ apiKey, baseUrl, worldId })`. The `apiKey` was mandatory. `baseUrl` hinted at a configurable WebSocket server URL (defaulting to a production one, with a local option `ws://localhost:3001`). `worldId` was used for actor-specific interactions.
+        *   **Workflows:**
+            *   `vitrus.workflow(workflowName, params)`: For executing cloud-based workflows.
+            *   `vitrus.list_workflows()`: For discovering available workflows.
+        *   **Actors & Agents (World-based interactions):**
+            *   `vitrus.actor(actorName, initialArgs?)`: To connect to or define an actor, returning an `actor` object.
+            *   `actor.on(eventName, callback)`: For an actor to listen to incoming messages/commands and potentially respond.
+            *   `actor.run(eventName, args)`: For an "agent" to send messages/commands to an actor and receive a response.
+        *   **Inference:** The `baseUrl` starting with `ws://` or `wss://` and the actor interaction model (`on`/`run`) strongly suggested a WebSocket-based communication protocol for the core real-time functionalities.
+
+3.  **Inspecting Source Code Structure (`src/`):**
+    *   A directory listing of `vitrus-sdk/src/` revealed that the primary client-side logic was consolidated within a single file: `index.ts`.
+
+4.  **Deep Dive into `src/index.ts`:**
+    *   **Purpose:** To understand the internal implementation details.
+    *   **Key Architectural Insights:**
+        *   **`Vitrus` Class:** The central class managing the WebSocket connection, authentication (handshake with `apiKey`, `worldId`, `actorName`), message routing (using `requestId` to correlate requests and responses), and state (pending requests, actor command handlers, metadata).
+        *   **`Actor` Class:** A wrapper around a `Vitrus` instance, specific to an actor's identity. It handled local registration of command handlers (`on()`) and dispatching commands (`run()`).
+        *   **`Scene` Class:** Appeared to be a planned feature, less developed in terms of server interaction based on the provided code snippets.
+        *   **Communication Protocol:** JSON-based messages over WebSockets, distinguished by a `type` field (e.g., `HANDSHAKE`, `COMMAND`, `RESPONSE`, `WORKFLOW`, `LIST_WORKFLOWS`).
+        *   **Workflow Implementation:** Workflow-related methods (`workflow()`, `list_workflows()`) also operated over the main WebSocket connection, not a separate HTTP endpoint as initially hypothesized.
+        *   **Asynchronous Nature:** Extensive use of `async/await` for non-blocking operations.
+        *   **Actor Identity:** The SDK could connect either as a generic "agent" or specifically *as* an actor (`vitrus.connect(actorName, metadata)`), which was important for how `actor.on()` registrations were communicated to the server.
+        *   **Helper Functions:** e.g., `getParameterTypes()` for inspecting function signatures (relevant for `REGISTER_COMMAND` messages).
+
+**Phase 2: Planning the Python SDK (`vitrus-sdk-python`)**
+
+With a solid understanding of the TypeScript version, the next phase involved planning the Python equivalent:
+
+1.  **Project Structure:**
+    *   A dedicated package directory: `vitrus/`.
+    *   Main SDK code within `vitrus/__init__.py` for easy import (`from vitrus import Vitrus`).
+    *   Packaging files: `setup.py` (for compatibility and initial setup) and `pyproject.toml` (for modern PEP 517/518 based builds and metadata).
+    *   Standard auxiliary files: `README.md` (adapted for Python), `LICENSE` (copied), and a Python-specific `.gitignore`.
+
+2.  **Core Classes and Functionality Mapping:**
+    *   **`Vitrus` Class (Python):**
+        *   Constructor: `__init__(self, api_key, world_id=None, base_url=DEFAULT_BASE_URL, debug=False, actor_name=None)`. `actor_name` was later primarily handled during the `connect()` method.
+        *   WebSocket Client: The `websockets` library was chosen as the Python equivalent to `ws`.
+        *   Methods: `connect()`, `disconnect()`, `workflow()`, `list_workflows()`, `actor()`, `run_command()`. Internal methods for message handling, authentication, pinging, etc.
+        *   State Management: Dictionaries for `_pending_requests` (mapping request IDs to `asyncio.Future` objects), `_actor_command_handlers`, `_actor_metadata_cache`.
+    *   **`Actor` Class (Python):**
+        *   Constructor: `__init__(self, vitrus_instance, name, metadata=None)`.
+        *   Methods: `on(self, command_name, handler)` (using Python's `inspect` module to get parameter names for `REGISTER_COMMAND`), `run(self, command_name, *args)`.
+    *   **Message Types:** Python dictionaries were used to represent the JSON message structures.
+    *   **Asynchronous Operations:** Python's `asyncio` library, along with `async/await` syntax, was a natural fit.
+
+**Phase 3: Implementation of the Python SDK**
+
+This phase involved writing the Python code:
+
+1.  **File Creation:**
+    *   `LICENSE`: Copied directly from the TypeScript SDK.
+    *   `README.md`: Adapted from the TypeScript version, with Python-specific installation instructions and usage examples.
+    *   `setup.py`: Created with basic package metadata (name, version, author, description, dependencies like `websockets`).
+    *   `vitrus/__init__.py`: This became the main file for the SDK logic.
+
+2.  **Core Logic in `vitrus/__init__.py`:**
+    *   **`Vitrus` Class Implementation:**
+        *   Initialization of attributes (API key, world ID, base URL, debug flags, WebSocket instance, state dictionaries).
+        *   `_generate_request_id()`: Using Python's `uuid` module.
+        *   **Connection Management (`connect`, `disconnect`):**
+            *   `connect(self, actor_name=None, metadata=None)`: Handles WebSocket connection establishment, including logic for switching actor contexts or connecting as an agent.
+            *   `_authenticate()`: Sends the `HANDSHAKE` message and awaits `HANDSHAKE_RESPONSE`. Manages an `asyncio.Future` for this.
+            *   `_listen_for_messages()`: An `async` task to continuously receive messages from the server in a loop.
+            *   `_send_ping_periodically()`: An `async` task to keep the WebSocket connection alive.
+            *   `disconnect()`: Closes the WebSocket connection and cleans up associated tasks.
+        *   **Message Handling:**
+            *   `_send_message(payload)`: Serializes the payload to JSON and sends it over the WebSocket. Includes basic reconnection attempt logic.
+            *   `_handle_message(message)`: Parses incoming JSON messages. Based on message `type`:
+                *   Resolves pending futures for `RESPONSE`, `WORKFLOW_RESULT`, `WORKFLOW_LIST`.
+                *   Handles `HANDSHAKE_RESPONSE` to update authentication status.
+                *   Dispatches `COMMAND` messages to `_handle_command_message()`.
+        *   **Actor and Command Logic:**
+            *   `actor(self, name, metadata=None)`: Returns an `Actor` instance, caching metadata if provided.
+            *   `run_command(self, target_actor_name, command_name, args)`: Sends a `COMMAND` message and manages a future for its response.
+            *   `register_actor_command_handler()`: Stores a handler locally.
+            *   `_register_command_on_server()`: Sends the `REGISTER_COMMAND` message to the server.
+            *   `_register_pending_commands()`: Called after successful authentication as an actor to register all its commands.
+            *   `_handle_command_message()`: Invokes the appropriate local actor command handler if the client is the target actor. It inspects the handler's signature to pass arguments correctly.
+        *   **Workflow Methods:**
+            *   `workflow(self, workflow_name, params)`: Sends a `WORKFLOW` message and manages a future.
+            *   `list_workflows(self)`: Sends a `LIST_WORKFLOWS` message and manages a future.
+        *   **Context Management:** `__aenter__` and `__aexit__` added for `async with` support.
+        *   **Logging:** Python's `logging` module was used for debug and informational messages.
+    *   **`Actor` Class Implementation:**
+        *   Stores reference to the `Vitrus` instance, its name, and metadata.
+        *   `on(command_name, handler)`: Validates handler is a coroutine, stores it, and calls `vitrus_instance.register_actor_command_handler()`. Uses `inspect.signature()` to get parameter names (as a substitute for TypeScript's richer type information for the `parameterTypes` field in `REGISTER_COMMAND`).
+        *   `run(command_name, args)`: Delegates to `vitrus_instance.run_command()`.
+        *   `update_metadata()`: Updates metadata locally and sends an `UPDATE_METADATA` message if connected as that actor.
+    *   **Example Usage:** An `if __name__ == '__main__':` block with an `example_main()` async function was included for basic testing of workflow listing/execution and conceptual actor/agent flow.
+
+**Phase 4: Packaging for PyPI (Iterative Process)**
+
+The goal was to make the SDK installable via `pip` and publishable on PyPI.
+
+1.  **Initial Packaging Files:**
+    *   `setup.py` was created early on.
+    *   `pyproject.toml`: Added later to adopt modern Python packaging standards (PEP 517/518).
+        *   `[build-system]`: Specified `setuptools>=61.0` and `wheel` as requirements, and `setuptools.build_meta` as the build backend.
+        *   `[project]`: Populated with metadata largely mirrored from `setup.py` (name, version, author, description, classifiers, dependencies, project URLs, readme, license).
+
+2.  **Build Process (`python -m build`):**
+    *   **Initial Error:** `BackendUnavailable: Cannot find module 'setuptools.build_meta'`. This was traced to an incorrect `backend-path = ["."]` in `pyproject.toml`, which was subsequently removed.
+    *   **License Warnings:** After fixing the backend path, the build process showed `SetuptoolsDeprecationWarning` messages related to the `license = { file = "LICENSE" }` table format and the `License :: OSI Approved :: MIT License` classifier. Setuptools recommended using a direct SPDX string for `license` and the `license-files` field.
+
+3.  **Upload Process (`twine upload`):**
+    *   **Initial Error (`--repository vitrus`):** `InvalidConfiguration: Missing 'vitrus' section from ~/.pypirc`. This was a user error in the command, intending `testpypi`.
+    *   **Persistent `license-file` Error:** `InvalidDistribution: Invalid distribution metadata: unrecognized or malformed field 'license-file'`. This occurred even after cleaning build artifacts and using `pyproject.toml`.
+    *   **Resolution:** The `pyproject.toml` was updated to strictly follow the newer setuptools recommendations for license metadata:
+        *   Changed `license = { file = "LICENSE" }` to `license = "MIT"` (SPDX identifier).
+        *   Added `license-files = ["LICENSE"]` to the `[project]` table.
+        *   Commented out the now-redundant `License :: OSI Approved :: MIT License` classifier.
+    *   After these changes, and ensuring a clean build directory, the package was structured correctly for `twine` to upload without the `license-file` metadata error.
+
+4.  **Tooling Updates:** Throughout the troubleshooting, packaging tools (`pip`, `setuptools`, `wheel`, `build`, `twine`) were upgraded to their latest versions to ensure compatibility and access to the latest features/fixes.
+
+**Phase 5: Key TypeScript-to-Python Adaptations**
+
+*   **Async Model:** TypeScript's `async/await` on `Promise`s mapped well to Python's `async/await` on `asyncio` coroutines and `Future`s.
+*   **WebSocket Client:** The `ws` library in Node.js was replaced by the `websockets` library in Python.
+*   **Type System:** TypeScript's static interfaces were translated to Python type hints (`typing` module). Runtime checks (`isinstance`) were used where appropriate. For `REGISTER_COMMAND`, where TypeScript could provide parameter types, Python used `inspect.signature(handler).parameters.keys()` to get parameter names as a practical alternative.
+*   **Error Handling:** `try...catch` blocks in TypeScript became `try...except` blocks in Python.
+*   **Module/Package System:** TypeScript's `import/export` became Python's `import` statements.
+*   **Environmental Variables:** `process.env` (Node.js) was replaced with `os.environ.get()`.
+
+This iterative process of understanding, planning, implementing, and refining the packaging allowed for the successful conversion of the Vitrus SDK to Python.

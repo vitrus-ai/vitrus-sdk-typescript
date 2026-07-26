@@ -97,6 +97,19 @@ dist
 # https://nextjs.org/blog/next-9-1#public-directory-support
 # public
 
+# Unified SDK workspace
+node_modules/
+dist/
+.DS_Store
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+coverage/
+site/
+benchmarks/output/
+
 # vuepress build output
 .vuepress/dist
 

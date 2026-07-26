@@ -1,0 +1,44 @@
+{
+  "name": "vitrus",
+  "version": "0.2.8",
+  "type": "module",
+  "description": "TypeScript client for interfacing with the Vitrus SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "browser": {
+    "ws": false
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test",
+    "prepublishOnly": "bun run build",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "vitrus",
+    "actors",
+    "agents",
+    "workflows",
+    "robotics",
+    "ai",
+    "ai-agents",
+    "ai-workflows",
+    "ai-actors",
+    "ai-agents",
+    "ai-workflows",
+    "ai-actors"
+  ],
+  "author": "",
+  "license": "LicenseRef-Vitrus-Internal-Research-1.0",
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.0.0",
+    "ws": "^8.0.0"
+  },
+  "dependencies": {
+    "@eclipse-zenoh/zenoh-ts": "^1.9.0"
+  }
+}

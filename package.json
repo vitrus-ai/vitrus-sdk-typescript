@@ -1,44 +1,15 @@
 {
-  "name": "vitrus",
-  "version": "0.2.8",
-  "type": "module",
-  "description": "TypeScript client for interfacing with the Vitrus SDK",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": [
-    "dist"
-  ],
-  "browser": {
-    "ws": false
-  },
+  "name": "@vitrus/sdk-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Unified Vitrus Droids SDK for TypeScript, Python, Web, LAN mesh and Bridge cloud transport.",
   "scripts": {
-    "build": "tsc",
-    "test": "bun test",
-    "prepublishOnly": "bun run build",
-    "dev": "tsc --watch"
-  },
-  "keywords": [
-    "vitrus",
-    "actors",
-    "agents",
-    "workflows",
-    "robotics",
-    "ai",
-    "ai-agents",
-    "ai-workflows",
-    "ai-actors",
-    "ai-agents",
-    "ai-workflows",
-    "ai-actors"
-  ],
-  "author": "",
-  "license": "LicenseRef-Vitrus-Internal-Research-1.0",
-  "devDependencies": {
-    "bun-types": "latest",
-    "typescript": "^5.0.0",
-    "ws": "^8.0.0"
-  },
-  "dependencies": {
-    "@eclipse-zenoh/zenoh-ts": "^1.9.0"
+    "build:typescript": "cd typescript && bun run build",
+    "test:typescript": "cd typescript && bun test",
+    "check:typescript": "cd typescript && bun run build && bun test",
+    "test:python": "PYTHONPATH=python python3 -m pytest python/tests -q",
+    "check:docs": "test -f docs/index.html && test -f docs/architecture.md",
+    "check": "bun run check:typescript && bun run test:python && bun run check:docs",
+    "docs:serve": "python3 -m http.server 4173 --directory docs"
   }
 }

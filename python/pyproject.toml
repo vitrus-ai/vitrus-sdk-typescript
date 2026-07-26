@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"] # setuptools is a common backend
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vitrus"
+version = "0.2.2" # Keep in sync with your setup.py or single-source it later
+authors = [
+    { name="Vitrus AI", email="support@vitrus.ai" },
+]
+description = "Python client for Vitrus multi-agent orchestration platform"
+readme = "README.md"
+requires-python = ">=3.7"
+license = "MIT"  # Use SPDX identifier
+license-files = ["LICENSE"] # Standard way to include the license file text
+keywords = ["vitrus", "actors", "agents", "workflows", "robotics", "ai", "ai-agents", "ai-workflows", "ai-actors", "multi-agent systems"]
+classifiers = [
+    "Development Status :: 3 - Alpha", # Or choose an appropriate status
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    # "License :: OSI Approved :: MIT License", # This classifier is now redundant due to SPDX license field
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "websockets>=10.0",
+    "eclipse-zenoh>=1.7.2",
+    "httpx>=0.24.0,<0.25.0",
+    # asyncio is part of the standard library, no need to list it here
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/vitrus-ai/vitrus-sdk-python" # Replace with actual URL if different
+"Documentation" = "https://vitrus.gitbook.io/docs/concepts"
+"Repository" = "https://github.com/vitrus-ai/vitrus-sdk-python" # Replace if different
+"Bug Tracker" = "https://github.com/vitrus-ai/vitrus-sdk-python/issues" # Replace if different
+
+# Optional: If you have command-line scripts
+# [project.scripts]
+# command-name = "vitrus.module:function"
+
+# Optional: For setuptools specific configurations if not covered by pyproject.toml's standard fields
+# [tool.setuptools]
+# packages = ["vitrus"] # Or find_packages in setup.py 
+# package-dir = {"" = "src"} # Example if using src layout
+# packages = find: # Example if using find directive within tool.setuptools
+# license-files = ["LICENSE"] # Could also be here if not in [project] 

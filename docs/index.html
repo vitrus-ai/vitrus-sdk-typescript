@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Vitrus Droids SDK documentation for Web, TypeScript, Python, Bridge and LAN Zenoh mesh.">
+  <title>Vitrus Droids SDK</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#top"><span class="brand-mark">V</span><span>Vitrus Droids SDK</span></a>
+    <nav aria-label="Primary navigation"><a href="#quickstart">Quickstart</a><a href="#architecture">Architecture</a><a href="#benchmarks">Benchmarks</a><a href="architecture.md">Full architecture</a><button id="theme" type="button" aria-label="Toggle color theme">◐</button></nav>
+  </header>
+  <main id="top">
+    <section class="hero"><div class="eyebrow">DROIDS SDK · v0.2</div><h1>One contract.<br><em>Every channel.</em></h1><p class="lead">Control Vitrus robots from Web, TypeScript or Python, with the Bridge for trust and Zenoh for the fast local path.</p><div class="hero-actions"><a class="button primary" href="#quickstart">Start connecting</a><a class="button ghost" href="https://github.com/vitrus-ai/vitrus-sdk-typescript">View source ↗</a></div><div class="hero-grid"><div><strong>50 Hz</strong><span>edge control loop</span></div><div><strong>3</strong><span>separate data planes</span></div><div><strong>2</strong><span>SDK languages</span></div></div></section>
+    <section id="quickstart" class="section split"><div><div class="eyebrow">01 · QUICKSTART</div><h2>Two values to begin.</h2><p>Serial or alias resolution happens through the Vitrus Bridge. Device tokens and robot IP addresses stay out of client applications.</p></div><div class="code-card"><div class="code-head"><span>.env</span><span>minimal config</span></div><pre><code>VITRUS_DROID=VTRS-R06-2607-R2D2X
+VITRUS_API_KEY=your-vitrus-api-key</code></pre></div></section>
+    <section id="architecture" class="section"><div class="eyebrow">02 · ARCHITECTURE</div><h2>Trust in the cloud.<br><em>Speed on the LAN.</em></h2><div class="flow"><div class="node web"><small>WEB / JS</small><b>Bridge API</b><span>HTTPS · WebSocket</span></div><div class="arrow">→</div><div class="node bridge"><small>VITRUS BRIDGE</small><b>Auth + leases</b><span>organization scope</span></div><div class="arrow">→</div><div class="node zenoh"><small>ZENOH MESH</small><b>Native peer</b><span>low-jitter edge path</span></div><div class="arrow">→</div><div class="node robot"><small>R-05 / RPI5</small><b>VitrusOS</b><span>motor broker</span></div></div><div class="note"><strong>LAN insight</strong><span>MacBook and Raspberry Pi 5 can form a direct Zenoh peer path after Bridge authorization. Browser clients remain on the Bridge path; Python edge clients can use native Zenoh TCP.</span></div></section>
+    <section id="benchmarks" class="section"><div class="eyebrow">03 · BENCHMARKS</div><h2>Measure the right thing.</h2><div class="metrics"><article><span class="metric-label">CONTROL</span><strong>low jitter</strong><p>Joint targets, leases, TTL and emergency stop. Keep this path independent from image transfer.</p></article><article><span class="metric-label">TELEMETRY</span><strong>state snapshots</strong><p>Joints, health and feedback. Native Zenoh is the fast path on a LAN.</p></article><article><span class="metric-label">CAMERA</span><strong>bulk frames</strong><p>Capture, encode, transport and decode. Report p50/p95 plus size and resolution.</p></article></div></section>
+    <section class="section code-section"><div><div class="eyebrow">04 · TYPESCRIPT</div><h2>Same API, different routes.</h2></div><div class="code-card"><div class="code-head"><span>client.ts</span><span>Web / Node / Bun</span></div><pre><code>import Vitrus from "vitrus";
+
+const droid = await Vitrus.Droid.connect(
+  process.env.VITRUS_DROID!,
+  { apiKey: process.env.VITRUS_API_KEY! },
+);
+
+const state = await droid.telemetry.snapshot();
+const frame = await droid.camera.getFrame("head_camera");</code></pre></div></section>
+    <section class="section code-section"><div><div class="eyebrow">05 · PYTHON</div><h2>Native Zenoh on the edge.</h2></div><div class="code-card"><div class="code-head"><span>client.py</span><span>Raspberry Pi / Linux</span></div><pre><code>from vitrus import Droid
+
+droid = await Droid.from_env()
+lease = await droid.acquire(owner="edge-control")
+await droid.send_targets(
+    [{"joint_name": "NECK_HEAD", "position_deg": 5}],
+    lease["id"],
+)</code></pre></div></section>
+  </main>
+  <footer><span>VITRUS · Droids SDK</span><a href="architecture.md">Architecture reference</a><a href="https://github.com/vitrus-ai">GitHub ↗</a></footer>
+</body>
+</html>

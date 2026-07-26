@@ -1,0 +1,1 @@
+const button=document.querySelector('#theme');const saved=localStorage.getItem('vitrus-theme');if(saved)document.body.dataset.theme=saved;button?.addEventListener('click',()=>{const next=document.body.dataset.theme==='dark'?'light':'dark';document.body.dataset.theme=next;localStorage.setItem('vitrus-theme',next)});
