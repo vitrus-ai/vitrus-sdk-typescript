@@ -18,6 +18,19 @@ except Exception:  # pragma: no cover - optional at import time
 DEFAULT_BRIDGE_URL = "https://vitrus-dataplane.onrender.com"
 DEFAULT_ZENOH_ENDPOINT = "tcp/127.0.0.1:7447"
 DEFAULT_ZENOH_TOPIC = "vitrus/servo/targets"
+DEFAULT_TELEMETRY_TOPIC = "vitrus/telemetry/state"
+
+
+class TelemetrySubscription:
+    """Closable native Zenoh telemetry subscription shared by many clients."""
+
+    def __init__(self, subscriber: Any) -> None:
+        self._subscriber = subscriber
+
+    def close(self) -> None:
+        undeclare = getattr(self._subscriber, "undeclare", None)
+        if callable(undeclare):
+            undeclare()
 
 
 class Droid:
@@ -31,6 +44,7 @@ class Droid:
         bridge_url: str = DEFAULT_BRIDGE_URL,
         zenoh_endpoint: str = DEFAULT_ZENOH_ENDPOINT,
         zenoh_topic: str = DEFAULT_ZENOH_TOPIC,
+        telemetry_topic: str = DEFAULT_TELEMETRY_TOPIC,
         http_client: Optional[httpx.AsyncClient] = None,
         zenoh_session: Any = None,
     ) -> None:
@@ -39,6 +53,7 @@ class Droid:
         self.bridge_url = bridge_url.rstrip("/")
         self.zenoh_endpoint = zenoh_endpoint
         self.zenoh_topic = zenoh_topic
+        self.telemetry_topic = telemetry_topic
         self._http = http_client
         self._owns_http = http_client is None
         self._zenoh = zenoh_session
@@ -62,12 +77,14 @@ class Droid:
         bridge_url = os.environ.get("VITRUS_API_URL", DEFAULT_BRIDGE_URL)
         zenoh_endpoint = os.environ.get("VITRUS_ZENOH_TCP_ENDPOINT", DEFAULT_ZENOH_ENDPOINT)
         zenoh_topic = os.environ.get("VITRUS_ZENOH_TOPIC", DEFAULT_ZENOH_TOPIC)
+        telemetry_topic = os.environ.get("VITRUS_ZENOH_TELEMETRY_TOPIC", DEFAULT_TELEMETRY_TOPIC)
         return await cls.connect(
             name,
             api_key,
             bridge_url=bridge_url,
             zenoh_endpoint=zenoh_endpoint,
             zenoh_topic=zenoh_topic,
+            telemetry_topic=telemetry_topic,
             **kwargs,
         )
 
@@ -105,6 +122,22 @@ class Droid:
             "/v1/droids/control/leases/" + quote(lease_id, safe=""),
             params={"ref": self.name},
         )
+
+    def subscribe_telemetry(self, callback: Any) -> TelemetrySubscription:
+        """Subscribe to normalized state without polling the motor broker."""
+        session = self._zenoh or self._open_zenoh()
+        self._zenoh = session
+
+        def on_sample(sample: Any) -> None:
+            payload = getattr(sample, "payload", sample)
+            if hasattr(payload, "to_bytes"):
+                payload = payload.to_bytes()
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode("utf-8")
+            callback(json.loads(payload) if isinstance(payload, str) else payload)
+
+        subscriber = session.declare_subscriber(self.telemetry_topic, on_sample)
+        return TelemetrySubscription(subscriber)
 
     async def send_targets(
         self,

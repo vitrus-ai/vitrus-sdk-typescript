@@ -8,7 +8,7 @@ Leases, authorization, emergency stop, command validation and audit travel throu
 
 ### Telemetry
 
-Python edge clients can subscribe to native Zenoh on the LAN. Web clients receive a normalized snapshot/event stream through the Bridge relay. Telemetry should be sampled independently from the motor loop.
+One VitrusOS publisher reads the motor broker and publishes the normalized `vitrus/telemetry/state` stream. Python edge clients can subscribe to native Zenoh on the LAN, while Web clients receive a normalized snapshot/event stream through the Bridge relay. Any number of subscribers can read the same stream without multiplying hardware reads. Telemetry should be sampled independently from the motor loop.
 
 ### Camera
 
