@@ -1,4 +1,6 @@
-# Vitrus Droids SDK
+# One SDK, any Droid
+
+> A unified way to interface and control with robots running VitrusOS.
 
 One SDK contract for Vitrus Droids across Web/JavaScript, TypeScript, Python, LAN mesh and the public Vitrus Bridge.
 

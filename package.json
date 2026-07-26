@@ -2,7 +2,7 @@
   "name": "@vitrus/sdk-monorepo",
   "private": true,
   "version": "0.1.0",
-  "description": "Unified Vitrus Droids SDK for TypeScript, Python, Web, LAN mesh and Bridge cloud transport.",
+  "description": "One SDK, any Droid: a unified interface for robots running VitrusOS across TypeScript, Python, Web and LAN mesh.",
   "scripts": {
     "build:typescript": "cd typescript && bun run build",
     "test:typescript": "cd typescript && bun test",
