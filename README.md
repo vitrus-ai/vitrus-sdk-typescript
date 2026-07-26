@@ -27,7 +27,7 @@ Python on edge ─────────────────────�
 
 Motion, telemetry and camera data are benchmarked separately. Camera frames are intentionally not used as a control-loop transport.
 
-Telemetry is publish/subscribe: VitrusOS reads the motor broker once and multiple Python, Web and UI clients consume the same normalized stream. Camera video remains a separate WebRTC media plane.
+Telemetry is publish/subscribe: VitrusOS reads the motor broker once and multiple Python, Web and UI clients consume the same normalized stream. Python uses the canonical typed `vitrus/state/motor_state` topic; Web compatibility uses the Bridge. Camera video remains a separate WebRTC media plane.
 
 ## Development
 

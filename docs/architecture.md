@@ -8,7 +8,7 @@ Leases, authorization, emergency stop, command validation and audit travel throu
 
 ### Telemetry
 
-One VitrusOS publisher reads the motor broker and publishes the normalized `vitrus/telemetry/state` stream. Python edge clients can subscribe to native Zenoh on the LAN, while Web clients receive a normalized snapshot/event stream through the Bridge relay. Any number of subscribers can read the same stream without multiplying hardware reads. Telemetry should be sampled independently from the motor loop.
+One VitrusOS publisher reads the motor broker and publishes the canonical typed `vitrus/state/motor_state` stream. The older `vitrus/telemetry/state` blob remains a Web/compatibility stream. Python edge clients subscribe to the typed stream over native Zenoh, while Web clients receive a normalized snapshot/event stream through the Bridge relay. Any number of subscribers can read the same stream without multiplying hardware reads. Telemetry should be sampled independently from the motor loop.
 
 ### Camera
 

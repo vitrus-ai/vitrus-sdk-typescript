@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional at import time
 DEFAULT_BRIDGE_URL = "https://vitrus-dataplane.onrender.com"
 DEFAULT_ZENOH_ENDPOINT = "tcp/127.0.0.1:7447"
 DEFAULT_ZENOH_TOPIC = "vitrus/servo/targets"
-DEFAULT_TELEMETRY_TOPIC = "vitrus/telemetry/state"
+DEFAULT_TELEMETRY_TOPIC = "vitrus/state/motor_state"
 
 
 class TelemetrySubscription:
