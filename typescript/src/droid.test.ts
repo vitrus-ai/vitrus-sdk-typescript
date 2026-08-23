@@ -243,8 +243,8 @@ describe("Droid realtime and control sessions", () => {
 
     await expect(droid.motion.sendTargets(
       [{ jointName: "LEFT_ELBOW", displayDeg: 12 }],
-      { leaseId: "lease-1", ttlMs: 400, edgeKeepaliveMs: 1_501 },
-    )).rejects.toThrow("edgeKeepaliveMs must be an integer between 1 and 1500 ms");
+      { leaseId: "lease-1", ttlMs: 400, edgeKeepaliveMs: 15_001 },
+    )).rejects.toThrow("edgeKeepaliveMs must be an integer between 1 and 15000 ms");
   });
 
   test("sends a discovered semantic effector through the direct SDK API", async () => {

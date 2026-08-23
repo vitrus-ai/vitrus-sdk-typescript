@@ -91,10 +91,10 @@ export function createJointTargetsMessage(options: {
     && (
       !Number.isSafeInteger(options.edgeKeepaliveMs)
       || options.edgeKeepaliveMs < 1
-      || options.edgeKeepaliveMs > 1_500
+      || options.edgeKeepaliveMs > 15_000
     )
   ) {
-    throw new Error("edgeKeepaliveMs must be an integer between 1 and 1500 ms");
+    throw new Error("edgeKeepaliveMs must be an integer between 1 and 15000 ms");
   }
 
   const sentAtMs = Math.trunc(options.sentAtMs ?? Date.now());
