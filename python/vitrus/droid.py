@@ -17,8 +17,10 @@ except Exception:  # pragma: no cover - optional at import time
 
 DEFAULT_BRIDGE_URL = "https://vitrus-dataplane.onrender.com"
 DEFAULT_ZENOH_ENDPOINT = "tcp/127.0.0.1:7447"
-DEFAULT_ZENOH_TOPIC = "vitrus/servo/targets"
-DEFAULT_TELEMETRY_TOPIC = "vitrus/state/motor_state"
+DEFAULT_ZENOH_TOPIC = "vitrus/control/joint_targets"
+# VitrusOS currently emits the compatibility JSON snapshot on this topic;
+# keep SDK direct-IP telemetry aligned until the typed publisher is deployed.
+DEFAULT_TELEMETRY_TOPIC = "vitrus/telemetry/state"
 
 
 class TelemetrySubscription:
@@ -156,19 +158,25 @@ class Droid:
         command = {
             "schema": "vitrus.control.joint_targets",
             "schema_version": "0.1.0",
+            "type": "clay_joint_targets",
             "source": source,
+            "mode": "read_write",
             "lease_id": lease_id,
+            "session_id": lease_id,
+            "sequence": self._sequence,
             "seq": self._sequence,
             "issued_at_ms": sent_at_ms,
+            "sent_at_ms": sent_at_ms,
+            "ttl_ms": max(1, int(ttl_ms)),
             "deadline_ms": sent_at_ms + max(1, int(ttl_ms)),
-            "target": self._edge_target(normalized[0]),
+            "flush": True,
+            "targets": [self._edge_target(target) for target in normalized],
             "robot_id": str(identity["id"]),
+            "trajectory_owner": "edge",
         }
         session = self._zenoh_session or self._open_zenoh()
         self._zenoh_session = session
-        for target in normalized:
-            command["target"] = self._edge_target(target)
-            session.put(self.zenoh_topic, json.dumps(command, separators=(",", ":")).encode("utf-8"))
+        session.put(self.zenoh_topic, json.dumps(command, separators=(",", ":")).encode("utf-8"))
         return {
             "requestId": str(self._sequence),
             "status": "acknowledged",

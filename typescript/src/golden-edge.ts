@@ -19,13 +19,39 @@ export type GoldenEdgePublishResult = {
   error?: string;
 };
 
+export type GoldenEdgeReleaseResult = {
+  ok: boolean;
+  transport: "dora";
+  released: boolean;
+  lease_id: string;
+  broker?: Record<string, unknown>;
+};
+
+export type GoldenEdgeAcquireResult = {
+  ok: boolean;
+  transport: "dora";
+  acquired: boolean;
+  lease_id: string;
+  broker?: Record<string, unknown>;
+};
+
 export type GoldenEdgeClientOptions = {
   endpoint: string;
   robotId: string;
   leaseId: string;
   source?: string;
+  requestTimeoutMs?: number;
   fetch?: typeof globalThis.fetch;
 };
+
+export class GoldenEdgeRequestTimeoutError extends Error {
+  readonly code = "VITRUS_EDGE_ADMISSION_TIMEOUT";
+
+  constructor(readonly path: string, readonly timeoutMs: number) {
+    super(`Golden Edge admission timed out after ${timeoutMs} ms (${path})`);
+    this.name = "GoldenEdgeRequestTimeoutError";
+  }
+}
 
 export class GoldenEdgeClient {
   private sequence = 0;
@@ -52,6 +78,31 @@ export class GoldenEdgeClient {
 
   async health(): Promise<GoldenEdgeHealth> {
     return this.request<GoldenEdgeHealth>("/healthz", { method: "GET" });
+  }
+
+  async acquire(
+    leaseId: string,
+    options: { owner: string; durationMs: number; jointNames: string[] },
+  ): Promise<GoldenEdgeAcquireResult> {
+    const requested = leaseId.trim();
+    if (!requested || !options.jointNames.length) {
+      throw new Error("Golden Edge acquire requires a lease and explicit joint scope");
+    }
+    const result = await this.request<GoldenEdgeAcquireResult>("/api/dora/acquire", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        lease_id: requested,
+        owner: options.owner,
+        duration_ms: options.durationMs,
+        joint_names: options.jointNames,
+      }),
+    }, 10_000);
+    if (!result.ok || !result.acquired || result.lease_id !== requested) {
+      throw new Error("Golden Edge did not confirm acquire");
+    }
+    this.setLease(requested);
+    return result;
   }
 
   async sendJointTargets(
@@ -82,16 +133,45 @@ export class GoldenEdgeClient {
     return result;
   }
 
-  private async request<T>(path: string, init: RequestInit): Promise<T> {
-    const response = await this.fetchImpl(`${this.endpoint}${path}`, init);
-    const payload = await response.json().catch(() => null) as T | { error?: unknown } | null;
-    if (!response.ok) {
-      const detail = payload && typeof payload === "object" && "error" in payload
-        ? String(payload.error)
-        : response.statusText;
-      throw new Error(`Golden Edge request failed (${response.status}): ${detail}`);
+  async release(leaseId: string): Promise<GoldenEdgeReleaseResult> {
+    const requested = leaseId.trim();
+    if (!requested || requested !== this.leaseId) {
+      throw new Error("Golden Edge release lease does not match active client lease");
     }
-    if (!payload || typeof payload !== "object") throw new Error("Golden Edge returned invalid JSON");
-    return payload as T;
+    const result = await this.request<GoldenEdgeReleaseResult>("/api/dora/release", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ lease_id: requested }),
+    }, 8_000);
+    if (!result.ok || !result.released) throw new Error("Golden Edge did not confirm release");
+    return result;
+  }
+
+  private async request<T>(path: string, init: RequestInit, timeoutOverrideMs?: number): Promise<T> {
+    const timeoutMs = timeoutOverrideMs ?? this.options.requestTimeoutMs ?? 1_000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await this.fetchImpl(`${this.endpoint}${path}`, {
+        ...init,
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => null) as T | { error?: unknown } | null;
+      if (!response.ok) {
+        const detail = payload && typeof payload === "object" && "error" in payload
+          ? String(payload.error)
+          : response.statusText;
+        throw new Error(`Golden Edge request failed (${response.status}): ${detail}`);
+      }
+      if (!payload || typeof payload !== "object") throw new Error("Golden Edge returned invalid JSON");
+      return payload as T;
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new GoldenEdgeRequestTimeoutError(path, timeoutMs);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }

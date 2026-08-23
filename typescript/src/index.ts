@@ -4,6 +4,8 @@ export * from './droid-live.js';
 export * from './contracts.js';
 export * from './golden-edge.js';
 export * from './zenoh-edge.js';
+export * from './joint-stop-calibration.js';
+export * from './effectors.js';
 
 /**
  * Vitrus SDK

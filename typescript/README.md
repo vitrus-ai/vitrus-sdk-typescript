@@ -38,11 +38,48 @@ const lease = await droid.control.acquire({ durationMs: 5_000 });
 
 await droid.motion.sendTargets(
   [{ jointName: "ARM_JOINT", displayDeg: 5 }],
-  { leaseId: lease.id },
+  { leaseId: lease.id, ttlMs: 400, edgeKeepaliveMs: 1_500 },
 );
 ```
 
+### Semantic effectors
+
+Effectors are discovered from the active robot description, so application
+code does not depend on motor count or joint names. The R06 model exposes
+`aperture` (`0` closed to `1` open) and `shape` (`-1` precision, `0` parallel,
+`1` enveloping):
+
+```ts
+const effectors = await droid.effectors.list();
+const right = effectors.find(({ id }) => id === "right_gripper");
+if (!right?.available) throw new Error("Right effector is unavailable");
+
+await droid.effectors.command(
+  right.id,
+  { aperture: 0.55, shape: 0.25 },
+  { leaseId: lease.id, ttlMs: 400, maxTorqueNm: 0.25 },
+);
+```
+
+`maxTorqueNm` is optional. When present it must fall inside the active robot
+description's torque-stop policy; VitrusOS validates it again against its local
+configuration before commanding hardware.
+
+For simultaneous arm and effector control, attach `effectorCommands` to one
+`motion.sendTargets` call. This preserves one atomic latest-target frame. The
+SDK includes a preview for admission, but VitrusOS verifies the effector/model
+revision and resolves the calibrated motor targets again on the robot.
+
+New anatomies add a versioned `semantic_effector` command model to the robot
+manifest. They do not require a new transport contract; a new command type
+only requires matching SDK preview and VitrusOS resolver adapters.
+
 Control requires an authorized API key and a lease. The Vitrus service validates commands before the robot receives them.
+
+`ttlMs` is the WAN admission deadline. `edgeKeepaliveMs` is a separate,
+explicitly bounded window (maximum 1500 ms) in which a compatible VitrusOS
+edge may refresh an admitted positional target locally. Release, E-stop, lease
+expiry, or keepalive expiry still cuts the edge to `read_only`.
 
 The default Web/JS control path is the authenticated Bridge. The Bridge and the VitrusOS relay use Zenoh behind the API boundary, so browser clients never need robot IPs or Zenoh endpoints.
 
@@ -67,7 +104,7 @@ const droid = await Vitrus.Droid.connect("VTRS-<MODEL>-<YYMM>-<UNIQUE_ID>", {
   endpoint: "https://vitrus-dataplane.onrender.com",
   motionTransport: "zenoh",
   zenohEndpoint: "ws://r05-edge:7448",
-  zenohTopic: "vitrus/servo/targets",
+  zenohTopic: "vitrus/control/joint_targets",
 });
 ```
 
