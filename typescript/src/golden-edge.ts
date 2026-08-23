@@ -35,6 +35,15 @@ export type GoldenEdgeAcquireResult = {
   broker?: Record<string, unknown>;
 };
 
+export type GoldenEdgeRenewResult = {
+  ok: boolean;
+  transport: "dora";
+  renewed: boolean;
+  lease_id: string;
+  duration_ms: number;
+  broker?: Record<string, unknown>;
+};
+
 export type GoldenEdgeClientOptions = {
   endpoint: string;
   robotId: string;
@@ -107,7 +116,7 @@ export class GoldenEdgeClient {
 
   async sendJointTargets(
     targets: ControlJointTarget[],
-    options: { ttlMs?: number; sentAtMs?: number } = {},
+    options: { ttlMs?: number; sentAtMs?: number; edgeKeepaliveMs?: number } = {},
   ): Promise<GoldenEdgePublishResult> {
     const command = createJointTargetsMessage({
       robotId: this.options.robotId,
@@ -116,9 +125,29 @@ export class GoldenEdgeClient {
       source: this.options.source,
       ttlMs: options.ttlMs,
       sentAtMs: options.sentAtMs,
+      edgeKeepaliveMs: options.edgeKeepaliveMs,
       targets,
     });
     return this.publish(command);
+  }
+
+  async renew(leaseId: string, durationMs = 30_000): Promise<GoldenEdgeRenewResult> {
+    const requested = leaseId.trim();
+    if (!requested || requested !== this.leaseId) {
+      throw new Error("Golden Edge renew lease does not match active client lease");
+    }
+    if (!Number.isSafeInteger(durationMs) || durationMs < 1_000 || durationMs > 30_000) {
+      throw new Error("Golden Edge renew durationMs must be in [1000, 30000]");
+    }
+    const result = await this.request<GoldenEdgeRenewResult>("/api/dora/renew", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ lease_id: requested, duration_ms: durationMs }),
+    }, 4_000);
+    if (!result.ok || !result.renewed || result.lease_id !== requested) {
+      throw new Error("Golden Edge did not confirm renew");
+    }
+    return result;
   }
 
   async publish(command: ControlJointTargetsMessage): Promise<GoldenEdgePublishResult> {

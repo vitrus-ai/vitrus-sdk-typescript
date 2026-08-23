@@ -78,6 +78,27 @@ describe("GoldenEdgeClient", () => {
     expect(client.release("other-lease")).rejects.toThrow("does not match");
   });
 
+  test("renews the same lease through the local gateway", async () => {
+    let path = "";
+    let body: Record<string, unknown> = {};
+    const client = new GoldenEdgeClient({
+      endpoint: "http://r-05-edge:8782",
+      robotId: "R06.cannon",
+      leaseId: "lease-1",
+      fetch: (async (input, init) => {
+        path = new URL(String(input)).pathname;
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({
+          ok: true, transport: "dora", renewed: true,
+          lease_id: "lease-1", duration_ms: 30_000,
+        }));
+      }) as typeof fetch,
+    });
+    await client.renew("lease-1", 30_000);
+    expect(path).toBe("/api/dora/renew");
+    expect(body).toEqual({ lease_id: "lease-1", duration_ms: 30_000 });
+  });
+
   test("acquires one explicit scope through the local gateway", async () => {
     let path = "";
     let body: Record<string, unknown> = {};

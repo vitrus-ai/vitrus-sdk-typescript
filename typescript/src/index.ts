@@ -1,4 +1,6 @@
 import { Droid } from './droid-live.js';
+export * from './edge-control-session.js';
+export * from './golden-edge.js';
 
 export * from './droid-live.js';
 export * from './contracts.js';
