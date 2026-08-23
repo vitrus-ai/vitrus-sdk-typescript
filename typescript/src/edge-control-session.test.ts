@@ -51,4 +51,34 @@ describe("EdgeControlSession", () => {
       .rejects.toThrow("outside the acquired Edge scope");
     await session.release();
   });
+
+  test("resolves all motors to an immutable exact lease scope", async () => {
+    let acquireBody: Record<string, unknown> | null = null;
+    const session = await EdgeControlSession.acquire({
+      endpoint: "http://edge.test",
+      robotId: "R06",
+      leaseId: "lease-all",
+      jointNames: "all",
+      fetch: (async (input, init) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/control-scope")) return Response.json({
+          ok: true,
+          transport: "dora",
+          scope: "all_controllable",
+          joint_names: ["ARM_A", "FINGER_A"],
+          count: 2,
+          excluded: [],
+        });
+        if (path.endsWith("/acquire")) {
+          acquireBody = JSON.parse(String(init?.body));
+          return Response.json({ ok: true, transport: "dora", acquired: true, lease_id: "lease-all" });
+        }
+        if (path.endsWith("/release")) return Response.json({ ok: true, transport: "dora", released: true, lease_id: "lease-all" });
+        return Response.json({ ok: true, transport: "dora", stream: "joint_targets" });
+      }) as typeof fetch,
+    });
+    expect(session.jointNames).toEqual(["ARM_A", "FINGER_A"]);
+    expect(acquireBody?.joint_names).toEqual(["ARM_A", "FINGER_A"]);
+    await session.release();
+  });
 });

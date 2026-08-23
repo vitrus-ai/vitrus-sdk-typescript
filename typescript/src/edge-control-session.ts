@@ -7,7 +7,8 @@ import type { ControlJointTarget } from "./contracts.js";
 export type EdgeControlSessionOptions = {
   endpoint: string;
   robotId: string;
-  jointNames: string[];
+  /** Exact joints, or all currently fresh/calibrated/controllable motors. */
+  jointNames: string[] | "all";
   owner?: string;
   leaseId?: string;
   source?: string;
@@ -46,7 +47,7 @@ export class EdgeControlSession {
   private renewAtMs = 0;
   private released = false;
 
-  private constructor(options: EdgeControlSessionOptions, leaseId: string) {
+  private constructor(options: Omit<EdgeControlSessionOptions, "jointNames"> & { jointNames: string[] }, leaseId: string) {
     this.leaseId = leaseId;
     this.jointNames = [...options.jointNames];
     this.durationMs = options.durationMs ?? 30_000;
@@ -64,7 +65,22 @@ export class EdgeControlSession {
   }
 
   static async acquire(options: EdgeControlSessionOptions): Promise<EdgeControlSession> {
-    const names = options.jointNames.map(name => name.trim()).filter(Boolean);
+    const leaseId = options.leaseId?.trim() || `sdk-edge-${createSessionId()}`;
+    let requestedNames: string[];
+    if (options.jointNames === "all") {
+      const resolver = new GoldenEdgeClient({
+        endpoint: options.endpoint,
+        robotId: options.robotId,
+        leaseId,
+        source: options.source ?? "vitrus-sdk-edge-session",
+        requestTimeoutMs: options.requestTimeoutMs,
+        fetch: options.fetch,
+      });
+      requestedNames = (await resolver.controlScope()).joint_names;
+    } else {
+      requestedNames = options.jointNames;
+    }
+    const names = requestedNames.map(name => name.trim()).filter(Boolean);
     if (!names.length || new Set(names).size !== names.length) {
       throw new Error("Edge control session requires a unique non-empty joint scope");
     }
@@ -76,7 +92,6 @@ export class EdgeControlSession {
     if (!Number.isSafeInteger(refreshMs) || refreshMs < 50 || refreshMs > 1_000) {
       throw new Error("Edge control session refreshMs must be in [50, 1000]");
     }
-    const leaseId = options.leaseId?.trim() || `sdk-edge-${createSessionId()}`;
     const session = new EdgeControlSession({ ...options, jointNames: names }, leaseId);
     await session.client.acquire(leaseId, {
       owner: options.owner?.trim() || "vitrus-sdk",

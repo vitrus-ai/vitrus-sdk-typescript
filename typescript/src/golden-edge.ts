@@ -44,6 +44,15 @@ export type GoldenEdgeRenewResult = {
   broker?: Record<string, unknown>;
 };
 
+export type GoldenEdgeControlScopeResult = {
+  ok: boolean;
+  transport: "dora";
+  scope: "all_controllable";
+  joint_names: string[];
+  count: number;
+  excluded: Array<{ joint_name: string; reason: string }>;
+};
+
 export type GoldenEdgeClientOptions = {
   endpoint: string;
   robotId: string;
@@ -87,6 +96,14 @@ export class GoldenEdgeClient {
 
   async health(): Promise<GoldenEdgeHealth> {
     return this.request<GoldenEdgeHealth>("/healthz", { method: "GET" });
+  }
+
+  async controlScope(): Promise<GoldenEdgeControlScopeResult> {
+    const result = await this.request<GoldenEdgeControlScopeResult>("/api/dora/control-scope", { method: "GET" }, 4_000);
+    if (!result.ok || !Array.isArray(result.joint_names) || !result.joint_names.length) {
+      throw new Error("Golden Edge returned no controllable motors");
+    }
+    return result;
   }
 
   async acquire(
