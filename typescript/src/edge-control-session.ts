@@ -139,6 +139,9 @@ export class EdgeControlSession {
       const remaining = deadline - this.now();
       if (remaining > 0) await this.sleep(Math.min(refreshMs, remaining));
     } while (this.now() < deadline);
+    if (!admissions.length) {
+      throw new Error("Edge hold completed without a confirmed target admission");
+    }
     return admissions;
   }
 

@@ -81,4 +81,25 @@ describe("EdgeControlSession", () => {
     expect(acquireBody?.joint_names).toEqual(["ARM_A", "FINGER_A"]);
     await session.release();
   });
+
+  test("never reports a hold with zero confirmed admissions as success", async () => {
+    let now = 0;
+    const session = await EdgeControlSession.acquire({
+      endpoint: "http://edge.test",
+      robotId: "R06",
+      leaseId: "lease-no-admission",
+      jointNames: ["ARM_A"],
+      now: () => now,
+      sleep: async durationMs => { now += durationMs; },
+      fetch: (async (input) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/acquire")) return Response.json({ ok: true, transport: "dora", acquired: true, lease_id: "lease-no-admission" });
+        if (path.endsWith("/release")) return Response.json({ ok: true, transport: "dora", released: true, lease_id: "lease-no-admission" });
+        return Response.json({ ok: false, error: "not admitted" }, { status: 409 });
+      }) as typeof fetch,
+    });
+    await expect(session.hold([{ joint_name: "ARM_A", position_deg: 0 }], { durationMs: 100 }))
+      .rejects.toThrow(/not admitted|without a confirmed/);
+    await session.release();
+  });
 });
