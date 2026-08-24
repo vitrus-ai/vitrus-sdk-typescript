@@ -147,6 +147,31 @@ export type DroidCommandResult = {
   error?: string;
 };
 
+export type MotionOperationState = "submitting" | "acknowledged" | "failed" | "cancelled";
+
+export type MotionOperationStatus = {
+  id: string;
+  state: MotionOperationState;
+  error?: string;
+};
+
+export type MotionOperation = {
+  readonly id: string;
+  status: () => MotionOperationStatus;
+  result: () => Promise<DroidCommandResult>;
+  cancel: () => Promise<void>;
+};
+
+export type MotionTargetOptions = {
+  leaseId: string;
+  timeoutMs?: number;
+};
+
+export type MotionSubmitOptions = MotionTargetOptions & {
+  holdMs: number;
+  operationId?: string;
+};
+
 export type DroidConnectionOptions = {
   apiKey: string;
   relayUrl?: string;
@@ -236,12 +261,13 @@ export class Droid {
     subscribe: (listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
   };
   readonly control: {
-    acquire: (options?: { durationMs?: number; owner?: string }) => Promise<ControlLease>;
+    acquire: (options?: { durationMs?: number; owner?: string; jointNames?: string[] | "all_controllable" }) => Promise<ControlLease>;
     renew: (leaseId: string, options?: { durationMs?: number }) => Promise<ControlLease>;
     release: (leaseId: string) => Promise<void>;
   };
   readonly motion: {
-    sendTargets: (targets: JointTarget[], options: { leaseId: string; timeoutMs?: number }) => Promise<DroidCommandResult>;
+    sendTargets: (targets: JointTarget[], options: MotionTargetOptions) => Promise<DroidCommandResult>;
+    submitTargets: (targets: JointTarget[], options: MotionSubmitOptions) => MotionOperation;
   };
   readonly safety: { emergencyStop: (reason?: string) => Promise<DroidCommandResult> };
 
@@ -286,15 +312,120 @@ export class Droid {
     };
     this.events = { subscribe: (listener, request) => this.subscribeEvents(listener, request) };
     this.control = {
-      acquire: (request = {}) => this.post<ControlLease>("/v1/droids/control/leases", { durationMs: request.durationMs, owner: request.owner?.trim() || this.clientId }),
-      renew: (leaseId, request = {}) => this.post<ControlLease>(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, request),
-      release: async (leaseId) => { await this.delete(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`); },
+      acquire: (request = {}) => this.acquireControl(request),
+      renew: (leaseId, request = {}) => this.renewControl(leaseId, request),
+      release: (leaseId) => this.releaseControl(leaseId),
     };
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
+      submitTargets: (targets, request) => this.submitTargets(targets, request),
     };
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),
+    };
+  }
+
+  private randomId(prefix: string): string {
+    return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+  }
+
+  private async edge(): Promise<GoldenEdgeClient> {
+    if (!this.options.edgeEndpoint) throw new Error("Droid edge transport requires edgeEndpoint");
+    if (!this.edgeClient) {
+      const identity = await this.identity.get();
+      this.edgeClient = new GoldenEdgeClient({
+        endpoint: this.options.edgeEndpoint,
+        robotId: identity.id,
+        source: "vitrus-sdk",
+      });
+    }
+    return this.edgeClient;
+  }
+
+  private async acquireControl(request: { durationMs?: number; owner?: string; jointNames?: string[] | "all_controllable" }): Promise<ControlLease> {
+    if ((this.options.motionTransport ?? "bridge") !== "edge") {
+      return this.post<ControlLease>("/v1/droids/control/leases", {
+        durationMs: request.durationMs,
+        owner: request.owner?.trim() || this.clientId,
+      });
+    }
+    const client = await this.edge();
+    const identity = await this.identity.get();
+    const durationMs = request.durationMs ?? 10_000;
+    const owner = request.owner?.trim() || this.clientId;
+    const requestedNames = request.jointNames;
+    const jointNames = Array.isArray(requestedNames)
+      ? requestedNames
+      : (await client.controlScope()).joint_names;
+    if (!jointNames.length || jointNames.some((name) => !name.trim())) {
+      throw new Error("Edge control acquire requires at least one valid joint name");
+    }
+    const leaseId = this.randomId("edge-lease");
+    await client.acquire({ leaseId, owner, jointNames, durationMs });
+    this.edgeLeaseId = leaseId;
+    return {
+      id: leaseId,
+      droidId: identity.id,
+      owner,
+      expiresAt: new Date(Date.now() + durationMs).toISOString(),
+    };
+  }
+
+  private async renewControl(leaseId: string, request: { durationMs?: number }): Promise<ControlLease> {
+    if ((this.options.motionTransport ?? "bridge") !== "edge") {
+      return this.post<ControlLease>(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, request);
+    }
+    const durationMs = request.durationMs ?? 10_000;
+    await (await this.edge()).renew(leaseId, durationMs);
+    const identity = await this.identity.get();
+    return {
+      id: leaseId,
+      droidId: identity.id,
+      owner: this.clientId,
+      expiresAt: new Date(Date.now() + durationMs).toISOString(),
+    };
+  }
+
+  private async releaseControl(leaseId: string): Promise<void> {
+    if ((this.options.motionTransport ?? "bridge") !== "edge") {
+      await this.delete(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`);
+      return;
+    }
+    await (await this.edge()).release(leaseId);
+    if (this.edgeLeaseId === leaseId) this.edgeLeaseId = null;
+  }
+
+  private submitTargets(targets: JointTarget[], request: MotionSubmitOptions): MotionOperation {
+    if ((this.options.motionTransport ?? "bridge") !== "edge") {
+      throw new Error("bounded motion operations require motionTransport: edge");
+    }
+    const id = request.operationId?.trim() || this.randomId("motion");
+    let state: MotionOperationState = "submitting";
+    let error: string | undefined;
+    const resultPromise = this.sendTargets(targets, {
+      leaseId: request.leaseId,
+      timeoutMs: request.timeoutMs,
+      holdMs: request.holdMs,
+      operationId: id,
+    }).then((result) => {
+      if (state !== "cancelled") state = "acknowledged";
+      return {
+        ...result,
+        result: { ...(result.result ?? {}), operation_id: id },
+      };
+    }).catch((cause) => {
+      error = cause instanceof Error ? cause.message : String(cause);
+      if (state !== "cancelled") state = "failed";
+      throw cause;
+    });
+    return {
+      id,
+      status: () => ({ id, state, ...(error ? { error } : {}) }),
+      result: () => resultPromise,
+      cancel: async () => {
+        await this.releaseControl(request.leaseId);
+        state = "cancelled";
+      },
     };
   }
 
@@ -394,37 +525,35 @@ export class Droid {
     return subscription;
   }
 
-  private async sendTargets(targets: JointTarget[], request: { leaseId: string; timeoutMs?: number }): Promise<DroidCommandResult> {
+  private async sendTargets(targets: JointTarget[], request: MotionTargetOptions & { holdMs?: number; operationId?: string }): Promise<DroidCommandResult> {
     const identity = await this.identity.get();
+    const motionTransport = this.options.motionTransport ?? "bridge";
+    if (request.holdMs != null && motionTransport !== "edge") {
+      throw new Error("holdMs is supported only by the Edge motion transport");
+    }
     const command = createJointTargetsMessage({
       robotId: identity.id,
       leaseId: request.leaseId,
       sequence: ++this.sequence,
       ttlMs: request.timeoutMs,
+      edgeKeepaliveMs: request.holdMs,
+      operationId: request.operationId,
       targets: targets.map((target) => ({
         joint_name: target.jointName,
         position_deg: target.displayDeg,
         ...(target.maxVelocityDegS == null ? {} : { velocity_deg_s: target.maxVelocityDegS }),
       })),
     });
-    const motionTransport = this.options.motionTransport ?? "bridge";
     if (motionTransport === "edge") {
       if (!this.options.edgeEndpoint) {
         throw new Error("Droid edge motion transport requires edgeEndpoint");
       }
-      if (!this.edgeClient) {
-        this.edgeClient = new GoldenEdgeClient({
-          endpoint: this.options.edgeEndpoint,
-          robotId: identity.id,
-          leaseId: request.leaseId,
-          source: command.source,
-        });
-        this.edgeLeaseId = request.leaseId;
-      } else if (this.edgeLeaseId !== request.leaseId) {
-        this.edgeClient.setLease(request.leaseId);
+      const client = await this.edge();
+      if (this.edgeLeaseId !== request.leaseId) {
+        client.setLease(request.leaseId);
         this.edgeLeaseId = request.leaseId;
       }
-      const result = await this.edgeClient.publish(command);
+      const result = await client.publish(command);
       return {
         requestId: String(result.sequence ?? command.sequence),
         status: "acknowledged",

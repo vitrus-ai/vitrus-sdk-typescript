@@ -12,7 +12,7 @@ export type GoldenEdgeHealth = {
 
 export type GoldenEdgePublishResult = {
   ok: boolean;
-  transport: "dora";
+  transport: "dora" | "broker-direct";
   stream: "joint_targets";
   sequence?: number;
   dropped?: string;
@@ -22,7 +22,7 @@ export type GoldenEdgePublishResult = {
 export type GoldenEdgeClientOptions = {
   endpoint: string;
   robotId: string;
-  leaseId: string;
+  leaseId?: string;
   source?: string;
   fetch?: typeof globalThis.fetch;
 };
@@ -35,11 +35,10 @@ export class GoldenEdgeClient {
 
   constructor(private readonly options: GoldenEdgeClientOptions) {
     this.endpoint = options.endpoint.replace(/\/+$/, "");
-    this.leaseId = options.leaseId.trim();
+    this.leaseId = options.leaseId?.trim() ?? "";
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     if (!this.endpoint) throw new Error("Golden Edge client requires endpoint");
     if (!options.robotId.trim()) throw new Error("Golden Edge client requires robotId");
-    if (!this.leaseId) throw new Error("Golden Edge client requires leaseId");
     if (typeof this.fetchImpl !== "function") throw new Error("Golden Edge client requires fetch");
   }
 
@@ -54,10 +53,53 @@ export class GoldenEdgeClient {
     return this.request<GoldenEdgeHealth>("/healthz", { method: "GET" });
   }
 
+  async controlScope(): Promise<{ joint_names: string[]; excluded?: Array<Record<string, unknown>> }> {
+    return this.request("/api/dora/control-scope", { method: "GET" });
+  }
+
+  async acquire(options: {
+    leaseId: string;
+    owner: string;
+    jointNames: string[];
+    durationMs: number;
+  }): Promise<Record<string, unknown>> {
+    const result = await this.request<Record<string, unknown>>("/api/dora/acquire", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        lease_id: options.leaseId,
+        owner: options.owner,
+        joint_names: options.jointNames,
+        duration_ms: options.durationMs,
+      }),
+    });
+    this.setLease(options.leaseId);
+    return result;
+  }
+
+  async renew(leaseId: string, durationMs: number): Promise<Record<string, unknown>> {
+    return this.request("/api/dora/renew", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ lease_id: leaseId, duration_ms: durationMs }),
+    });
+  }
+
+  async release(leaseId: string): Promise<Record<string, unknown>> {
+    const result = await this.request<Record<string, unknown>>("/api/dora/release", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ lease_id: leaseId }),
+    });
+    if (this.leaseId === leaseId) this.leaseId = "";
+    return result;
+  }
+
   async sendJointTargets(
     targets: ControlJointTarget[],
     options: { ttlMs?: number; sentAtMs?: number } = {},
   ): Promise<GoldenEdgePublishResult> {
+    if (!this.leaseId) throw new Error("Golden Edge joint targets require an acquired lease");
     const command = createJointTargetsMessage({
       robotId: this.options.robotId,
       leaseId: this.leaseId,

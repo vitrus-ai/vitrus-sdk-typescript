@@ -246,6 +246,92 @@ describe("Droid realtime and control sessions", () => {
     expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/joint-targets", "/api/dora/joint-targets"]);
   });
 
+  test("owns authority and a bounded motion operation entirely on the Edge path", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      requests.push({ path: url.pathname, body });
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          displayName: "R-06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/api/dora/control-scope") {
+        return jsonResponse({ joint_names: ["LEFT_SHOULDER_A", "LEFT_ELBOW_A"] });
+      }
+      if (url.pathname === "/api/dora/acquire") {
+        return jsonResponse({ ok: true, acquired: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/renew") {
+        return jsonResponse({ ok: true, renewed: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/joint-targets") {
+        return jsonResponse({
+          ok: true,
+          transport: "broker-direct",
+          stream: "joint_targets",
+          sequence: body.sequence,
+        });
+      }
+      if (url.pathname === "/api/dora/release") {
+        return jsonResponse({ ok: true, released: true, lease_id: body.lease_id });
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      edgeEndpoint: "http://r06-edge:8782",
+      motionTransport: "edge",
+      clientId: "calibration-agent",
+    });
+    const lease = await droid.control.acquire({
+      durationMs: 12_000,
+      owner: "calibration-agent",
+      jointNames: "all_controllable",
+    });
+    await droid.control.renew(lease.id, { durationMs: 12_000 });
+    const operation = droid.motion.submitTargets(
+      [{ jointName: "LEFT_ELBOW_A", displayDeg: -20 }],
+      { leaseId: lease.id, holdMs: 4_000, timeoutMs: 250, operationId: "left-elbow-probe-1" },
+    );
+    const result = await operation.result();
+
+    expect(operation.id).toBe("left-elbow-probe-1");
+    expect(operation.status()).toEqual({ id: "left-elbow-probe-1", state: "acknowledged" });
+    expect(result).toMatchObject({
+      status: "acknowledged",
+      route: "local",
+      result: { operation_id: "left-elbow-probe-1" },
+    });
+    const command = requests.find((request) => request.path === "/api/dora/joint-targets")?.body;
+    expect(command).toMatchObject({
+      lease_id: lease.id,
+      edge_keepalive_ms: 4_000,
+      operation_id: "left-elbow-probe-1",
+      targets: [{ joint_name: "LEFT_ELBOW_A", position_deg: -20 }],
+    });
+
+    await operation.cancel();
+    expect(operation.status()).toEqual({ id: "left-elbow-probe-1", state: "cancelled" });
+    expect(requests.map((request) => request.path)).toEqual([
+      "/v1/droids/resolve",
+      "/api/dora/control-scope",
+      "/api/dora/acquire",
+      "/api/dora/renew",
+      "/api/dora/joint-targets",
+      "/api/dora/release",
+    ]);
+  });
+
   test("publishes motion through a persistent Zenoh session", async () => {
     const published: Array<{ topic: string; payload: Record<string, unknown> }> = [];
     let opens = 0;

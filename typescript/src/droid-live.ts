@@ -1,6 +1,6 @@
 import { Droid as BaseDroid } from "./droid.js";
 export * from "./droid.js";
-import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidRef, DroidTelemetry, JointTarget } from "./droid.js";
+import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidRef, DroidTelemetry, JointTarget, MotionOperation, MotionSubmitOptions, MotionTargetOptions } from "./droid.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -83,8 +83,8 @@ export class Droid {
   readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
   readonly telemetry: { snapshot(): Promise<DroidTelemetry>; subscribe(listener: (value: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly events: { subscribe(listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
-  readonly control: { acquire(options?: { durationMs?: number; owner?: string }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
-  readonly motion: { sendTargets(targets: JointTarget[], options: { leaseId: string; timeoutMs?: number }): Promise<DroidCommandResult> };
+  readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] | "all_controllable" }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
+  readonly motion: { sendTargets(targets: JointTarget[], options: MotionTargetOptions): Promise<DroidCommandResult>; submitTargets(targets: JointTarget[], options: MotionSubmitOptions): MotionOperation };
   readonly safety;
   private identityCache: DroidIdentity | null = null;
   private readonly clientId: string;
@@ -111,11 +111,7 @@ export class Droid {
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribe(listener, request) };
-    this.control = {
-      acquire: (request = {}) => this.post("/v1/droids/control/leases", { durationMs: request.durationMs, owner: request.owner?.trim() || this.clientId }),
-      renew: (leaseId, request = {}) => this.post(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, request),
-      release: (leaseId) => this.remove(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`),
-    };
+    this.control = base.control;
   }
 
   private async calibration(camera: string): Promise<CameraCalibration | null> {
