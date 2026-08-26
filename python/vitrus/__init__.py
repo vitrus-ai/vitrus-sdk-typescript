@@ -5,6 +5,7 @@ import os
 import uuid
 import inspect
 from .droid import Droid
+from .device_status import DEVICE_STATUS_SCHEMA, DEVICE_STATUS_VERSION, normalize_device_status
 from typing import (
     Any,
     Dict,

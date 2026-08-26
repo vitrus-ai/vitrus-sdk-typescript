@@ -10,14 +10,13 @@ authors = [
 ]
 description = "Python client for Vitrus multi-agent orchestration platform"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = "MIT"  # Use SPDX identifier
 license-files = ["LICENSE"] # Standard way to include the license file text
 keywords = ["vitrus", "actors", "agents", "workflows", "robotics", "ai", "ai-agents", "ai-workflows", "ai-actors", "multi-agent systems"]
 classifiers = [
     "Development Status :: 3 - Alpha", # Or choose an appropriate status
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -57,4 +56,4 @@ dev = [
 # packages = ["vitrus"] # Or find_packages in setup.py 
 # package-dir = {"" = "src"} # Example if using src layout
 # packages = find: # Example if using find directive within tool.setuptools
-# license-files = ["LICENSE"] # Could also be here if not in [project] 
+# license-files = ["LICENSE"] # Could also be here if not in [project]

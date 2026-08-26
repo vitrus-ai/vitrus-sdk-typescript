@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.vitrus.ai/vitrus.device.status.v1.schema.json",
+  "title": "Vitrus Device Status v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "device_id",
+    "serial_number",
+    "model",
+    "timestamp",
+    "sequence",
+    "state",
+    "connection",
+    "safety",
+    "control",
+    "robot",
+    "telemetry",
+    "components",
+    "errors",
+    "extensions"
+  ],
+  "properties": {
+    "schema": { "const": "vitrus.device.status.v1" },
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "device_id": { "type": "string", "minLength": 1 },
+    "serial_number": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "state": { "enum": ["online", "degraded", "offline", "starting", "stopping", "fault"] },
+    "connection": {
+      "type": "object",
+      "required": ["sdk_agent", "bridge", "edge_local", "last_connected_at"],
+      "properties": {
+        "sdk_agent": { "$ref": "#/$defs/connectionState" },
+        "bridge": { "$ref": "#/$defs/connectionState" },
+        "edge_local": { "type": "boolean" },
+        "last_connected_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+      },
+      "additionalProperties": true
+    },
+    "safety": {
+      "type": "object",
+      "required": ["state", "estop", "deadman_active", "deadman_latched", "faults"],
+      "properties": {
+        "state": { "enum": ["safe", "warning", "fault", "estopped"] },
+        "estop": { "type": "boolean" },
+        "deadman_active": { "type": "boolean" },
+        "deadman_latched": { "type": "boolean" },
+        "faults": { "type": "array", "items": { "$ref": "#/$defs/error" } }
+      },
+      "additionalProperties": true
+    },
+    "control": {
+      "type": "object",
+      "required": ["mode", "phase", "owner", "lease_id", "lease_expires_at"],
+      "properties": {
+        "mode": { "enum": ["read_only", "read_write"] },
+        "phase": { "type": "string", "minLength": 1 },
+        "owner": { "type": ["string", "null"] },
+        "lease_id": { "type": ["string", "null"] },
+        "lease_expires_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "read_write" } } },
+          "then": {
+            "properties": {
+              "owner": { "type": "string", "minLength": 1 },
+              "lease_id": { "type": "string", "minLength": 1 },
+              "lease_expires_at": { "type": "string", "format": "date-time" }
+            }
+          },
+          "else": {
+            "properties": {
+              "owner": { "type": "null" },
+              "lease_id": { "type": "null" },
+              "lease_expires_at": { "type": "null" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "robot": {
+      "type": "object",
+      "required": ["description_revision", "configuration_revision", "calibration_revision", "joint_count", "available_joint_count"],
+      "properties": {
+        "description_revision": { "$ref": "#/$defs/nullableRevision" },
+        "configuration_revision": { "$ref": "#/$defs/nullableRevision" },
+        "calibration_revision": { "$ref": "#/$defs/nullableRevision" },
+        "joint_count": { "type": "integer", "minimum": 0 },
+        "available_joint_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "telemetry": {
+      "type": "object",
+      "required": ["schema", "sequence", "sampled_at", "age_ms", "complete", "stale"],
+      "properties": {
+        "schema": { "const": "vitrus.telemetry.state.v1" },
+        "sequence": { "type": ["integer", "null"], "minimum": 0 },
+        "sampled_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+        "age_ms": { "type": ["number", "null"], "minimum": 0 },
+        "complete": { "type": "boolean" },
+        "stale": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/component" }
+    },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/error" } },
+    "extensions": { "type": "object" }
+  },
+  "$defs": {
+    "connectionState": {
+      "enum": ["connected", "reconnecting", "disconnected", "misconfigured", "not_configured"]
+    },
+    "nullableRevision": {
+      "anyOf": [
+        { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        { "type": "null" }
+      ]
+    },
+    "component": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["ok", "degraded", "unavailable", "fault"] },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "severity"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "component": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["warning", "error"] }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

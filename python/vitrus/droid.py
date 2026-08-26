@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .device_status import normalize_device_status
+
 try:
     import zenoh  # type: ignore
 except Exception:  # pragma: no cover - optional at import time
@@ -21,6 +23,7 @@ DEFAULT_ZENOH_TOPIC = "vitrus/control/joint_targets"
 # VitrusOS currently emits the compatibility JSON snapshot on this topic;
 # keep SDK direct-IP telemetry aligned until the typed publisher is deployed.
 DEFAULT_TELEMETRY_TOPIC = "vitrus/telemetry/state"
+DEFAULT_STATUS_TOPIC = "vitrus/device/status"
 
 
 class TelemetrySubscription:
@@ -35,6 +38,19 @@ class TelemetrySubscription:
             undeclare()
 
 
+class DeviceStatusClient:
+    """Canonical status namespace exposed as ``droid.status``."""
+
+    def __init__(self, droid: "Droid") -> None:
+        self._droid = droid
+
+    async def snapshot(self) -> Dict[str, Any]:
+        return await self._droid._status_snapshot()
+
+    def subscribe(self, callback: Any) -> TelemetrySubscription:
+        return self._droid._subscribe_json(self._droid.status_topic, callback, normalize_device_status)
+
+
 class Droid:
     """Connect to a Vitrus droid with Bridge leases and native Zenoh targets."""
 
@@ -47,6 +63,8 @@ class Droid:
         zenoh_endpoint: str = DEFAULT_ZENOH_ENDPOINT,
         zenoh_topic: str = DEFAULT_ZENOH_TOPIC,
         telemetry_topic: str = DEFAULT_TELEMETRY_TOPIC,
+        status_topic: str = DEFAULT_STATUS_TOPIC,
+        edge_status_url: Optional[str] = None,
         http_client: Optional[httpx.AsyncClient] = None,
         zenoh_session: Any = None,
     ) -> None:
@@ -56,11 +74,14 @@ class Droid:
         self.zenoh_endpoint = zenoh_endpoint
         self.zenoh_topic = zenoh_topic
         self.telemetry_topic = telemetry_topic
+        self.status_topic = status_topic
+        self.edge_status_url = edge_status_url
         self._http = http_client
         self._owns_http = http_client is None
         self._zenoh = zenoh_session
         self._sequence = 0
         self._identity: Optional[Dict[str, Any]] = None
+        self.status = DeviceStatusClient(self)
         if not self.name:
             raise ValueError("DROID_NAME is required")
         if not self.api_key:
@@ -80,6 +101,8 @@ class Droid:
         zenoh_endpoint = os.environ.get("VITRUS_ZENOH_TCP_ENDPOINT", DEFAULT_ZENOH_ENDPOINT)
         zenoh_topic = os.environ.get("VITRUS_ZENOH_TOPIC", DEFAULT_ZENOH_TOPIC)
         telemetry_topic = os.environ.get("VITRUS_ZENOH_TELEMETRY_TOPIC", DEFAULT_TELEMETRY_TOPIC)
+        status_topic = os.environ.get("VITRUS_ZENOH_STATUS_TOPIC", DEFAULT_STATUS_TOPIC)
+        edge_status_url = os.environ.get("VITRUS_EDGE_STATUS_URL")
         return await cls.connect(
             name,
             api_key,
@@ -87,6 +110,8 @@ class Droid:
             zenoh_endpoint=zenoh_endpoint,
             zenoh_topic=zenoh_topic,
             telemetry_topic=telemetry_topic,
+            status_topic=status_topic,
+            edge_status_url=edge_status_url,
             **kwargs,
         )
 
@@ -127,6 +152,9 @@ class Droid:
 
     def subscribe_telemetry(self, callback: Any) -> TelemetrySubscription:
         """Subscribe to normalized state without polling the motor broker."""
+        return self._subscribe_json(self.telemetry_topic, callback)
+
+    def _subscribe_json(self, topic: str, callback: Any, normalizer: Any = None) -> TelemetrySubscription:
         session = self._zenoh or self._open_zenoh()
         self._zenoh = session
 
@@ -136,10 +164,20 @@ class Droid:
                 payload = payload.to_bytes()
             if isinstance(payload, (bytes, bytearray)):
                 payload = payload.decode("utf-8")
-            callback(json.loads(payload) if isinstance(payload, str) else payload)
+            value = json.loads(payload) if isinstance(payload, str) else payload
+            callback(normalizer(value) if normalizer else value)
 
-        subscriber = session.declare_subscriber(self.telemetry_topic, on_sample)
+        subscriber = session.declare_subscriber(topic, on_sample)
         return TelemetrySubscription(subscriber)
+
+    async def _status_snapshot(self) -> Dict[str, Any]:
+        if self.edge_status_url:
+            if self._http is None:
+                self._http = httpx.AsyncClient(timeout=15)
+            response = await self._http.request("GET", self.edge_status_url)
+            response.raise_for_status()
+            return normalize_device_status(response.json())
+        return normalize_device_status(await self._request("GET", "/v1/droids/status", params={"ref": self.name}))
 
     async def send_targets(
         self,
@@ -174,8 +212,8 @@ class Droid:
             "robot_id": str(identity["id"]),
             "trajectory_owner": "edge",
         }
-        session = self._zenoh_session or self._open_zenoh()
-        self._zenoh_session = session
+        session = self._zenoh or self._open_zenoh()
+        self._zenoh = session
         session.put(self.zenoh_topic, json.dumps(command, separators=(",", ":")).encode("utf-8"))
         return {
             "requestId": str(self._sequence),

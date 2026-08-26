@@ -10,6 +10,7 @@ import {
 } from "./effectors.js";
 import { GoldenEdgeClient } from "./golden-edge.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
+import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 
 export type DroidRef = string | { serialNumber?: string; droidId?: string; alias?: string };
 
@@ -344,6 +345,7 @@ export type DroidRealtimeState = "connecting" | "connected" | "reconnecting" | "
 
 export type DroidRealtimeEvent =
   | { type: "droid.updated"; droid: DroidIdentity }
+  | { type: "droid.status"; droid: Pick<DroidIdentity, "id" | "serialNumber">; status: Record<string, unknown> }
   | { type: "droid.telemetry"; droid: Pick<DroidIdentity, "id" | "serialNumber">; telemetry: Record<string, unknown> }
   | { type: "droid.cameras.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; cameras: DroidCamera[] }
   | { type: "droid.description.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; description: DroidDescription };
@@ -419,6 +421,8 @@ export type DroidConnectionOptions = {
   edgeEndpoint?: string;
   /** Full URL for an Edge-local telemetry snapshot compatible with DroidTelemetry. */
   edgeTelemetryUrl?: string;
+  /** Full URL for the canonical Edge-local vitrus.device.status.v1 snapshot. */
+  edgeStatusUrl?: string;
   /** Lease lifecycle route. Edge keeps acquire/renew/release robot-local. */
   controlTransport?: "bridge" | "edge";
   motionTransport?: "bridge" | "edge" | "zenoh";
@@ -583,6 +587,10 @@ export class Droid {
     snapshot: () => Promise<DroidTelemetry>;
     subscribe: (listener: (telemetry: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
   };
+  readonly status: {
+    snapshot: () => Promise<DeviceStatus>;
+    subscribe: (listener: (status: DeviceStatus) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
+  };
   readonly events: {
     subscribe: (listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
   };
@@ -672,6 +680,17 @@ export class Droid {
       subscribe: (listener, request) => this.subscribeEvents((event) => {
         if (event.type !== "droid.telemetry") return;
         listener(normalizeDroidTelemetry(event.telemetry));
+      }, request),
+    };
+    this.status = {
+      snapshot: async () => normalizeDeviceStatus(
+        this.options.edgeStatusUrl
+          ? await this.request<unknown>(this.options.edgeStatusUrl, { method: "GET" }, "GET edge status")
+          : await this.get<unknown>("/v1/droids/status"),
+      ),
+      subscribe: (listener, request) => this.subscribeEvents((event) => {
+        if (event.type !== "droid.status") return;
+        listener(normalizeDeviceStatus(event.status));
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribeEvents(listener, request) };
