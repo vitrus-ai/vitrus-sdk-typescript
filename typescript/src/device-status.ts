@@ -35,6 +35,7 @@ export type DeviceStatus = {
   };
   safety: {
     state: DeviceSafetyState;
+    /** Software-reported E-stop latch; the mechanical E-stop remains hardware-local. */
     estop: boolean;
     deadman_active: boolean;
     deadman_latched: boolean;

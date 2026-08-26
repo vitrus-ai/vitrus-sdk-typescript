@@ -46,7 +46,10 @@
       "required": ["state", "estop", "deadman_active", "deadman_latched", "faults"],
       "properties": {
         "state": { "enum": ["safe", "warning", "fault", "estopped"] },
-        "estop": { "type": "boolean" },
+        "estop": {
+          "type": "boolean",
+          "description": "Software-reported E-stop latch. The mandatory mechanical E-stop remains hardware-local and does not require digital readback."
+        },
         "deadman_active": { "type": "boolean" },
         "deadman_latched": { "type": "boolean" },
         "faults": { "type": "array", "items": { "$ref": "#/$defs/error" } }

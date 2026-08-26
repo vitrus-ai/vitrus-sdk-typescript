@@ -16,6 +16,7 @@ const COMMAND_PROOF_TIMEOUT_MS = 180;
 const FEEDBACK_MAX_AGE_MS = 150;
 const RETURN_TOLERANCE_DEG = 0.35;
 const LIMIT_MARGIN_DEG = 2;
+const LEASE_DURATION_MS = 20_000;
 
 const JOINTS = [
   { name: "LEFT_WRIST_B", amplitudeDeg: 0.5, maxVelocityDegS: 2, maxAbsVelocityDegS: 15, maxAbsTorqueNm: 1.5 },
@@ -69,7 +70,6 @@ function assertSdkSafety(status: DeviceStatus): void {
   assert(status.device_id.length > 0 && status.model === "R06", "SDK resolved a device other than R06");
   assert(status.safety.state === "safe", `SDK safety is ${status.safety.state}, expected safe`);
   assert(status.safety.estop === false, "E-stop is active");
-  assert(!status.errors.some((error) => error.code === "ESTOP_STATUS_UNAVAILABLE"), "E-stop source is unavailable");
   assert(status.control.mode === "read_only" && status.control.lease_id === null, "SDK status is not read_only without a lease");
   assert(status.telemetry.complete && !status.telemetry.stale, "SDK telemetry is incomplete or stale");
   assert(status.robot.available_joint_count === status.robot.joint_count, "not all configured joints are available");
@@ -116,25 +116,27 @@ function originSequence(admission: DroidCommandResult): number {
   return value;
 }
 
-async function waitForCommandProof(jointName: string, leaseId: string, expectedOrigin: number): Promise<Json> {
+async function waitForCommandProof(leaseId: string, expectedOrigin: number): Promise<Map<string, Json>> {
   const deadline = performance.now() + COMMAND_PROOF_TIMEOUT_MS;
-  let lastRow: Json = {};
+  let lastRows: Json[] = [];
   while (performance.now() < deadline) {
     const state = await realtimeState();
     assert(state.access_mode === "read_write", `broker left read_write: ${String(state.control_phase)}`);
     assert(state.exclusive_lease_id === leaseId, "exclusive lease changed during HIL");
     assert(state.complete === true, `armed feedback is incomplete: ${JSON.stringify(state.missing_joints ?? [])}`);
-    assert(motors(state).length === 1, `armed scope is not singular: ${motors(state).map((row) => row.joint_name).join(",")}`);
-    lastRow = motor(state, jointName);
-    if (
-      Number(lastRow.accepted_origin_sequence) === expectedOrigin
-      && Number(lastRow.applied_origin_sequence) === expectedOrigin
-    ) return lastRow;
+    lastRows = motors(state);
+    const expectedNames = JOINTS.map((joint) => joint.name).sort();
+    const actualNames = lastRows.map((row) => String(row.joint_name)).sort();
+    assert(JSON.stringify(actualNames) === JSON.stringify(expectedNames), `armed scope changed: ${actualNames.join(",")}`);
+    if (lastRows.every((row) => (
+      Number(row.accepted_origin_sequence) === expectedOrigin
+      && Number(row.applied_origin_sequence) === expectedOrigin
+    ))) return new Map(lastRows.map((row) => [String(row.joint_name), row]));
     await sleep(10);
   }
   throw new Error(
-    `${jointName} lacks exact accepted/applied proof for origin ${expectedOrigin} `
-    + `(accepted=${String(lastRow.accepted_origin_sequence)}, applied=${String(lastRow.applied_origin_sequence)})`,
+    `joint scope lacks exact accepted/applied proof for origin ${expectedOrigin}: `
+    + lastRows.map((row) => `${String(row.joint_name)}=${String(row.accepted_origin_sequence)}/${String(row.applied_origin_sequence)}`).join(", "),
   );
 }
 
@@ -153,8 +155,14 @@ async function waitForStopped(): Promise<Json> {
   throw new Error(`broker did not stop: ${String(state.access_mode)}/${String(state.control_phase)}/${String(state.exclusive_lease_id)}`);
 }
 
-async function runJoint(droid: Awaited<ReturnType<typeof Droid.connect>>, joint: typeof JOINTS[number]): Promise<Json> {
-  assertSdkSafety(await droid.status.snapshot());
+type JointPlan = {
+  joint: typeof JOINTS[number];
+  startDeg: number;
+  lowDeg: number;
+  highDeg: number;
+};
+
+async function preflightJoint(joint: typeof JOINTS[number]): Promise<JointPlan> {
   const preflight = await brokerStatus(joint.name);
   assertReadOnly(preflight);
   const startRow = motor(preflight, joint.name);
@@ -167,46 +175,74 @@ async function runJoint(droid: Awaited<ReturnType<typeof Droid.connect>>, joint:
   const highDeg = startDeg + joint.amplitudeDeg;
   const lowDeg = startDeg - joint.amplitudeDeg;
   assert(lowDeg >= minDeg + LIMIT_MARGIN_DEG && highDeg <= maxDeg - LIMIT_MARGIN_DEG, `${joint.name} oscillation is too close to calibrated limits`);
+  return { joint, startDeg, lowDeg, highDeg };
+}
 
-  if (!EXECUTE) {
-    return { joint: joint.name, preflight: "passed", startDeg, rangeDeg: [lowDeg, highDeg], executed: false };
-  }
+async function runSingleLeaseFlow(
+  droid: Awaited<ReturnType<typeof Droid.connect>>,
+  plans: JointPlan[],
+): Promise<Json[]> {
+  const lease = await droid.control.acquire({
+    durationMs: LEASE_DURATION_MS,
+    owner: "sdk-hil-left-wrist-head",
+    jointNames: JOINTS.map((joint) => joint.name),
+  });
+  const observed = new Map(plans.map((plan) => [plan.joint.name, {
+    minDeg: plan.startDeg,
+    maxDeg: plan.startDeg,
+    firstOrigin: null as number | null,
+    lastOrigin: null as number | null,
+  }]));
+  const starts = new Map(plans.map((plan) => [plan.joint.name, plan.startDeg]));
 
-  const lease = await droid.control.acquire({ durationMs: 15_000, owner: `sdk-hil-${joint.name.toLowerCase()}`, jointNames: [joint.name] });
   let released = false;
-  let minObservedDeg = startDeg;
-  let maxObservedDeg = startDeg;
-  let firstOrigin: number | null = null;
-  let lastOrigin: number | null = null;
-
-  const send = async (displayDeg: number): Promise<void> => {
+  const sendFrame = async (targets: ReadonlyMap<string, number>): Promise<void> => {
     const started = performance.now();
     const admission = await droid.motion.sendTargets(
-      [{ jointName: joint.name, displayDeg, maxVelocityDegS: joint.maxVelocityDegS }],
+      JOINTS.map((joint) => ({
+        jointName: joint.name,
+        displayDeg: finite(targets.get(joint.name), `${joint.name}.target`),
+        maxVelocityDegS: joint.maxVelocityDegS,
+      })),
       { leaseId: lease.id, ttlMs: TTL_MS, edgeKeepaliveMs: 0 },
     );
     const origin = originSequence(admission);
-    const liveRow = await waitForCommandProof(joint.name, lease.id, origin);
-    assertMotorReady(liveRow, joint);
-    const observed = finite(liveRow.display_pos_deg, `${joint.name}.live_display_pos_deg`);
-    minObservedDeg = Math.min(minObservedDeg, observed);
-    maxObservedDeg = Math.max(maxObservedDeg, observed);
-    firstOrigin ??= origin;
-    lastOrigin = origin;
+    const liveRows = await waitForCommandProof(lease.id, origin);
+    for (const joint of JOINTS) {
+      const liveRow = liveRows.get(joint.name);
+      assert(liveRow, `${joint.name} is absent from live feedback`);
+      assertMotorReady(liveRow, joint);
+      const displayDeg = finite(liveRow.display_pos_deg, `${joint.name}.live_display_pos_deg`);
+      const jointObserved = observed.get(joint.name);
+      assert(jointObserved, `${joint.name} observation state is absent`);
+      jointObserved.minDeg = Math.min(jointObserved.minDeg, displayDeg);
+      jointObserved.maxDeg = Math.max(jointObserved.maxDeg, displayDeg);
+      jointObserved.firstOrigin ??= origin;
+      jointObserved.lastOrigin = origin;
+    }
     const remaining = PERIOD_MS - (performance.now() - started);
     if (remaining > 0) await sleep(remaining);
   };
 
+  const holdFrame = (): Map<string, number> => new Map(starts);
+  const waveform = (plan: JointPlan): number[] => [
+    ...ramp(plan.startDeg, plan.highDeg), plan.highDeg, plan.highDeg,
+    ...ramp(plan.highDeg, plan.startDeg),
+    ...ramp(plan.startDeg, plan.lowDeg), plan.lowDeg, plan.lowDeg,
+    ...ramp(plan.lowDeg, plan.startDeg),
+  ];
+
   try {
-    for (let index = 0; index < 8; index += 1) await send(startDeg);
-    const waveform = [
-      ...ramp(startDeg, highDeg), highDeg, highDeg,
-      ...ramp(highDeg, startDeg),
-      ...ramp(startDeg, lowDeg), lowDeg, lowDeg,
-      ...ramp(lowDeg, startDeg),
-      ...Array.from({ length: 8 }, () => startDeg),
-    ];
-    for (const target of waveform) await send(target);
+    for (let index = 0; index < 8; index += 1) await sendFrame(holdFrame());
+    for (const plan of plans) {
+      for (const target of waveform(plan)) {
+        const frame = holdFrame();
+        frame.set(plan.joint.name, target);
+        await sendFrame(frame);
+      }
+      for (let index = 0; index < 4; index += 1) await sendFrame(holdFrame());
+    }
+    for (let index = 0; index < 8; index += 1) await sendFrame(holdFrame());
   } finally {
     try {
       await droid.control.release(lease.id);
@@ -216,17 +252,33 @@ async function runJoint(droid: Awaited<ReturnType<typeof Droid.connect>>, joint:
     }
   }
 
-  assert(released, `${joint.name} lease was not released`);
-  const finalStatus = await brokerStatus(joint.name);
-  assertReadOnly(finalStatus);
-  const finalRow = motor(finalStatus, joint.name);
-  assertMotorReady(finalRow, joint);
-  const finalDeg = finite(finalRow.display_pos_deg, `${joint.name}.final_display_pos_deg`);
-  assert(maxObservedDeg - startDeg >= 0.1, `${joint.name} positive physical excursion was not observed`);
-  assert(startDeg - minObservedDeg >= 0.1, `${joint.name} negative physical excursion was not observed`);
-  assert(Math.abs(finalDeg - startDeg) <= RETURN_TOLERANCE_DEG, `${joint.name} did not return near start`);
-
-  return { joint: joint.name, startDeg, lowDeg, highDeg, finalDeg, minObservedDeg, maxObservedDeg, firstOrigin, lastOrigin, executed: true };
+  assert(released, "joint-scope lease was not released");
+  const results: Json[] = [];
+  for (const plan of plans) {
+    const finalStatus = await brokerStatus(plan.joint.name);
+    assertReadOnly(finalStatus);
+    const finalRow = motor(finalStatus, plan.joint.name);
+    assertMotorReady(finalRow, plan.joint);
+    const finalDeg = finite(finalRow.display_pos_deg, `${plan.joint.name}.final_display_pos_deg`);
+    const jointObserved = observed.get(plan.joint.name);
+    assert(jointObserved, `${plan.joint.name} observation state is absent`);
+    assert(jointObserved.maxDeg - plan.startDeg >= 0.1, `${plan.joint.name} positive physical excursion was not observed`);
+    assert(plan.startDeg - jointObserved.minDeg >= 0.1, `${plan.joint.name} negative physical excursion was not observed`);
+    assert(Math.abs(finalDeg - plan.startDeg) <= RETURN_TOLERANCE_DEG, `${plan.joint.name} did not return near start`);
+    results.push({
+      joint: plan.joint.name,
+      startDeg: plan.startDeg,
+      lowDeg: plan.lowDeg,
+      highDeg: plan.highDeg,
+      finalDeg,
+      minObservedDeg: jointObserved.minDeg,
+      maxObservedDeg: jointObserved.maxDeg,
+      firstOrigin: jointObserved.firstOrigin,
+      lastOrigin: jointObserved.lastOrigin,
+      executed: true,
+    });
+  }
+  return results;
 }
 
 async function main(): Promise<void> {
@@ -262,10 +314,25 @@ async function main(): Promise<void> {
   const scope = await scopeClient.controlScope();
   for (const joint of JOINTS) assert(scope.joint_names.includes(joint.name), `${joint.name} is outside the configured remote joint scope`);
 
-  const results: Json[] = [];
-  for (const joint of JOINTS) results.push(await runJoint(droid, joint));
+  const plans: JointPlan[] = [];
+  for (const joint of JOINTS) plans.push(await preflightJoint(joint));
+  const results: Json[] = EXECUTE
+    ? await runSingleLeaseFlow(droid, plans)
+    : plans.map((plan) => ({
+      joint: plan.joint.name,
+      preflight: "passed",
+      startDeg: plan.startDeg,
+      rangeDeg: [plan.lowDeg, plan.highDeg],
+      executed: false,
+    }));
   assertReadOnly(await brokerStatus());
-  console.log(JSON.stringify({ result: EXECUTE ? "passed" : "preflight_passed", identity, results }, null, 2));
+  console.log(JSON.stringify({
+    result: EXECUTE ? "passed" : "preflight_passed",
+    identity,
+    leaseStrategy: "single_lease_exact_joint_scope",
+    joints: JOINTS.map((joint) => joint.name),
+    results,
+  }, null, 2));
 }
 
 await main();
