@@ -12,11 +12,95 @@ export type GoldenEdgeHealth = {
 
 export type GoldenEdgePublishResult = {
   ok: boolean;
-  transport: "dora";
+  transport: "dora" | "broker-direct";
   stream: "joint_targets";
   sequence?: number;
   dropped?: string;
   error?: string;
+  broker?: {
+    lease_id?: string;
+    seq?: number;
+    accepted?: number;
+    rejected?: unknown[];
+    access_mode?: string;
+    control_phase?: string;
+    deadman?: { active?: boolean; latched?: boolean };
+    feedback?: unknown[];
+  };
+};
+
+export type GoldenEdgeCartesianPoint = {
+  positionM: [number, number, number];
+  quaternionXyzw?: [number, number, number, number];
+  timeMs?: number;
+};
+
+export type GoldenEdgeIkTrajectoryResult = {
+  ok: boolean;
+  accepted: boolean;
+  command_id: number;
+  mode: "ik";
+  chain: string;
+  point_count: number;
+  ttl_ms: number;
+  alignment_profile: { id: string; frame_corrections_applied?: number };
+};
+
+/** Device-local execution evidence for the latest Cartesian target. */
+export type GoldenEdgeIkStatus = {
+  ok: boolean;
+  mode: "ready" | "ik";
+  tracking: boolean;
+  last_error: string | null;
+  last_error_command_id?: number | null;
+  /** Numerical no-progress while Edge continues holding the last safe target. */
+  last_warning?: string | null;
+  last_output: {
+    command_id: number;
+    chain: string;
+    lease_id: string;
+    writer_source: string;
+    status: string;
+    solver_status?: string;
+    broker_accepted?: number;
+    broker_rejected?: unknown[];
+  } | null;
+};
+
+export type GoldenEdgeCartesianPose = {
+  ok: boolean;
+  chain: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+  joint_names: string[];
+  alignment_profile: { id: string; frame_corrections_applied?: number };
+};
+
+export type GoldenEdgeJointState = {
+  joint_name: string;
+  connected?: boolean;
+  stale?: boolean;
+  fault?: unknown;
+  display_pos_deg?: number;
+  velocity_deg_s?: number;
+  torque_nm?: number;
+  feedback_age_ms?: number;
+  accepted_origin_sequence?: number;
+  applied_origin_sequence?: number;
+};
+
+export type GoldenEdgeControlState = {
+  ok: boolean;
+  transport: "broker-direct";
+  cycle_seq?: number;
+  complete?: boolean;
+  missing_joints?: string[];
+  access_mode?: string;
+  control_phase?: string;
+  exclusive_lease_id?: string | null;
+  global_control?: string;
+  deadman?: { active?: boolean; latched?: boolean; trip_count?: number };
+  motors?: GoldenEdgeJointState[];
 };
 
 export type GoldenEdgeReleaseResult = {
@@ -106,6 +190,13 @@ export class GoldenEdgeClient {
     return result;
   }
 
+  async controlState(): Promise<GoldenEdgeControlState> {
+    // State is a broker read, not a control-frame admission.  Respect the
+    // caller's configured diagnostic timeout so a transient Edge refresh
+    // cannot make an otherwise healthy HIL preflight look like a command loss.
+    return this.request<GoldenEdgeControlState>("/api/dora/control-state", { method: "GET" }, this.options.requestTimeoutMs ?? 1_000);
+  }
+
   async acquire(
     leaseId: string,
     options: { owner: string; durationMs: number; jointNames: string[] },
@@ -175,6 +266,58 @@ export class GoldenEdgeClient {
     });
     if (!result.ok || result.dropped) {
       throw new Error(result.error || result.dropped || "Golden Edge rejected joint targets");
+    }
+    return result;
+  }
+
+  async submitIkTrajectory(request: {
+    chain: string;
+    points: GoldenEdgeCartesianPoint[];
+    ttlMs: number;
+    alignmentProfile?: string | Record<string, unknown>;
+  }): Promise<GoldenEdgeIkTrajectoryResult> {
+    const chain = request.chain.trim().toUpperCase();
+    if (!chain || !Array.isArray(request.points) || !request.points.length) {
+      throw new Error("Golden Edge IK trajectory requires a chain and at least one point");
+    }
+    const result = await this.request<GoldenEdgeIkTrajectoryResult>("/api/dora/ik-targets", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        lease_id: this.leaseId,
+        session_id: this.leaseId,
+        chain,
+        ttl_ms: request.ttlMs,
+        points: request.points.map((point) => ({
+          position: point.positionM,
+          ...(point.quaternionXyzw ? { quaternion: point.quaternionXyzw } : {}),
+          ...(point.timeMs == null ? {} : { time_ms: point.timeMs }),
+        })),
+        ...(request.alignmentProfile == null ? {} : { alignment_profile: request.alignmentProfile }),
+      }),
+    }, 4_000);
+    if (!result.ok || result.accepted !== true || result.mode !== "ik") {
+      throw new Error("Golden Edge did not admit the IK trajectory");
+    }
+    return result;
+  }
+
+  async ikStatus(): Promise<GoldenEdgeIkStatus> {
+    const result = await this.request<GoldenEdgeIkStatus>("/api/dora/ik/status", { method: "GET" }, 3_000);
+    if (!result.ok || !["ready", "ik"].includes(result.mode)) {
+      throw new Error("Golden Edge returned an invalid IK execution status");
+    }
+    return result;
+  }
+
+  async currentCartesianPose(chain: string, alignmentProfile?: string): Promise<GoldenEdgeCartesianPose> {
+    const name = chain.trim().toUpperCase();
+    if (!name) throw new Error("Golden Edge current Cartesian pose requires a chain");
+    const query = new URLSearchParams({ chain: name });
+    if (alignmentProfile) query.set("alignment_profile", alignmentProfile);
+    const result = await this.request<GoldenEdgeCartesianPose>(`/api/dora/ik/current-pose?${query}`, { method: "GET" }, 3_000);
+    if (!result.ok || result.chain !== name || result.position.length !== 3 || result.quaternion.length !== 4) {
+      throw new Error("Golden Edge returned an invalid Cartesian pose");
     }
     return result;
   }

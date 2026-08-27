@@ -1,7 +1,7 @@
 import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry, validateDroidLeaseDurationMs } from "./droid.js";
 import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 export * from "./droid.js";
-import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { CameraFrame, ControlLease as BaseControlLease, DroidCartesianTrajectoryOptions, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -91,6 +91,7 @@ export class Droid {
   readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
   readonly motion: {
     sendTargets(targets: JointTarget[], options: DroidTargetOptions): Promise<DroidCommandResult>;
+    sendCartesianTrajectory(options: DroidCartesianTrajectoryOptions): Promise<DroidCommandResult>;
     primeAndWaitReady(targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions): Promise<DroidMotionReady>;
   };
   readonly safety;
@@ -131,9 +132,9 @@ export class Droid {
       // BaseDroid owns the Edge transport client and performs the synchronous
       // local acquire after creating the authenticated control-plane lease.
       acquire: (request = {}) => base.control.acquire(request) as Promise<ControlLease>,
-      renew: async (leaseId, request = {}) => this.post(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, {
-        durationMs: validateDroidLeaseDurationMs(request.durationMs),
-      }),
+      // In Edge mode the local broker owns the lease. Delegating keeps the
+      // public Droid wrapper on the same local renewal path as BaseDroid.
+      renew: (leaseId, request = {}) => base.control.renew(leaseId, request) as Promise<ControlLease>,
       // BaseDroid owns the active Edge transport client. Delegate release so
       // local broker torque-off acknowledgement happens before cloud revoke.
       release: (leaseId) => base.control.release(leaseId),

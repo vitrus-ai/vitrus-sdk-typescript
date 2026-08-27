@@ -384,6 +384,24 @@ export type DroidTargetOptions = {
   timeoutMs?: number;
 };
 
+/** Cartesian point in the robot-origin frame. Vitruvian solves this on Edge. */
+export type CartesianTargetPoint = {
+  positionM: [number, number, number];
+  quaternionXyzw?: [number, number, number, number];
+  /** Offset from trajectory start; points are executed locally by VitrusOS. */
+  timeMs?: number;
+};
+
+export type DroidCartesianTrajectoryOptions = {
+  leaseId: string;
+  chain: string;
+  points: CartesianTargetPoint[];
+  /** Lifetime of this robot-local trajectory, including its final hold. */
+  ttlMs?: number;
+  /** Alignment Studio snapshot or a profile id registered on this device. */
+  alignmentProfile?: string | Record<string, unknown>;
+};
+
 export type DroidEffectorCommandOptions = DroidTargetOptions & { maxTorqueNm?: number };
 
 export type DroidPrimeAndWaitReadyOptions = DroidTargetOptions & {
@@ -601,6 +619,7 @@ export class Droid {
   };
   readonly motion: {
     sendTargets: (targets: JointTarget[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
+    sendCartesianTrajectory: (options: DroidCartesianTrajectoryOptions) => Promise<DroidCommandResult>;
     primeAndWaitReady: (targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions) => Promise<DroidMotionReady>;
   };
   readonly safety: { emergencyStop: (reason?: string) => Promise<DroidCommandResult> };
@@ -740,11 +759,7 @@ export class Droid {
           if (!this.edgeClient || leaseId !== this.edgeLeaseId || !this.edgeControlOwner || !this.edgeControlJointNames.length) {
             throw new Error("Cannot renew a non-active Edge lease");
           }
-          await this.edgeClient.acquire(leaseId, {
-            owner: this.edgeControlOwner,
-            durationMs,
-            jointNames: this.edgeControlJointNames,
-          });
+          await this.edgeClient.renew(leaseId, durationMs);
           return {
             id: leaseId,
             droidId: (await this.identity.get()).id,
@@ -777,6 +792,7 @@ export class Droid {
     };
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
+      sendCartesianTrajectory: (request) => this.sendCartesianTrajectory(request),
       primeAndWaitReady: (targets, request) => this.primeAndWaitReady(targets, request),
     };
     this.safety = {
@@ -996,6 +1012,47 @@ export class Droid {
       ...admission,
       result: { ...(admission.result ?? {}), sdkSequence: command.sequence },
     };
+  }
+
+  private async sendCartesianTrajectory(request: DroidCartesianTrajectoryOptions): Promise<DroidCommandResult> {
+    if ((this.options.motionTransport ?? "bridge") !== "edge" || !this.options.edgeEndpoint) {
+      throw new Error("Cartesian trajectories require the robot-local Edge motion transport");
+    }
+    if (!request.leaseId.trim() || !request.chain.trim() || !request.points.length) {
+      throw new Error("Cartesian trajectory requires leaseId, chain, and points");
+    }
+    const ttlMs = request.ttlMs ?? 500;
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 50 || ttlMs > 30_000) {
+      throw new Error("Cartesian trajectory ttlMs must be in [50, 30000]");
+    }
+    for (const point of request.points) {
+      if (point.positionM.length !== 3 || !point.positionM.every(Number.isFinite)
+        || (point.quaternionXyzw && (point.quaternionXyzw.length !== 4 || !point.quaternionXyzw.every(Number.isFinite)))
+        || (point.timeMs != null && (!Number.isSafeInteger(point.timeMs) || point.timeMs < 0 || point.timeMs > ttlMs))) {
+        throw new Error("Cartesian trajectory contains an invalid point");
+      }
+    }
+    const identity = await this.identity.get();
+    if (!this.edgeClient) {
+      this.edgeClient = new GoldenEdgeClient({
+        endpoint: this.options.edgeEndpoint,
+        robotId: identity.id,
+        leaseId: request.leaseId,
+        source: "vitrus-sdk",
+        requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
+      });
+      this.edgeLeaseId = request.leaseId;
+    } else if (this.edgeLeaseId !== request.leaseId) {
+      this.edgeClient.setLease(request.leaseId);
+      this.edgeLeaseId = request.leaseId;
+    }
+    const result = await this.edgeClient.submitIkTrajectory({
+      chain: request.chain,
+      points: request.points,
+      ttlMs,
+      alignmentProfile: request.alignmentProfile,
+    });
+    return { requestId: `${request.leaseId}:${result.chain}`, status: "acknowledged", route: "local", result };
   }
 
   private async primeAndWaitReady(
