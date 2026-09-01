@@ -14,6 +14,8 @@
   "scripts": {
     "build": "tsc",
     "test": "bun test",
+    "smoke:dataplane-control": "bun run examples/dataplane-control-smoke.mts",
+    "hil:r06-left-arm-lift": "bun run examples/r06-left-arm-vitruvian-lift.mts",
     "prepublishOnly": "bun run build",
     "dev": "tsc --watch"
   },

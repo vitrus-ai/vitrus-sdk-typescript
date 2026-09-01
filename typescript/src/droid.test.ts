@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Droid } from "./droid-live.js";
+import { DEFAULT_CAMERA_FRAME_OPTIONS, Droid, DroidRequestTimeoutError } from "./droid-live.js";
+import { semanticEffectorManifest } from "./effectors.test.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -15,6 +16,45 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("Droid camera calibration", () => {
+  test("uses the inspection-image defaults for getFrame(camera)", async () => {
+    let requested: URL | null = null;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1" });
+      if (url.pathname === "/api/dora/cameras/frame") {
+        requested = url;
+        return new Response(new Uint8Array([1, 2, 3]), {
+          headers: { "content-type": "image/jpeg", "x-vitrus-frame-id": "head:42", "x-vitrus-captured-at": "2026-08-27T00:00:00Z" },
+        });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("R05", { apiKey: "test-key", endpoint: "https://relay.test", edgeCameraEndpoint: "http://edge.test" });
+    const frame = await droid.camera.getFrame("head_camera");
+    expect(requested?.searchParams.get("width")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.width));
+    expect(requested?.searchParams.get("height")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.height));
+    expect(requested?.searchParams.get("quality")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.quality));
+    expect(requested?.searchParams.get("consistency")).toBe("latest");
+    expect(frame.bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  test("opens a realtime stream without a snapshot profile", async () => {
+    const calls: URL[] = [];
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      calls.push(url);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1" });
+      if (url.pathname === "/api/dora/cameras/streams") return jsonResponse({ id: "stream-1", droidId: "droid-1", camera: "head_camera", expiresAt: "", transport: "webrtc", route: "direct", profile: "realtime", width: 640, height: 360, fps: 30 });
+      if (url.pathname === "/api/dora/cameras/offer") return jsonResponse({ sdp: "answer", type: "answer", camera: "head_camera" });
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("R05", { apiKey: "test-key", endpoint: "https://relay.test", edgeCameraEndpoint: "http://edge.test" });
+    const stream = await droid.camera.openStream("head_camera");
+    expect(stream.profile).toBe("realtime");
+    await stream.negotiate?.({ sdp: "offer", type: "offer" });
+    expect(calls.map((url) => url.pathname)).toEqual(["/v1/droids/resolve", "/api/dora/cameras/streams", "/api/dora/cameras/offer"]);
+  });
+
   test("combines VitrusOS fisheye intrinsics with Clay camera extrinsics", async () => {
     globalThis.fetch = async (input) => {
       const url = new URL(String(input));
@@ -159,6 +199,30 @@ describe("Droid camera calibration", () => {
 });
 
 describe("Droid realtime and control sessions", () => {
+  test("separates control-plane timeout and reports the timed-out operation", async () => {
+    globalThis.fetch = ((_, init) => new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })) as typeof fetch;
+
+    try {
+      await Droid.connect("VTRS-R06-2607-R2D2X", {
+        apiKey: "test-key",
+        endpoint: "https://relay.test",
+        controlPlaneTimeoutMs: 5,
+        motionAdmissionTimeoutMs: 250,
+      });
+      throw new Error("expected identity timeout");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DroidRequestTimeoutError);
+      expect(error).toMatchObject({
+        code: "VITRUS_REQUEST_TIMEOUT",
+        operation: "GET /v1/droids/resolve",
+        path: "/v1/droids/resolve",
+        timeoutMs: 5,
+      });
+    }
+  });
+
   test("sends motion with the Golden Dora joint-target contract", async () => {
     let command: Record<string, unknown> | null = null;
     globalThis.fetch = async (input, init) => {
@@ -187,8 +251,14 @@ describe("Droid realtime and control sessions", () => {
       motionTransport: "bridge",
     });
     await droid.motion.sendTargets(
-      [{ jointName: "LEFT_ELBOW", displayDeg: 12, maxVelocityDegS: 30 }],
-      { leaseId: "lease-1", timeoutMs: 400 },
+      [{
+        jointName: "LEFT_ELBOW",
+        displayDeg: 12,
+        maxVelocityDegS: 30,
+        maxAccelerationDegS2: 120,
+        maxTorqueNm: 0.25,
+      }],
+      { leaseId: "lease-1", ttlMs: 400, edgeKeepaliveMs: 1_500 },
     );
 
     expect(command).toMatchObject({
@@ -198,13 +268,255 @@ describe("Droid realtime and control sessions", () => {
       lease_id: "lease-1",
       sequence: 1,
       ttl_ms: 400,
+      edge_keepalive_ms: 1_500,
       safety: { requires_calibration: true, respect_limits: true },
-      targets: [{ joint_name: "LEFT_ELBOW", position_deg: 12, velocity_deg_s: 30 }],
+      targets: [{
+        joint_name: "LEFT_ELBOW",
+        position_deg: 12,
+        velocity_deg_s: 30,
+        eased_max_velocity_deg_s: 30,
+        eased_max_accel_deg_s: 120,
+        max_torque_nm: 0.25,
+      }],
     });
+
+    await expect(droid.motion.sendTargets(
+      [{ jointName: "LEFT_ELBOW", displayDeg: 12 }],
+      { leaseId: "lease-1", ttlMs: 400, edgeKeepaliveMs: 15_001 },
+    )).rejects.toThrow("edgeKeepaliveMs must be an integer between 1 and 15000 ms");
+  });
+
+  test("sends a discovered semantic effector through the direct SDK API", async () => {
+    let command: Record<string, unknown> | null = null;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/v1/droids/description") {
+        return jsonResponse({
+          schema: "vitrus.droid.description.v1",
+          revisionId: "description-7",
+          manifest: semanticEffectorManifest,
+        });
+      }
+      if (url.pathname === "/v1/droids/control/joint-targets") {
+        command = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({ requestId: "1", status: "queued", route: "relay" });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+    });
+    await droid.effectors.command(
+      "right_gripper",
+      { aperture: 0.5, shape: 1 },
+      { leaseId: "lease-1", ttlMs: 400, maxTorqueNm: 0.2 },
+    );
+
+    expect(command).toMatchObject({
+      semantic_effectors: {
+        schema: "vitrus.control.effectors.v1",
+        description_revision_id: "description-7",
+        commands: [{
+          effector_id: "right_gripper",
+          model_id: "r06.opposed_serial_digits",
+          model_revision: "1.0.0",
+          command_type: "aperture_shape",
+          values: { aperture: 0.5, shape: 1 },
+          limits: { max_torque_nm: 0.2 },
+        }],
+      },
+      targets: [
+        { joint_name: "LEFT_A", percent: 70 },
+        { joint_name: "LEFT_B", percent: 30 },
+        { joint_name: "RIGHT_A", percent: 30 },
+        { joint_name: "RIGHT_B", percent: 70 },
+      ],
+    });
+  });
+
+  test("primes an aligned hold and waits for the exact Edge lease to accept it", async () => {
+    let telemetryPolls = 0;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          displayName: "R-06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/v1/droids/control/joint-targets") {
+        return jsonResponse({ requestId: "hold-1", status: "queued", route: "relay" });
+      }
+      if (url.pathname === "/v1/droids/telemetry") {
+        telemetryPolls += 1;
+        const ready = telemetryPolls > 1;
+        return jsonResponse({
+          schema: "vitrus.motor_bridge.realtime.v1",
+          timestamp: new Date().toISOString(),
+          access_mode: "read_write",
+          control_phase: ready ? "ready_for_realtime" : "holding_current_pose",
+          exclusive_lease_id: "lease-1",
+          motors: [{
+            joint_name: "RIGHT_WRIST_B",
+            accepted_origin_sequence: ready ? 1 : null,
+            applied_origin_sequence: ready ? 1 : null,
+          }],
+          // The deployed Dataplane also retains an older raw copy. Root is
+          // authoritative and must be recognized without motor_bridge nesting.
+          raw: {
+            access_mode: "read_write",
+            control_phase: ready ? "ready_for_realtime" : "holding_current_pose",
+          },
+        });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      motionTransport: "bridge",
+    });
+    const ready = await droid.motion.primeAndWaitReady(
+      [{ jointName: "RIGHT_WRIST_B", displayDeg: -28.2 }],
+      {
+        leaseId: "lease-1",
+        ttlMs: 5_000,
+        edgeKeepaliveMs: 1_000,
+        readinessTimeoutMs: 1_000,
+        pollIntervalMs: 10,
+      },
+    );
+
+    expect(ready).toMatchObject({
+      phase: "ready_for_realtime",
+      leaseId: "lease-1",
+      acceptedTargetCount: 1,
+      appliedTargetCount: 1,
+      originSequence: 1,
+      admission: { status: "queued", route: "relay" },
+    });
+    expect(telemetryPolls).toBe(2);
+  });
+
+  test("sends one aligned hold while Edge owns local keepalive", async () => {
+    let targetAdmissions = 0;
+    let telemetryPolls = 0;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({
+          id: "droid-1",
+          serialNumber: "VTRS-R06-2607-R2D2X",
+          model: "R06",
+          displayName: "R-06",
+          organizationId: "org-1",
+          status: "online",
+          enrollmentState: "enrolled",
+        });
+      }
+      if (url.pathname === "/v1/droids/control/joint-targets") {
+        targetAdmissions += 1;
+        return jsonResponse({ requestId: `hold-${targetAdmissions}`, status: "queued", route: "relay" });
+      }
+      if (url.pathname === "/v1/droids/telemetry") {
+        telemetryPolls += 1;
+        const ready = telemetryPolls >= 3;
+        return jsonResponse({
+          schema: "vitrus.motor_bridge.realtime.v1",
+          timestamp: new Date().toISOString(),
+          access_mode: ready ? "read_write" : "read_only",
+          control_phase: ready ? "ready_for_realtime" : "read_only",
+          exclusive_lease_id: ready ? "lease-1" : null,
+          motors: [{
+            joint_name: "RIGHT_WRIST_B",
+            accepted_origin_sequence: ready ? 1 : null,
+            applied_origin_sequence: ready ? 1 : null,
+          }],
+        });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      motionTransport: "bridge",
+    });
+    const ready = await droid.motion.primeAndWaitReady(
+      [{ jointName: "RIGHT_WRIST_B", displayDeg: -28.2 }],
+      {
+        leaseId: "lease-1",
+        ttlMs: 5_000,
+        edgeKeepaliveMs: 50,
+        readinessTimeoutMs: 1_000,
+        pollIntervalMs: 10,
+      },
+    );
+
+    expect(targetAdmissions).toBe(1);
+    expect(telemetryPolls).toBeGreaterThanOrEqual(3);
+    expect(ready.originSequence).toBe(1);
+    expect(ready.acceptedTargetCount).toBe(1);
+    expect(ready.appliedTargetCount).toBe(1);
+  });
+
+  test("continues bounded Edge priming after one transient readiness observation failure", async () => {
+    let controlStateReads = 0;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X", model: "R06", displayName: "R-06", organizationId: "org-1", status: "online", enrollmentState: "enrolled" });
+      }
+      if (url.pathname === "/api/dora/joint-targets") {
+        return jsonResponse({ ok: true, transport: "broker-direct", stream: "joint_targets", sdkSequence: 1 });
+      }
+      if (url.pathname === "/api/dora/control-heartbeat") {
+        return jsonResponse({ ok: true, transport: "broker-direct", lease_id: "lease-1", hold_active: true });
+      }
+      if (url.pathname === "/api/dora/control-state") {
+        controlStateReads += 1;
+        if (controlStateReads === 1) return jsonResponse({ ok: false, error: "timed out" }, 400);
+        return jsonResponse({
+          ok: true, transport: "broker-direct", access_mode: "read_write", control_phase: "ready_for_realtime", exclusive_lease_id: "lease-1",
+          motors: [{ joint_name: "RIGHT_WRIST_B", accepted_origin_sequence: 1, applied_origin_sequence: 1 }],
+        });
+      }
+      return jsonResponse({ detail: `not found: ${url.pathname}` }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://edge.test:8782", motionTransport: "edge", motionAdmissionTimeoutMs: 1_000,
+    });
+    const ready = await droid.motion.primeAndWaitReady(
+      [{ jointName: "RIGHT_WRIST_B", displayDeg: -28.2 }],
+      { leaseId: "lease-1", ttlMs: 5_000, edgeKeepaliveMs: 1_000, readinessTimeoutMs: 1_000, pollIntervalMs: 10 },
+    );
+
+    expect(ready).toMatchObject({ phase: "ready_for_realtime", leaseId: "lease-1", acceptedTargetCount: 1, appliedTargetCount: 1 });
+    expect(controlStateReads).toBe(2);
   });
 
   test("sends motion through the explicit local Golden Edge transport", async () => {
     const requestedPaths: string[] = [];
+    let activeEdgeLeaseId = "";
     globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
       requestedPaths.push(url.pathname);
@@ -223,6 +535,39 @@ describe("Droid realtime and control sessions", () => {
         const command = JSON.parse(String(init?.body)) as { sequence: number };
         return jsonResponse({ ok: true, transport: "dora", stream: "joint_targets", sequence: command.sequence });
       }
+      if (url.pathname === "/api/dora/control-heartbeat") {
+        return jsonResponse({ ok: true, transport: "dora", lease_id: activeEdgeLeaseId, hold_active: true });
+      }
+      if (url.pathname === "/api/dora/control-state") {
+        return jsonResponse({
+          ok: true,
+          transport: "broker-direct",
+          access_mode: "read_write",
+          control_phase: "ready_for_realtime",
+          exclusive_lease_id: activeEdgeLeaseId,
+          motors: [{ joint_name: "NECK_HEAD", accepted_origin_sequence: 3, applied_origin_sequence: 3 }],
+        });
+      }
+      if (url.pathname === "/api/dora/acquire") {
+        const acquireBody = JSON.parse(String(init?.body)) as { lease_id: string };
+        const leaseId = String(acquireBody.lease_id);
+        activeEdgeLeaseId = leaseId;
+        return jsonResponse({ ok: true, transport: "dora", acquired: true, lease_id: leaseId });
+      }
+      if (url.pathname === "/api/dora/release") {
+        return jsonResponse({ ok: true, transport: "dora", released: true, lease_id: "lease-1" });
+      }
+      if (url.pathname === "/api/motor-bridge/status") {
+        return jsonResponse({
+          access_mode: "read_write",
+          control_phase: "ready_for_realtime",
+          global_control: "drive",
+          motors: [{ joint_name: "NECK_HEAD", display_pos_deg: 5, feedback_generation: 7 }],
+        });
+      }
+      if (url.pathname.includes("/v1/droids/control/leases/") && init?.method === "DELETE") {
+        return jsonResponse({ released: true });
+      }
       return jsonResponse({ detail: "unexpected bridge request" }, 500);
     };
 
@@ -230,20 +575,41 @@ describe("Droid realtime and control sessions", () => {
       apiKey: "test-key",
       endpoint: "https://relay.test",
       edgeEndpoint: "http://r06-edge:8782",
+      edgeTelemetryUrl: "http://r06-edge:8775/api/motor-bridge/status?fast=1",
       motionTransport: "edge",
+      controlTransport: "edge",
     });
+    const lease = await droid.control.acquire({ durationMs: 30_000, owner: "test", jointNames: ["NECK_HEAD"] });
     const result = await droid.motion.sendTargets(
       [{ jointName: "NECK_HEAD", displayDeg: 5 }],
-      { leaseId: "lease-1", timeoutMs: 250 },
+      { leaseId: lease.id, timeoutMs: 250 },
     );
     const second = await droid.motion.sendTargets(
       [{ jointName: "NECK_HEAD", displayDeg: 6 }],
-      { leaseId: "lease-1", timeoutMs: 250 },
+      { leaseId: lease.id, timeoutMs: 250 },
     );
+    const primed = await droid.motion.primeAndWaitReady(
+      [{ jointName: "NECK_HEAD", displayDeg: 6 }],
+      { leaseId: lease.id, ttlMs: 5_000, edgeKeepaliveMs: 1_000, readinessTimeoutMs: 100, pollIntervalMs: 10 },
+    );
+    const telemetry = await droid.telemetry.snapshot();
+    await droid.control.release(lease.id);
 
     expect(result).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
     expect(second.requestId).toBe("2");
-    expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/joint-targets", "/api/dora/joint-targets"]);
+    expect(primed).toMatchObject({ phase: "ready_for_realtime", acceptedTargetCount: 1, appliedTargetCount: 1, originSequence: 3 });
+    expect(telemetry.joints.NECK_HEAD?.feedback_generation).toBe(7);
+    expect(requestedPaths).toEqual([
+      "/v1/droids/resolve",
+      "/api/dora/acquire",
+      "/api/dora/joint-targets",
+      "/api/dora/joint-targets",
+      "/api/dora/joint-targets",
+      "/api/dora/control-heartbeat",
+      "/api/dora/control-state",
+      "/api/motor-bridge/status",
+      "/api/dora/release",
+    ]);
   });
 
   test("publishes motion through a persistent Zenoh session", async () => {
@@ -277,7 +643,15 @@ describe("Droid realtime and control sessions", () => {
     expect(first).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
     expect(second.requestId).toBe("2");
     expect(published).toHaveLength(2);
-    expect(published[0]).toMatchObject({ topic: "vitrus/servo/targets", payload: { lease_id: "lease-1", seq: 1, target: { joint_name: "NECK_HEAD", display_deg: 5 } } });
+    expect(published[0]).toMatchObject({
+      topic: "vitrus/control/joint_targets",
+      payload: {
+        type: "clay_joint_targets",
+        lease_id: "lease-1",
+        sequence: 1,
+        targets: [{ joint_name: "NECK_HEAD", display_deg: 5 }],
+      },
+    });
   });
 
   test("lists registered droids using the configured API key", async () => {
@@ -348,6 +722,12 @@ describe("Droid realtime and control sessions", () => {
     await droid.control.release(lease.id);
     expect(requests.some((request) => request.method === "DELETE" && request.path.includes("media-1"))).toBe(true);
     expect(requests.some((request) => request.method === "DELETE" && request.path.includes("lease-1"))).toBe(true);
+    await expect(droid.control.acquire({ durationMs: 30_001 })).rejects.toThrow(
+      "durationMs must be an integer in [1000, 30000]",
+    );
+    await expect(droid.control.renew(lease.id, { durationMs: 999 })).rejects.toThrow(
+      "durationMs must be an integer in [1000, 30000]",
+    );
   });
 
   test("filters Bridge realtime telemetry to the connected droid", async () => {
@@ -366,12 +746,23 @@ describe("Droid realtime and control sessions", () => {
       endpoint: "https://relay.test",
       webSocketFactory: () => socket as unknown as WebSocket,
     });
-    const received: string[] = [];
-    const subscription = await droid.telemetry.subscribe((telemetry) => received.push(String(telemetry.raw.robot)));
+    const received: Array<{ robot: string; phase: unknown; motors: number }> = [];
+    const subscription = await droid.telemetry.subscribe((telemetry) => received.push({
+      robot: String(telemetry.raw.robot),
+      phase: telemetry.motorBridge?.control_phase,
+      motors: Array.isArray(telemetry.motorBridge?.motors) ? telemetry.motorBridge.motors.length : 0,
+    }));
     socket.emit("open");
     socket.emit("message", { type: "droid.telemetry", droid: { id: "other", serialNumber: "VTRS-R05-2607-ABCDZ" }, telemetry: { robot: "other" } });
-    socket.emit("message", { type: "droid.telemetry", droid: { id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" }, telemetry: { schema: "vitrus.telemetry.state.v1", timestamp: "2026-07-16T00:00:00Z", robot: "R-06" } });
-    expect(received).toEqual(["R-06"]);
+    socket.emit("message", { type: "droid.telemetry", droid: { id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" }, telemetry: {
+      schema: "vitrus.motor_bridge.realtime.v1",
+      timestamp: "2026-07-16T00:00:00Z",
+      robot: "R-06",
+      access_mode: "read_only",
+      control_phase: "read_only",
+      motors: [{ joint_name: "RIGHT_WRIST_B" }],
+    } });
+    expect(received).toEqual([{ robot: "R-06", phase: "read_only", motors: 1 }]);
     expect(JSON.parse(socket.sent[0])).toEqual({ type: "subscribe", topics: ["droids"] });
     subscription.close();
     expect(subscription.state).toBe("closed");

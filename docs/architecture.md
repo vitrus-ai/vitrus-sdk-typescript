@@ -6,9 +6,15 @@
 
 Leases, authorization, emergency stop, command validation and audit travel through the Vitrus Bridge. The browser never receives robot network coordinates.
 
+Semantic effector intent travels inside the same atomic joint-target frame as
+arm motion. Robot descriptions own anatomy, variables, profiles, driver scope,
+and model revision; the SDK owns the versioned envelope; VitrusOS owns final
+calibrated resolution. A revision mismatch, disabled effector, missing preview
+joint, or unsupported command type is rejected before broker admission.
+
 ### Telemetry
 
-One VitrusOS publisher reads the motor broker and publishes the canonical typed `vitrus/state/motor_state` stream. The older `vitrus/telemetry/state` blob remains a Web/compatibility stream. Python edge clients subscribe to the typed stream over native Zenoh, while Web clients receive a normalized snapshot/event stream through the Bridge relay. Any number of subscribers can read the same stream without multiplying hardware reads. Telemetry should be sampled independently from the motor loop.
+One VitrusOS publisher reads the motor broker and publishes the normalized `vitrus/telemetry/state` stream used by current direct-IP clients. The SDK sends one atomic full-pose command on `vitrus/control/joint_targets`; Web clients receive a normalized snapshot/event stream through the Bridge relay. Any number of subscribers can read the same stream without multiplying hardware reads. Telemetry is sampled independently from the motor loop.
 
 ### Camera
 

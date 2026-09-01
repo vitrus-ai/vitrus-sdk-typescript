@@ -1,6 +1,8 @@
-import { Droid as BaseDroid } from "./droid.js";
+import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry, validateDroidLeaseDurationMs } from "./droid.js";
+import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 export * from "./droid.js";
-import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidRef, DroidTelemetry, JointTarget } from "./droid.js";
+import type { CameraFrame, CameraFrameOptions, CameraStream, CameraStreamOptions, ControlLease as BaseControlLease, DroidCartesianTrajectoryOptions, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { GoldenEdgeModuleCatalog } from "./golden-edge.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -9,6 +11,7 @@ export type ControlLease = BaseControlLease & { owner: string };
 export type DroidRealtimeState = "connecting" | "connected" | "reconnecting" | "closed" | "error";
 export type DroidRealtimeEvent =
   | { type: "droid.updated"; droid: DroidIdentity }
+  | { type: "droid.status"; droid: Pick<DroidIdentity, "id" | "serialNumber">; status: Record<string, unknown> }
   | { type: "droid.telemetry"; droid: Pick<DroidIdentity, "id" | "serialNumber">; telemetry: Record<string, unknown> }
   | { type: "droid.cameras.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; cameras: DroidCamera[] }
   | { type: "droid.description.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; description: DroidDescription };
@@ -29,7 +32,7 @@ export class Droid {
   static async list(options: LiveDroidConnectionOptions): Promise<DroidIdentity[]> {
     const baseUrl = (options.endpoint || options.relayUrl || DEFAULT_DATAPLANE_URL).replace(/\/+$/, "");
     const headers = { authorization: `Bearer ${options.apiKey}` };
-    const response = await fetch(`${baseUrl}/v1/droids`, { headers });
+    const response = await controlPlaneFetch(`${baseUrl}/v1/droids`, { headers }, options, "GET /v1/droids");
     const payload = await response.json().catch(() => null) as unknown;
     if (response.ok) {
       if (!Array.isArray(payload)) throw new Error("Vitrus Bridge returned an invalid droid catalog");
@@ -42,7 +45,7 @@ export class Droid {
     // The deployed Render dataplane currently exposes registered runtime robots
     // through the established Bridge /devices contract. Keep this compatibility
     // path until /v1/droids is deployed there.
-    const devicesResponse = await fetch(`${baseUrl}/devices`, { headers });
+    const devicesResponse = await controlPlaneFetch(`${baseUrl}/devices`, { headers }, options, "GET /devices");
     const devicesPayload = await devicesResponse.json().catch(() => null) as unknown;
     if (!devicesResponse.ok) {
       throw new Error(`Vitrus Bridge request failed (${devicesResponse.status}): ${String(record(devicesPayload).detail ?? devicesResponse.statusText)}`);
@@ -80,11 +83,19 @@ export class Droid {
 
   readonly identity;
   readonly description;
-  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
+  readonly presets;
+  readonly effectors;
+  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string, options?: CameraFrameOptions): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openStream(camera: string, options?: CameraStreamOptions): Promise<CameraStream>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
   readonly telemetry: { snapshot(): Promise<DroidTelemetry>; subscribe(listener: (value: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
+  readonly status: { snapshot(): Promise<DeviceStatus>; subscribe(listener: (value: DeviceStatus) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly events: { subscribe(listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
-  readonly control: { acquire(options?: { durationMs?: number; owner?: string }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
-  readonly motion: { sendTargets(targets: JointTarget[], options: { leaseId: string; timeoutMs?: number }): Promise<DroidCommandResult> };
+  readonly modules: { list(): Promise<GoldenEdgeModuleCatalog>; configure(moduleId: string, settings: Record<string, unknown>): Promise<Record<string, unknown>> };
+  readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
+  readonly motion: {
+    sendTargets(targets: JointTarget[], options: DroidTargetOptions): Promise<DroidCommandResult>;
+    sendCartesianTrajectory(options: DroidCartesianTrajectoryOptions): Promise<DroidCommandResult>;
+    primeAndWaitReady(targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions): Promise<DroidMotionReady>;
+  };
   readonly safety;
   private identityCache: DroidIdentity | null = null;
   private readonly clientId: string;
@@ -93,28 +104,44 @@ export class Droid {
     this.clientId = options.clientId?.trim() || `vitrus-sdk-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
     this.identity = base.identity;
     this.description = base.description;
+    this.presets = base.presets;
+    this.effectors = base.effectors;
     this.motion = base.motion;
     this.safety = base.safety;
     this.camera = {
       list: () => base.camera.list() as Promise<DroidCamera[]>,
-      getFrame: (camera) => base.camera.getFrame(camera),
+      getFrame: (camera, request = {}) => base.camera.getFrame(camera, request),
       getCalibration: (camera) => this.calibration(camera),
-      openSession: (camera, request = {}) => this.post("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
-      closeSession: (sessionId) => this.remove(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`),
+      openStream: (camera, request = {}) => base.camera.openStream(camera, request),
+      openSession: (camera, request = {}) => base.camera.openSession(camera, request),
+      closeSession: (sessionId) => base.camera.closeSession(sessionId),
     };
     this.telemetry = {
       snapshot: () => base.telemetry.snapshot(),
       subscribe: (listener, request) => this.subscribe((event) => {
         if (event.type !== "droid.telemetry") return;
-        const raw = event.telemetry;
-        listener({ schema: typeof raw.schema === "string" ? raw.schema : "vitrus.telemetry.state.v1", timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString(), joints: record(raw.joints), cameras: Array.isArray(raw.cameras) ? raw.cameras.map(record) : undefined, motorBridge: record(raw.motor_bridge ?? raw.motorBridge), raw });
+        listener(normalizeDroidTelemetry(event.telemetry));
+      }, request),
+    };
+    this.status = {
+      snapshot: () => base.status.snapshot(),
+      subscribe: (listener, request) => this.subscribe((event) => {
+        if (event.type !== "droid.status") return;
+        listener(normalizeDeviceStatus(event.status));
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribe(listener, request) };
+    this.modules = { list: () => base.modules.list(), configure: (moduleId, settings) => base.modules.configure(moduleId, settings) };
     this.control = {
-      acquire: (request = {}) => this.post("/v1/droids/control/leases", { durationMs: request.durationMs, owner: request.owner?.trim() || this.clientId }),
-      renew: (leaseId, request = {}) => this.post(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, request),
-      release: (leaseId) => this.remove(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`),
+      // BaseDroid owns the Edge transport client and performs the synchronous
+      // local acquire after creating the authenticated control-plane lease.
+      acquire: (request = {}) => base.control.acquire(request) as Promise<ControlLease>,
+      // In Edge mode the local broker owns the lease. Delegating keeps the
+      // public Droid wrapper on the same local renewal path as BaseDroid.
+      renew: (leaseId, request = {}) => base.control.renew(leaseId, request) as Promise<ControlLease>,
+      // BaseDroid owns the active Edge transport client. Delegate release so
+      // local broker torque-off acknowledgement happens before cloud revoke.
+      release: (leaseId) => base.control.release(leaseId),
     };
   }
 
@@ -180,6 +207,27 @@ export class Droid {
   private appendRef(params: URLSearchParams): void { if (typeof this.ref === "string") params.set("ref", this.ref); else { if (this.ref.serialNumber) params.set("serial_number", this.ref.serialNumber); if (this.ref.droidId) params.set("droid_id", this.ref.droidId); if (this.ref.alias) params.set("alias", this.ref.alias); } }
   private async post<T>(path: string, body: unknown): Promise<T> { return this.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); }
   private async remove(path: string): Promise<void> { await this.request(path, { method: "DELETE" }); }
-  private async request<T>(path: string, init: RequestInit): Promise<T> { const url = new URL(`${this.baseUrl()}${path}`); this.appendRef(url.searchParams); const response = await fetch(url, { ...init, headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) } }); const payload = await response.json().catch(() => null) as unknown; if (!response.ok) throw new Error(`Vitrus Droid request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`); return payload as T; }
+  private async request<T>(path: string, init: RequestInit): Promise<T> { const url = new URL(`${this.baseUrl()}${path}`); this.appendRef(url.searchParams); const response = await controlPlaneFetch(url.toString(), { ...init, headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) } }, this.options, `${init.method ?? "GET"} ${path}`); const payload = await response.json().catch(() => null) as unknown; if (!response.ok) throw new Error(`Vitrus Droid request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`); return payload as T; }
   private realtimeUrl(): string { const url = new URL(this.baseUrl()); url.protocol = url.protocol === "https:" ? "wss:" : "ws:"; url.pathname = `${url.pathname.replace(/\/+$/, "")}/realtime`; url.search = ""; url.searchParams.set("api_key", this.options.apiKey); return url.toString(); }
+}
+
+async function controlPlaneFetch(
+  url: string,
+  init: RequestInit,
+  options: LiveDroidConnectionOptions,
+  operation: string,
+): Promise<Response> {
+  const timeoutMs = options.controlPlaneTimeoutMs ?? options.timeoutMs ?? 15_000;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+      throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }

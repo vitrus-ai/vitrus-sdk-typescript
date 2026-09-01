@@ -1,9 +1,15 @@
 import { Droid } from './droid-live.js';
+export * from './edge-control-session.js';
+export * from './motion-job.js';
+export * from './golden-edge.js';
 
 export * from './droid-live.js';
 export * from './contracts.js';
 export * from './golden-edge.js';
 export * from './zenoh-edge.js';
+export * from './joint-stop-calibration.js';
+export * from './effectors.js';
+export * from './device-status.js';
 
 /**
  * Vitrus SDK

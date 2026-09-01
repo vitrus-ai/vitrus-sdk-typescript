@@ -37,8 +37,8 @@ def test_multiple_clients_can_subscribe_without_motor_polling():
     first_session.callback(type("Sample", (), {"payload": payload.encode()})())
     second_session.callback(type("Sample", (), {"payload": payload.encode()})())
 
-    assert first_session.topic == "vitrus/state/motor_state"
-    assert second_session.topic == "vitrus/state/motor_state"
+    assert first_session.topic == "vitrus/telemetry/state"
+    assert second_session.topic == "vitrus/telemetry/state"
     assert len(received) == 2
     first_subscription.close()
     second_subscription.close()

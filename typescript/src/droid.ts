@@ -1,6 +1,16 @@
-import { createJointTargetsMessage, type ControlJointTargetsMessage } from "./contracts.js";
-import { GoldenEdgeClient } from "./golden-edge.js";
-import { ZenohEdgeClient, type ZenohEdgeSession } from "./zenoh-edge.js";
+import { createJointTargetsMessage, type ControlJointTarget, type ControlJointTargetsMessage, type ControlModelBinding } from "./contracts.js";
+import {
+  EFFECTOR_COMMANDS_SCHEMA,
+  createEffectorCommand,
+  effectorsFromManifest,
+  resolveEffectorCommand,
+  type EffectorCommand,
+  type EffectorCommandEnvelope,
+  type EffectorInstance,
+} from "./effectors.js";
+import { GoldenEdgeClient, type GoldenEdgeModuleCatalog } from "./golden-edge.js";
+import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
+import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 
 export type DroidRef = string | { serialNumber?: string; droidId?: string; alias?: string };
 
@@ -26,7 +36,222 @@ export type DroidDescription = {
   cameras?: Array<Record<string, unknown>>;
   calibration?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  presetDefinitions?: DroidPresetDefinition[];
+  presets?: DroidPresetInstance[];
 };
+
+export type DroidPresetVariable = {
+  type: "number" | "boolean" | "enum";
+  default: number | boolean | string;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: string[];
+};
+
+export type DroidPresetActuatorKind = "bldc" | "servo";
+export type DroidPresetCommandMode = "position" | "velocity" | "torque";
+export type DroidPresetFeedbackField = "position" | "velocity" | "torque" | "temperature" | "fault";
+
+export type DroidPresetActuatorSlot = {
+  id: string;
+  label: string;
+  kind: DroidPresetActuatorKind;
+  commandModes: DroidPresetCommandMode[];
+  feedback: DroidPresetFeedbackField[];
+};
+
+export type DroidPresetOutput = {
+  id: string;
+  label: string;
+  type: "number" | "boolean" | "enum";
+  unit?: string;
+  options?: string[];
+};
+
+export type DroidPresetDefinition = {
+  definitionId: string;
+  version: string;
+  label: string;
+  description?: string;
+  targetType?: "gripper" | "arm" | "mobile_base" | "custom";
+  artifactHash: string;
+  actuatorSlots: DroidPresetActuatorSlot[];
+  inputs: Record<string, DroidPresetVariable>;
+  outputs: DroidPresetOutput[];
+};
+
+export type DroidPresetInstance = {
+  presetId: string;
+  instanceId: string;
+  definitionId?: string;
+  definitionVersion?: string;
+  artifactHash?: string;
+  label?: string;
+  description?: string;
+  color?: string;
+  gripperGroup: string;
+  targetType?: "gripper" | "arm" | "mobile_base" | "custom";
+  targetId?: string;
+  controllerSide?: "left" | "right";
+  variables: Record<string, DroidPresetVariable>;
+  channels: Array<{ id: string; label?: string; input?: string; ratePctPerSecond?: number }>;
+  actuatorBindings?: Record<string, string>;
+  available?: boolean;
+  unavailableReason?: string;
+  inputBindings?: Array<{ input: string; variableId: string; mode: "rate" | "absolute"; deadzone?: number; invert?: boolean }>;
+};
+
+export type DroidPresetRun = {
+  runId: string;
+  instanceId: string;
+  definitionId: string;
+  definitionVersion: string;
+  artifactHash: string;
+  status: "starting" | "running" | "stopping" | "completed" | "failed" | "stopped";
+  leaseId?: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  fault?: string;
+};
+
+export type DroidPresetState = DroidPresetRun & {
+  sequence: number;
+  inputs: Record<string, number | boolean | string>;
+  outputs: Record<string, number | boolean | string>;
+  actuators: Record<string, {
+    actuatorId: string;
+    position?: number;
+    velocity?: number;
+    torque?: number;
+    temperature?: number;
+    fault?: string | null;
+  }>;
+};
+
+export type DroidPresetStartOptions = {
+  inputs?: Record<string, number | boolean | string>;
+  leaseId?: string;
+};
+
+export type DroidPresetInputOptions = {
+  sequence?: number;
+  leaseId?: string;
+};
+
+export function presetDefinitionsFromDescription(description: DroidDescription): DroidPresetDefinition[] {
+  if (Array.isArray(description.presetDefinitions)) return description.presetDefinitions;
+  const manifest = parseJsonRecord(description.manifest);
+  const candidates = Array.isArray(manifest.preset_motion_definitions)
+    ? manifest.preset_motion_definitions
+    : Array.isArray(manifest.presetDefinitions)
+      ? manifest.presetDefinitions
+      : [];
+  return candidates.flatMap((candidate) => {
+    const raw = parseJsonRecord(candidate);
+    if (typeof raw.definition_id !== "string" || typeof raw.version !== "string" || typeof raw.artifact_hash !== "string") return [];
+    const slots = Array.isArray(raw.actuator_slots)
+      ? raw.actuator_slots.flatMap((slot) => {
+          const value = parseJsonRecord(slot);
+          if (typeof value.id !== "string" || typeof value.label !== "string") return [];
+          const kind: DroidPresetActuatorKind | null = value.kind === "bldc" || value.kind === "servo" ? value.kind : null;
+          if (!kind) return [];
+          const commandModes = Array.isArray(value.command_modes)
+            ? value.command_modes.filter((mode): mode is DroidPresetCommandMode => mode === "position" || mode === "velocity" || mode === "torque")
+            : [];
+          const feedback = Array.isArray(value.feedback)
+            ? value.feedback.filter((field): field is DroidPresetFeedbackField => ["position", "velocity", "torque", "temperature", "fault"].includes(field as string))
+            : [];
+          return [{ id: value.id, label: value.label, kind, commandModes, feedback }];
+        })
+      : [];
+    const inputs = parseJsonRecord(raw.inputs) as Record<string, DroidPresetVariable>;
+    const outputs = Array.isArray(raw.outputs)
+      ? raw.outputs.flatMap((output) => {
+          const value = parseJsonRecord(output);
+          if (typeof value.id !== "string" || typeof value.label !== "string") return [];
+          if (value.type !== "number" && value.type !== "boolean" && value.type !== "enum") return [];
+          return [{
+            id: value.id,
+            label: value.label,
+            type: value.type,
+            ...(typeof value.unit === "string" ? { unit: value.unit } : {}),
+            ...(Array.isArray(value.options) ? { options: value.options.filter((option): option is string => typeof option === "string") } : {}),
+          } satisfies DroidPresetOutput];
+        })
+      : [];
+    return [{
+      definitionId: raw.definition_id,
+      version: raw.version,
+      label: typeof raw.label === "string" ? raw.label : raw.definition_id,
+      ...(typeof raw.description === "string" ? { description: raw.description } : {}),
+      ...(typeof raw.target_type === "string" ? { targetType: raw.target_type as DroidPresetDefinition["targetType"] } : {}),
+      artifactHash: raw.artifact_hash,
+      actuatorSlots: slots,
+      inputs,
+      outputs,
+    } satisfies DroidPresetDefinition];
+  });
+}
+
+export function presetInstancesFromDescription(description: DroidDescription): DroidPresetInstance[] {
+  if (Array.isArray(description.presets)) return description.presets;
+  const manifest = parseJsonRecord(description.manifest);
+  const mechanisms = Array.isArray(manifest.mechanisms) ? manifest.mechanisms : [];
+  return mechanisms.flatMap((candidate) => {
+    const mechanism = parseJsonRecord(candidate);
+    if (mechanism.type !== "multi_axis_effector") return [];
+    const preset = parseJsonRecord(mechanism.preset);
+    if (typeof preset.preset_id !== "string" || typeof preset.instance_id !== "string") return [];
+    const variables = parseJsonRecord(preset.variables) as Record<string, DroidPresetVariable>;
+    const channels = Array.isArray(mechanism.channels)
+      ? mechanism.channels.map((channel) => {
+          const value = parseJsonRecord(channel);
+          return {
+            id: typeof value.id === "string" ? value.id : "",
+            ...(typeof value.label === "string" ? { label: value.label } : {}),
+            ...(typeof value.input === "string" ? { input: value.input } : {}),
+            ...(typeof value.rate_pct_per_second === "number" ? { ratePctPerSecond: value.rate_pct_per_second } : {}),
+          };
+        }).filter((channel) => channel.id)
+      : [];
+    const inputBindings = Array.isArray(preset.input_bindings)
+      ? preset.input_bindings.flatMap((binding) => {
+          const value = parseJsonRecord(binding);
+          if (typeof value.input !== "string" || typeof value.variable_id !== "string") return [];
+          return [{
+            input: value.input,
+            variableId: value.variable_id,
+            mode: value.mode === "absolute" ? "absolute" as const : "rate" as const,
+            ...(typeof value.deadzone === "number" ? { deadzone: value.deadzone } : {}),
+            ...(typeof value.invert === "boolean" ? { invert: value.invert } : {}),
+          }];
+        })
+      : [];
+    return [{
+      presetId: preset.preset_id,
+      instanceId: preset.instance_id,
+      ...(typeof preset.definition_id === "string" ? { definitionId: preset.definition_id } : {}),
+      ...(typeof preset.definition_version === "string" ? { definitionVersion: preset.definition_version } : {}),
+      ...(typeof preset.artifact_hash === "string" ? { artifactHash: preset.artifact_hash } : {}),
+      ...(typeof preset.label === "string" ? { label: preset.label } : {}),
+      ...(typeof preset.description === "string" ? { description: preset.description } : {}),
+      ...(typeof preset.color === "string" ? { color: preset.color } : {}),
+      gripperGroup: typeof mechanism.gripper_group === "string" ? mechanism.gripper_group : "",
+      ...(typeof preset.target_type === "string" ? { targetType: preset.target_type as DroidPresetInstance["targetType"] } : {}),
+      ...(typeof preset.target_id === "string" ? { targetId: preset.target_id } : {}),
+      ...(mechanism.controller_side === "left" || mechanism.controller_side === "right" ? { controllerSide: mechanism.controller_side } : {}),
+      variables,
+      channels,
+      ...(Object.keys(parseJsonRecord(preset.actuator_bindings)).length
+        ? { actuatorBindings: parseJsonRecord(preset.actuator_bindings) as Record<string, string> }
+        : {}),
+      ...(typeof preset.available === "boolean" ? { available: preset.available } : {}),
+      ...(typeof preset.unavailable_reason === "string" ? { unavailableReason: preset.unavailable_reason } : {}),
+      ...(inputBindings.length ? { inputBindings } : {}),
+    } satisfies DroidPresetInstance];
+  });
+}
 
 export type CameraFrame = {
   camera: string;
@@ -35,8 +260,26 @@ export type CameraFrame = {
   capturedAt: string;
   imageUrl?: string;
   dataBase64?: string;
+  /** JPEG/PNG payload when the frame was read directly from VitrusOS. */
+  bytes?: Uint8Array;
   width?: number;
   height?: number;
+};
+
+/** One finite image read. Omitted fields use the device's normal inspection image. */
+export type CameraFrameOptions = {
+  width?: number;
+  height?: number;
+  quality?: number;
+  /** `latest` never waits for an older buffered image. */
+  consistency?: "latest";
+};
+
+export const DEFAULT_CAMERA_FRAME_OPTIONS: Required<CameraFrameOptions> = {
+  width: 1280,
+  height: 720,
+  quality: 90,
+  consistency: "latest",
 };
 
 export type DroidCamera = Record<string, unknown> & {
@@ -100,6 +343,24 @@ export type CameraMediaSession = {
   requiresAuthorization?: boolean;
 };
 
+export type CameraStreamProfile = "realtime" | "high-definition";
+
+/** Continuous-video options. `snapshot` is deliberately not a stream profile. */
+export type CameraStreamOptions = {
+  profile?: CameraStreamProfile;
+  width?: number;
+  height?: number;
+  fps?: number;
+  audio?: boolean;
+  preferredTransport?: Exclude<CameraMediaTransport, "snapshot"> | "auto";
+};
+
+export type CameraStream = CameraMediaSession & {
+  profile: CameraStreamProfile;
+  /** Sends a browser WebRTC offer through the authenticated SDK/Edge route. */
+  negotiate?: (offer: { sdp: string; type: string }) => Promise<{ sdp: string; type: string; camera: string; video?: { width: number; height: number; fps: number } }>;
+};
+
 export type DroidTelemetry = {
   schema: string;
   timestamp: string;
@@ -120,6 +381,7 @@ export type DroidRealtimeState = "connecting" | "connected" | "reconnecting" | "
 
 export type DroidRealtimeEvent =
   | { type: "droid.updated"; droid: DroidIdentity }
+  | { type: "droid.status"; droid: Pick<DroidIdentity, "id" | "serialNumber">; status: Record<string, unknown> }
   | { type: "droid.telemetry"; droid: Pick<DroidIdentity, "id" | "serialNumber">; telemetry: Record<string, unknown> }
   | { type: "droid.cameras.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; cameras: DroidCamera[] }
   | { type: "droid.description.updated"; droid: Pick<DroidIdentity, "id" | "serialNumber">; description: DroidDescription };
@@ -135,6 +397,79 @@ export type JointTarget = {
   durationS?: number;
   maxVelocityDegS?: number;
   maxAccelerationDegS2?: number;
+  /** Per-joint measured-load stop, enforced by VitrusOS. */
+  maxTorqueNm?: number;
+};
+
+export type DroidTargetOptions = {
+  leaseId: string;
+  /** Exact active VitrusOS model used to derive this target. */
+  modelBinding?: ControlModelBinding;
+  /** End-to-end command lifetime; this is not the HTTP request timeout. */
+  ttlMs?: number;
+  /**
+   * Maximum time the Edge may locally refresh an admitted positional target.
+   * The Edge still validates ttlMs before starting and cuts to read_only when
+   * this bounded keepalive expires without a newer target.
+   */
+  edgeKeepaliveMs?: number;
+  /**
+   * Versioned anatomy-specific intent. VitrusOS re-resolves this envelope
+   * against its active robot-local model before applying any effector target.
+   */
+  effectorCommands?: EffectorCommand[];
+  /** @deprecated Use ttlMs. Kept for source compatibility with SDK 0.2.x. */
+  timeoutMs?: number;
+};
+
+/** Cartesian point in the robot-origin frame. Vitruvian solves this on Edge. */
+export type CartesianTargetPoint = {
+  positionM: [number, number, number];
+  quaternionXyzw?: [number, number, number, number];
+  /** Offset from trajectory start; points are executed locally by VitrusOS. */
+  timeMs?: number;
+};
+
+export type DroidCartesianTrajectoryOptions = {
+  leaseId: string;
+  /** Stable per-lease job identity; Edge retains this job, not the browser. */
+  jobId: string;
+  /** Strictly increasing Cartesian target revision within the job. */
+  inputSequence: number;
+  /** Exact active VitrusOS model used to solve this Cartesian request. */
+  modelBinding?: ControlModelBinding;
+  chain: string;
+  /**
+   * Immutable Cartesian chains covered by this broker lease.  The Edge
+   * publishes one complete target batch for this exact set on every cycle;
+   * omitted means the requested `chain` only for backwards compatibility.
+   */
+  controlledChains?: string[];
+  points: CartesianTargetPoint[];
+  /** Lifetime of this robot-local trajectory, including its final hold. */
+  ttlMs?: number;
+  /** Alignment Studio snapshot or a profile id registered on this device. */
+  alignmentProfile?: string | Record<string, unknown>;
+};
+
+export type DroidEffectorCommandOptions = DroidTargetOptions & { maxTorqueNm?: number };
+
+export type DroidPrimeAndWaitReadyOptions = DroidTargetOptions & {
+  /** End-to-end wait for the Edge broker to accept the aligned hold. */
+  readinessTimeoutMs?: number;
+  /** Telemetry polling interval while the queued Dataplane commands apply. */
+  pollIntervalMs?: number;
+};
+
+export type DroidMotionReady = {
+  admission: DroidCommandResult;
+  telemetry: DroidTelemetry;
+  motorBridge: Record<string, unknown>;
+  phase: "ready_for_realtime";
+  leaseId: string;
+  acceptedTargetCount: number;
+  appliedTargetCount: number;
+  originSequence: number;
 };
 
 export type JointTargetCommand = ControlJointTargetsMessage;
@@ -152,14 +487,42 @@ export type DroidConnectionOptions = {
   relayUrl?: string;
   endpoint?: string;
   edgeEndpoint?: string;
+  /** Edge endpoint that serves module discovery, products, and module settings. Defaults to edgeEndpoint. */
+  moduleEndpoint?: string;
+  /** Edge gateway used exclusively for camera media. Defaults to edgeEndpoint. */
+  edgeCameraEndpoint?: string;
+  /** Full URL for an Edge-local telemetry snapshot compatible with DroidTelemetry. */
+  edgeTelemetryUrl?: string;
+  /** Full URL for the canonical Edge-local vitrus.device.status.v1 snapshot. */
+  edgeStatusUrl?: string;
+  /** Lease lifecycle route. Edge keeps acquire/renew/release robot-local. */
+  controlTransport?: "bridge" | "edge";
   motionTransport?: "bridge" | "edge" | "zenoh";
   zenohEndpoint?: string;
   zenohTopic?: string;
   zenohSessionFactory?: () => Promise<ZenohEdgeSession>;
+  /** Timeout for identity, leases, telemetry, and other control-plane HTTP. */
+  controlPlaneTimeoutMs?: number;
+  /** Timeout for local Edge admission of one motion frame. */
+  motionAdmissionTimeoutMs?: number;
+  /** @deprecated Use controlPlaneTimeoutMs. */
   timeoutMs?: number;
   clientId?: string;
   webSocketFactory?: (url: string) => WebSocket;
 };
+
+export class DroidRequestTimeoutError extends Error {
+  readonly code = "VITRUS_REQUEST_TIMEOUT";
+
+  constructor(
+    readonly operation: string,
+    readonly path: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`Vitrus ${operation} timed out after ${timeoutMs} ms (${path})`);
+    this.name = "DroidRequestTimeoutError";
+  }
+}
 
 const DEFAULT_ZENOH_WS_ENDPOINT = "ws://127.0.0.1:7448";
 
@@ -212,6 +575,52 @@ function firstRecord(...values: unknown[]): Record<string, unknown> {
   return values.map(parseJsonRecord).find((value) => Object.keys(value).length > 0) ?? {};
 }
 
+function looksLikeMotorBridge(value: Record<string, unknown>): boolean {
+  return typeof value.access_mode === "string" && typeof value.control_phase === "string";
+}
+
+export function normalizeDroidTelemetry(value: unknown): DroidTelemetry {
+  const raw = parseJsonRecord(value);
+  const nestedRaw = parseJsonRecord(raw.raw);
+  const explicitJoints = parseJsonRecord(raw.joints);
+  const joints = Object.keys(explicitJoints).length
+    ? explicitJoints
+    : Array.isArray(raw.motors)
+      ? Object.fromEntries(
+        raw.motors
+          .map(parseJsonRecord)
+          .filter((motor) => typeof motor.joint_name === "string" && motor.joint_name)
+          .map((motor) => [String(motor.joint_name), motor]),
+      )
+      : {};
+  const motorBridgeCandidates = [
+    parseJsonRecord(raw.motor_bridge),
+    parseJsonRecord(raw.motorBridge),
+    parseJsonRecord(nestedRaw.motor_bridge),
+    parseJsonRecord(nestedRaw.motorBridge),
+    raw,
+    nestedRaw,
+  ];
+  const motorBridge = motorBridgeCandidates.find(looksLikeMotorBridge) ?? {};
+  return {
+    schema: typeof raw.schema === "string" ? raw.schema : "vitrus.telemetry.state.v1",
+    timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString(),
+    joints,
+    cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
+    motorBridge,
+    raw,
+  };
+}
+
+/** Validate the lease window accepted by the VitrusOS embodiment relay. */
+export function validateDroidLeaseDurationMs(value: number | undefined): number | undefined {
+  if (value == null) return undefined;
+  if (!Number.isInteger(value) || value < 1_000 || value > 30_000) {
+    throw new RangeError("Vitrus control lease durationMs must be an integer in [1000, 30000]");
+  }
+  return value;
+}
+
 export class Droid {
   static async connect(ref: DroidRef, options: DroidConnectionOptions): Promise<Droid> {
     const droid = new Droid(ref, options);
@@ -221,10 +630,30 @@ export class Droid {
 
   readonly identity: { get: () => Promise<DroidIdentity> };
   readonly description: { get: () => Promise<DroidDescription> };
+  readonly presets: {
+    list: () => Promise<DroidPresetInstance[]>;
+    instances: () => Promise<DroidPresetInstance[]>;
+    definitions: () => Promise<DroidPresetDefinition[]>;
+    start: (instanceId: string, options?: DroidPresetStartOptions) => Promise<DroidPresetRun>;
+    setInputs: (runId: string, inputs: Record<string, number | boolean | string>, options?: DroidPresetInputOptions) => Promise<DroidPresetState>;
+    state: (runId: string) => Promise<DroidPresetState>;
+    stop: (runId: string, options?: { leaseId?: string }) => Promise<DroidPresetRun>;
+  };
+  readonly effectors: {
+    list: () => Promise<EffectorInstance[]>;
+    command: (
+      effectorId: string,
+      values: Record<string, number | boolean | string>,
+      options: DroidEffectorCommandOptions,
+    ) => Promise<DroidCommandResult>;
+    commandMany: (commands: EffectorCommand[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
+  };
   readonly camera: {
     list: () => Promise<DroidCamera[]>;
-    getFrame: (camera: string) => Promise<CameraFrame>;
+    getFrame: (camera: string, options?: CameraFrameOptions) => Promise<CameraFrame>;
     getCalibration: (camera: string) => Promise<CameraCalibration | null>;
+    openStream: (camera: string, options?: CameraStreamOptions) => Promise<CameraStream>;
+    /** @deprecated Use openStream(camera, options). */
     openSession: (camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }) => Promise<CameraMediaSession>;
     closeSession: (sessionId: string) => Promise<void>;
   };
@@ -232,24 +661,40 @@ export class Droid {
     snapshot: () => Promise<DroidTelemetry>;
     subscribe: (listener: (telemetry: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
   };
+  readonly status: {
+    snapshot: () => Promise<DeviceStatus>;
+    subscribe: (listener: (status: DeviceStatus) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
+  };
   readonly events: {
     subscribe: (listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
   };
+  /** Module discovery/configuration is device-local and independent of motor authority. */
+  readonly modules: {
+    list: () => Promise<GoldenEdgeModuleCatalog>;
+    configure: (moduleId: string, settings: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  };
   readonly control: {
-    acquire: (options?: { durationMs?: number; owner?: string }) => Promise<ControlLease>;
+    acquire: (options?: { durationMs?: number; owner?: string; jointNames?: string[] }) => Promise<ControlLease>;
     renew: (leaseId: string, options?: { durationMs?: number }) => Promise<ControlLease>;
     release: (leaseId: string) => Promise<void>;
   };
   readonly motion: {
-    sendTargets: (targets: JointTarget[], options: { leaseId: string; timeoutMs?: number }) => Promise<DroidCommandResult>;
+    sendTargets: (targets: JointTarget[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
+    sendCartesianTrajectory: (options: DroidCartesianTrajectoryOptions) => Promise<DroidCommandResult>;
+    primeAndWaitReady: (targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions) => Promise<DroidMotionReady>;
   };
   readonly safety: { emergencyStop: (reason?: string) => Promise<DroidCommandResult> };
 
   private sequence = 0;
   private identityCache: DroidIdentity | null = null;
   private edgeClient: GoldenEdgeClient | null = null;
+  private moduleClient: GoldenEdgeClient | null = null;
   private edgeLeaseId: string | null = null;
-  private zenohClient: ZenohEdgeClient | null = null;
+  private edgeControlOwner: string | null = null;
+  private edgeControlJointNames: string[] = [];
+  // Keep Zenoh optional for normal browser/Bridge clients. A static import here
+  // pulls its WASM bindings into every dashboard bundle.
+  private zenohClient: { setLease(leaseId: string): void; publish(command: ControlJointTargetsMessage): Promise<ZenohEdgePublishResult> } | null = null;
   private zenohLeaseId: string | null = null;
   private readonly clientId: string;
 
@@ -262,40 +707,186 @@ export class Droid {
       return identity;
     } };
     this.description = { get: () => this.get<DroidDescription>("/v1/droids/description") };
+    this.presets = {
+      list: async () => presetInstancesFromDescription(await this.description.get()),
+      instances: async () => presetInstancesFromDescription(await this.description.get()),
+      definitions: async () => presetDefinitionsFromDescription(await this.description.get()),
+      start: (instanceId, request = {}) => this.post<DroidPresetRun>("/v1/droids/preset-motions/runs", {
+        instanceId,
+        inputs: request.inputs ?? {},
+        ...(request.leaseId ? { leaseId: request.leaseId } : {}),
+      }),
+      setInputs: (runId, inputs, request = {}) => this.post<DroidPresetState>(`/v1/droids/preset-motions/runs/${encodeURIComponent(runId)}/inputs`, {
+        inputs,
+        ...(request.sequence == null ? {} : { sequence: request.sequence }),
+        ...(request.leaseId ? { leaseId: request.leaseId } : {}),
+      }),
+      state: (runId) => this.get<DroidPresetState>(`/v1/droids/preset-motions/runs/${encodeURIComponent(runId)}`),
+      stop: (runId, request = {}) => this.post<DroidPresetRun>(`/v1/droids/preset-motions/runs/${encodeURIComponent(runId)}/stop`, request),
+    };
+    this.effectors = {
+      list: async () => effectorsFromManifest((await this.description.get()).manifest),
+      command: async (effectorId, values, request) => {
+        const instances = await this.effectors.list();
+        const instance = instances.find((candidate) => candidate.id === effectorId);
+        if (!instance) throw new Error(`UNKNOWN_EFFECTOR: ${effectorId}`);
+        const { maxTorqueNm, ...targetRequest } = request;
+        return this.sendTargets([], {
+          ...targetRequest,
+          effectorCommands: [createEffectorCommand(instance, values, { maxTorqueNm })],
+        });
+      },
+      commandMany: (commands, request) => this.sendTargets([], {
+        ...request,
+        effectorCommands: commands,
+      }),
+    };
     this.camera = {
-      list: () => this.get<DroidCamera[]>("/v1/droids/cameras"),
-      getFrame: (camera) => this.get<CameraFrame>("/v1/droids/cameras/frame", { camera }),
+      list: () => this.edgeCameraUrl() ? this.edgeCameraList() : this.get<DroidCamera[]>("/v1/droids/cameras"),
+      getFrame: (camera, request = {}) => this.getCameraFrame(camera, request),
       getCalibration: (camera) => this.getCameraCalibration(camera),
-      openSession: (camera, request = {}) => this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
+      openStream: (camera, request = {}) => this.openCameraStream(camera, request),
+      openSession: async (camera, request = {}) => {
+        // Compatibility only: a finite image is now getFrame(), never a stream profile.
+        if (request.preferredTransport === "snapshot") {
+          return this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: "snapshot" });
+        }
+        return this.openCameraStream(camera, { preferredTransport: request.preferredTransport });
+      },
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
     };
     this.telemetry = {
-      snapshot: () => this.get<DroidTelemetry>("/v1/droids/telemetry"),
+      snapshot: async () => normalizeDroidTelemetry(
+        this.options.edgeTelemetryUrl
+          ? await this.request<unknown>(
+            this.options.edgeTelemetryUrl,
+            { method: "GET" },
+            "GET edge telemetry",
+          )
+          : await this.get<unknown>("/v1/droids/telemetry"),
+      ),
       subscribe: (listener, request) => this.subscribeEvents((event) => {
         if (event.type !== "droid.telemetry") return;
-        const raw = event.telemetry;
-        listener({
-          schema: typeof raw.schema === "string" ? raw.schema : "vitrus.telemetry.state.v1",
-          timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString(),
-          joints: parseJsonRecord(raw.joints),
-          cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
-          motorBridge: parseJsonRecord(raw.motor_bridge ?? raw.motorBridge),
-          raw,
-        });
+        listener(normalizeDroidTelemetry(event.telemetry));
+      }, request),
+    };
+    this.status = {
+      snapshot: async () => normalizeDeviceStatus(
+        this.options.edgeStatusUrl
+          ? await this.request<unknown>(this.options.edgeStatusUrl, { method: "GET" }, "GET edge status")
+          : await this.get<unknown>("/v1/droids/status"),
+      ),
+      subscribe: (listener, request) => this.subscribeEvents((event) => {
+        if (event.type !== "droid.status") return;
+        listener(normalizeDeviceStatus(event.status));
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribeEvents(listener, request) };
+    this.modules = {
+      list: () => this.moduleEdgeClient().modules(),
+      configure: (moduleId, settings) => this.moduleEdgeClient().configureModule(moduleId, settings),
+    };
     this.control = {
-      acquire: (request = {}) => this.post<ControlLease>("/v1/droids/control/leases", { durationMs: request.durationMs, owner: request.owner?.trim() || this.clientId }),
-      renew: (leaseId, request = {}) => this.post<ControlLease>(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, request),
-      release: async (leaseId) => { await this.delete(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`); },
+      acquire: async (request = {}) => {
+        const durationMs = validateDroidLeaseDurationMs(request.durationMs) ?? 15_000;
+        const owner = request.owner?.trim() || this.clientId;
+        const directControl = this.options.controlTransport === "edge";
+        const identity = await this.identity.get();
+        const lease: ControlLease = directControl
+          ? {
+            id: globalThis.crypto?.randomUUID?.() ?? `edge-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            droidId: identity.id,
+            owner,
+            expiresAt: new Date(Date.now() + durationMs).toISOString(),
+          }
+          : await this.post<ControlLease>("/v1/droids/control/leases", { durationMs, owner });
+        if ((this.options.motionTransport ?? "bridge") === "edge") {
+          if (!this.options.edgeEndpoint || !request.jointNames?.length) {
+            if (!directControl) await this.delete(`/v1/droids/control/leases/${encodeURIComponent(lease.id)}`).catch(() => undefined);
+            throw new Error("Droid edge acquire requires edgeEndpoint and explicit jointNames");
+          }
+          if (!this.edgeClient) {
+            this.edgeClient = new GoldenEdgeClient({
+              endpoint: this.options.edgeEndpoint,
+              robotId: identity.id,
+              leaseId: lease.id,
+              source: "vitrus-sdk",
+              requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
+            });
+          }
+          try {
+            await this.edgeClient.acquire(lease.id, { owner, durationMs, jointNames: request.jointNames });
+            this.edgeLeaseId = lease.id;
+            this.edgeControlOwner = owner;
+            this.edgeControlJointNames = [...request.jointNames];
+          } catch (error) {
+            if (!directControl) await this.delete(`/v1/droids/control/leases/${encodeURIComponent(lease.id)}`).catch(() => undefined);
+            throw error;
+          }
+        }
+        return lease;
+      },
+      renew: async (leaseId, request = {}) => {
+        const durationMs = validateDroidLeaseDurationMs(request.durationMs) ?? 15_000;
+        if (this.options.controlTransport === "edge") {
+          if (!this.edgeClient || leaseId !== this.edgeLeaseId || !this.edgeControlOwner || !this.edgeControlJointNames.length) {
+            throw new Error("Cannot renew a non-active Edge lease");
+          }
+          await this.edgeClient.renew(leaseId, durationMs);
+          return {
+            id: leaseId,
+            droidId: (await this.identity.get()).id,
+            owner: this.edgeControlOwner,
+            expiresAt: new Date(Date.now() + durationMs).toISOString(),
+          };
+        }
+        return this.post<ControlLease>(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, { durationMs });
+      },
+      release: async (leaseId) => {
+        let edgeError: unknown;
+        // Edge motion must release through the same low-latency local path
+        // that admitted its targets. The Bridge DELETE remains necessary to
+        // revoke cloud authority, but enqueue success alone is not physical
+        // torque-off acknowledgement.
+        if ((this.options.motionTransport ?? "bridge") === "edge" && this.edgeClient) {
+          try {
+            await this.edgeClient.release(leaseId);
+          } catch (error) {
+            edgeError = error;
+          }
+        }
+        if (this.options.controlTransport !== "edge") {
+          await this.delete(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}`);
+        }
+        this.edgeControlOwner = null;
+        this.edgeControlJointNames = [];
+        if (edgeError) throw edgeError;
+      },
     };
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
+      sendCartesianTrajectory: (request) => this.sendCartesianTrajectory(request),
+      primeAndWaitReady: (targets, request) => this.primeAndWaitReady(targets, request),
     };
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),
     };
+  }
+
+  private moduleEdgeClient(): GoldenEdgeClient {
+    const endpoint = this.options.moduleEndpoint ?? this.options.edgeEndpoint;
+    if (!endpoint) throw new Error("Droid modules require moduleEndpoint or edgeEndpoint");
+    if (!this.moduleClient) {
+      this.moduleClient = new GoldenEdgeClient({
+        endpoint,
+        robotId: this.identityCache?.id || "module-discovery",
+        // Module reads/configuration never borrow or mutate a motor lease.
+        leaseId: "vitrus-sdk-module-readonly",
+        source: "vitrus-sdk",
+        requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 3_000,
+      });
+    }
+    return this.moduleClient;
   }
 
   private async getCameraCalibration(camera: string): Promise<CameraCalibration | null> {
@@ -394,18 +985,63 @@ export class Droid {
     return subscription;
   }
 
-  private async sendTargets(targets: JointTarget[], request: { leaseId: string; timeoutMs?: number }): Promise<DroidCommandResult> {
+  private async sendTargets(targets: JointTarget[], request: DroidTargetOptions): Promise<DroidCommandResult> {
     const identity = await this.identity.get();
+    let semanticEffectors: EffectorCommandEnvelope | undefined;
+    const controlTargets: ControlJointTarget[] = targets.map((target) => ({
+      joint_name: target.jointName,
+      position_deg: target.displayDeg,
+      ...(target.maxVelocityDegS == null ? {} : {
+        // Keep the canonical field for older consumers and also name the
+        // Edge positional-track limit explicitly. VitrusOS owns the actual
+        // velocity trajectory when trajectory_owner is "edge".
+        velocity_deg_s: target.maxVelocityDegS,
+        eased_max_velocity_deg_s: target.maxVelocityDegS,
+      }),
+      ...(target.maxAccelerationDegS2 == null ? {} : {
+        eased_max_accel_deg_s: target.maxAccelerationDegS2,
+      }),
+      ...(target.maxTorqueNm == null ? {} : {
+        max_torque_nm: target.maxTorqueNm,
+      }),
+    }));
+    if (request.effectorCommands?.length) {
+      const description = await this.description.get();
+      const instances = effectorsFromManifest(description.manifest);
+      const byId = new Map(instances.map((instance) => [instance.id, instance]));
+      const previewByJoint = new Map<string, { joint_name: string; percent: number }>();
+      for (const semanticCommand of request.effectorCommands) {
+        const instance = byId.get(semanticCommand.effectorId);
+        if (!instance) throw new Error(`UNKNOWN_EFFECTOR: ${semanticCommand.effectorId}`);
+        for (const target of resolveEffectorCommand(instance, semanticCommand)) {
+          if (previewByJoint.has(target.jointName)) {
+            throw new Error(`DUPLICATE_EFFECTOR_TARGET: ${target.jointName}`);
+          }
+          previewByJoint.set(target.jointName, {
+            joint_name: target.jointName,
+            percent: target.percent,
+          });
+        }
+      }
+      const rawTargetNames = new Set(controlTargets.map((target) => target.joint_name));
+      for (const preview of previewByJoint.values()) {
+        if (!rawTargetNames.has(preview.joint_name)) controlTargets.push(preview);
+      }
+      semanticEffectors = {
+        schema: EFFECTOR_COMMANDS_SCHEMA,
+        descriptionRevisionId: description.revisionId,
+        commands: request.effectorCommands,
+      };
+    }
     const command = createJointTargetsMessage({
       robotId: identity.id,
       leaseId: request.leaseId,
       sequence: ++this.sequence,
-      ttlMs: request.timeoutMs,
-      targets: targets.map((target) => ({
-        joint_name: target.jointName,
-        position_deg: target.displayDeg,
-        ...(target.maxVelocityDegS == null ? {} : { velocity_deg_s: target.maxVelocityDegS }),
-      })),
+      ttlMs: request.ttlMs ?? request.timeoutMs,
+      edgeKeepaliveMs: request.edgeKeepaliveMs,
+      semanticEffectors,
+      modelBinding: request.modelBinding,
+      targets: controlTargets,
     });
     const motionTransport = this.options.motionTransport ?? "bridge";
     if (motionTransport === "edge") {
@@ -418,6 +1054,8 @@ export class Droid {
           robotId: identity.id,
           leaseId: request.leaseId,
           source: command.source,
+          modelBinding: request.modelBinding,
+          requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
         });
         this.edgeLeaseId = request.leaseId;
       } else if (this.edgeLeaseId !== request.leaseId) {
@@ -437,6 +1075,10 @@ export class Droid {
         ?? zenohTransportEndpoint(identity.transports)
         ?? DEFAULT_ZENOH_WS_ENDPOINT;
       if (!this.zenohClient) {
+        // Keep this indirection so browser bundlers do not attempt to compile the
+        // optional Zenoh WASM transport for Bridge-only applications.
+        const zenohModulePath = "./zenoh-edge.js";
+        const { ZenohEdgeClient } = await import(/* @vite-ignore */ zenohModulePath);
         this.zenohClient = new ZenohEdgeClient({
           endpoint: zenohEndpoint,
           topic: this.options.zenohTopic,
@@ -450,17 +1092,207 @@ export class Droid {
         this.zenohClient.setLease(request.leaseId);
         this.zenohLeaseId = request.leaseId;
       }
-      const result = await this.zenohClient.publish(command);
+      const result = await this.zenohClient!.publish(command);
       return { requestId: String(result.sequence), status: "acknowledged", route: "local", result };
     }
-    return this.post<DroidCommandResult>("/v1/droids/control/joint-targets", command);
+    const admission = await this.post<DroidCommandResult>(
+      "/v1/droids/control/joint-targets",
+      command,
+    );
+    return {
+      ...admission,
+      result: { ...(admission.result ?? {}), sdkSequence: command.sequence },
+    };
+  }
+
+  private async sendCartesianTrajectory(request: DroidCartesianTrajectoryOptions): Promise<DroidCommandResult> {
+    if ((this.options.motionTransport ?? "bridge") !== "edge" || !this.options.edgeEndpoint) {
+      throw new Error("Cartesian trajectories require the robot-local Edge motion transport");
+    }
+    if (!request.leaseId.trim() || !request.jobId.trim() || !Number.isSafeInteger(request.inputSequence) || request.inputSequence < 1 || !request.chain.trim() || !request.points.length) {
+      throw new Error("Cartesian trajectory requires leaseId, jobId, inputSequence, chain, and points");
+    }
+    const ttlMs = request.ttlMs ?? 500;
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 50 || ttlMs > 30_000) {
+      throw new Error("Cartesian trajectory ttlMs must be in [50, 30000]");
+    }
+    const controlledChains = request.controlledChains == null
+      ? undefined
+      : [...new Set(request.controlledChains.map((chain) => chain.trim().toUpperCase()))];
+    if (controlledChains && (!controlledChains.length || controlledChains.some((chain) => !chain) || !controlledChains.includes(request.chain.trim().toUpperCase()))) {
+      throw new Error("controlledChains must be a non-empty unique set containing chain");
+    }
+    for (const point of request.points) {
+      if (point.positionM.length !== 3 || !point.positionM.every(Number.isFinite)
+        || (point.quaternionXyzw && (point.quaternionXyzw.length !== 4 || !point.quaternionXyzw.every(Number.isFinite)))
+        || (point.timeMs != null && (!Number.isSafeInteger(point.timeMs) || point.timeMs < 0 || point.timeMs > ttlMs))) {
+        throw new Error("Cartesian trajectory contains an invalid point");
+      }
+    }
+    const identity = await this.identity.get();
+    if (!this.edgeClient) {
+      this.edgeClient = new GoldenEdgeClient({
+        endpoint: this.options.edgeEndpoint,
+        robotId: identity.id,
+        leaseId: request.leaseId,
+        source: "vitrus-sdk",
+        modelBinding: request.modelBinding,
+        requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
+      });
+      this.edgeLeaseId = request.leaseId;
+    } else if (this.edgeLeaseId !== request.leaseId) {
+      this.edgeClient.setLease(request.leaseId);
+      this.edgeLeaseId = request.leaseId;
+    }
+    const result = await this.edgeClient.submitIkTrajectory({
+      jobId: request.jobId,
+      inputSequence: request.inputSequence,
+      chain: request.chain,
+      points: request.points,
+      ttlMs,
+      controlledChains,
+      alignmentProfile: request.alignmentProfile,
+      modelBinding: request.modelBinding,
+    });
+    return { requestId: `${request.leaseId}:${result.chain}`, status: "acknowledged", route: "local", result };
+  }
+
+  private async primeAndWaitReady(
+    targets: JointTarget[],
+    request: DroidPrimeAndWaitReadyOptions,
+  ): Promise<DroidMotionReady> {
+    if (!targets.length) throw new Error("primeAndWaitReady requires at least one aligned hold target");
+    const admission = await this.sendTargets(targets, request);
+    if (["failed", "timeout", "not_reachable"].includes(admission.status)) {
+      throw new Error(admission.error || `Vitrus motion admission failed (${admission.status})`);
+    }
+
+    const originSequence = Number(
+      admission.result?.sdkSequence ?? admission.result?.sequence,
+    );
+    if (!Number.isSafeInteger(originSequence) || originSequence < 1) {
+      throw new Error("Vitrus motion admission did not preserve the SDK origin sequence");
+    }
+    const requestedNames = new Set(targets.map((target) => target.jointName));
+    if (requestedNames.size !== targets.length) {
+      throw new Error("primeAndWaitReady requires one unique target per joint");
+    }
+    const timeoutMs = Math.max(1, Math.trunc(request.readinessTimeoutMs ?? 15_000));
+    const pollIntervalMs = Math.max(10, Math.trunc(request.pollIntervalMs ?? 100));
+    const edgeHoldMs = request.edgeKeepaliveMs ?? 1_500;
+    // Priming can wait for native controller application longer than the
+    // first local static plan. Renew only the already-accepted hold while
+    // waiting; this does not emit a second target or extend a lease.
+    const heartbeatIntervalMs = Math.max(100, Math.min(1_000, Math.floor(edgeHoldMs / 3)));
+    let nextHeartbeatAtMs = 0;
+    const admissions = new Map<number, DroidCommandResult>([[originSequence, admission]]);
+    const startedAt = Date.now();
+    let lastPhase = "unknown";
+    let lastLease: string | null = null;
+    let lastAcceptedTargetCount = 0;
+    let lastAppliedTargetCount = 0;
+    let lastObservationError: string | null = null;
+    while (Date.now() - startedAt < timeoutMs) {
+      if ((this.options.motionTransport ?? "bridge") === "edge" && Date.now() >= nextHeartbeatAtMs) {
+        await this.edgeClient!.controlHeartbeat(request.leaseId, edgeHoldMs);
+        nextHeartbeatAtMs = Date.now() + heartbeatIntervalMs;
+      }
+      // The Edge gateway admitted the hold and owns its broker-local plan.
+      // Cloud/relay telemetry is intentionally asynchronous, and can still
+      // report a pre-acquire read_only snapshot after the Edge has already
+      // accepted the command. It must not revoke a healthy local lease.
+      let telemetry: DroidTelemetry;
+      try {
+        telemetry = (this.options.motionTransport ?? "bridge") === "edge"
+          ? await this.edgeClient!.controlState() as unknown as DroidTelemetry
+          : await this.telemetry.snapshot();
+        lastObservationError = null;
+      } catch (error) {
+        // A readiness observation is evidence, not a motor command.  The
+        // first hold has already been admitted and is renewed independently;
+        // fail closed only if exact accepted/applied evidence does not arrive
+        // within the caller's bounded readiness window.  Treating one slow
+        // observer response as a command failure unnecessarily released a
+        // healthy lease on a loaded Edge.
+        lastObservationError = error instanceof Error ? error.message : String(error);
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        continue;
+      }
+      const telemetryRecord = parseJsonRecord(telemetry);
+      const raw = parseJsonRecord(telemetryRecord.raw);
+      const motorBridge = firstRecord(
+        telemetryRecord.motorBridge,
+        telemetryRecord.motor_bridge,
+        raw.motorBridge,
+        raw.motor_bridge,
+        looksLikeMotorBridge(telemetryRecord) ? telemetryRecord : {},
+        looksLikeMotorBridge(raw) ? raw : {},
+      );
+      if (Object.keys(motorBridge).length) {
+        lastPhase = typeof motorBridge.control_phase === "string"
+          ? motorBridge.control_phase
+          : "unknown";
+        lastLease = typeof motorBridge.exclusive_lease_id === "string"
+          ? motorBridge.exclusive_lease_id
+          : null;
+        const motors = Array.isArray(motorBridge.motors)
+          ? motorBridge.motors.map(parseJsonRecord)
+          : [];
+        const requestedMotors = motors.filter((motor) =>
+          requestedNames.has(String(motor.joint_name ?? "")),
+        );
+        lastAcceptedTargetCount = requestedMotors.filter((motor) =>
+          admissions.has(Number(motor.accepted_origin_sequence)),
+        ).length;
+        lastAppliedTargetCount = requestedMotors.filter((motor) =>
+          admissions.has(Number(motor.applied_origin_sequence)),
+        ).length;
+        if (
+          motorBridge.access_mode === "read_write"
+          && lastPhase === "ready_for_realtime"
+          && lastLease === request.leaseId
+          && lastAcceptedTargetCount === targets.length
+          && lastAppliedTargetCount === targets.length
+        ) {
+          const appliedSequences = requestedMotors
+            .map((motor) => Number(motor.applied_origin_sequence))
+            .filter((sequence) => admissions.has(sequence));
+          const matchedOriginSequence = Math.max(...appliedSequences);
+          return {
+            admission: admissions.get(matchedOriginSequence) ?? admission,
+            telemetry,
+            motorBridge,
+            phase: "ready_for_realtime",
+            leaseId: request.leaseId,
+            acceptedTargetCount: lastAcceptedTargetCount,
+            appliedTargetCount: lastAppliedTargetCount,
+            originSequence: matchedOriginSequence,
+          };
+        }
+        if (["error", "fault"].includes(lastPhase)) {
+          throw new Error(
+            `Vitrus motor bridge failed while priming (phase=${lastPhase}, lease=${lastLease ?? "none"})`,
+          );
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+    throw new Error(
+      `Vitrus motor bridge did not accept the aligned hold in time `
+      + `(phase=${lastPhase}, expected lease=${request.leaseId}, `
+      + `broker lease=${lastLease ?? "none"}, `
+      + `accepted=${lastAcceptedTargetCount}/${targets.length}, `
+      + `applied=${lastAppliedTargetCount}/${targets.length}, `
+      + `origin=${originSequence}`
+      + `${lastObservationError ? `, last observer error=${lastObservationError}` : ""})`,
+    );
   }
 
   private async get<T>(path: string, params: Record<string, string> = {}): Promise<T> {
     const url = new URL(`${this.baseUrl()}${path}`);
     this.appendRef(url.searchParams);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
-    return this.request<T>(url.toString(), { method: "GET" });
+    return this.request<T>(url.toString(), { method: "GET" }, `GET ${path}`);
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
@@ -470,7 +1302,7 @@ export class Droid {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }, `POST ${path}`);
   }
 
   private async delete(path: string): Promise<void> {
@@ -503,9 +1335,89 @@ export class Droid {
     if (this.ref.alias) params.set("alias", this.ref.alias);
   }
 
-  private async request<T>(url: string, init: RequestInit): Promise<T> {
+  private edgeCameraUrl(): string | null {
+    const endpoint = this.options.edgeCameraEndpoint ?? this.options.edgeEndpoint;
+    return endpoint?.trim() ? cleanUrl(endpoint) : null;
+  }
+
+  private async edgeCameraList(): Promise<DroidCamera[]> {
+    const endpoint = this.edgeCameraUrl();
+    if (!endpoint) throw new Error("Vitrus Edge camera endpoint is not configured");
+    const payload = await this.request<{ cameras?: unknown }>(
+      `${endpoint}/api/dora/cameras`, { method: "GET" }, "GET Edge cameras",
+    );
+    return Array.isArray(payload.cameras) ? payload.cameras as DroidCamera[] : [];
+  }
+
+  private cameraFrameOptions(options: CameraFrameOptions): Required<CameraFrameOptions> {
+    const resolved = { ...DEFAULT_CAMERA_FRAME_OPTIONS, ...options };
+    for (const [name, value] of [["width", resolved.width], ["height", resolved.height], ["quality", resolved.quality]] as const) {
+      if (!Number.isInteger(value) || value < 1 || (name !== "quality" && value > 4096) || (name === "quality" && value > 100)) {
+        throw new RangeError(`camera frame ${name} is out of range`);
+      }
+    }
+    if (resolved.consistency !== "latest") throw new RangeError("camera frame consistency must be latest");
+    return resolved;
+  }
+
+  private async getCameraFrame(camera: string, options: CameraFrameOptions): Promise<CameraFrame> {
+    const resolved = this.cameraFrameOptions(options);
+    const endpoint = this.edgeCameraUrl();
+    if (!endpoint) {
+      return this.get<CameraFrame>("/v1/droids/cameras/frame", {
+        camera,
+        ...Object.fromEntries(Object.entries(resolved).map(([key, value]) => [key, String(value)])),
+      });
+    }
+    const url = new URL(`${endpoint}/api/dora/cameras/frame`);
+    url.searchParams.set("camera", camera);
+    for (const [key, value] of Object.entries(resolved)) url.searchParams.set(key, String(value));
+    const response = await this.requestBinary(url.toString(), { method: "GET", headers: { accept: "image/jpeg" } }, "GET Edge camera frame");
+    const capturedAt = response.headers.get("x-vitrus-captured-at") || new Date().toISOString();
+    return {
+      camera,
+      frameId: response.headers.get("x-vitrus-frame-id") || `${camera}:${capturedAt}`,
+      mimeType: response.headers.get("content-type") || "image/jpeg",
+      capturedAt,
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      width: resolved.width,
+      height: resolved.height,
+    };
+  }
+
+  private async openCameraStream(camera: string, options: CameraStreamOptions): Promise<CameraStream> {
+    const endpoint = this.edgeCameraUrl();
+    const profile = options.profile ?? "realtime";
+    if (!endpoint) {
+      const session = await this.post<CameraMediaSession>("/v1/droids/cameras/sessions", {
+        camera,
+        preferredTransport: options.preferredTransport ?? "webrtc",
+        ...options,
+      });
+      return { ...session, profile };
+    }
+    const payload = await this.request<CameraMediaSession & { profile?: CameraStreamProfile }>(
+      `${endpoint}/api/dora/cameras/streams`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile, ...options }) },
+      "open Edge camera stream",
+    );
+    return {
+      ...payload,
+      camera,
+      ...(payload.offerUrl ? { offerUrl: new URL(payload.offerUrl, `${endpoint}/`).toString() } : {}),
+      profile: payload.profile ?? profile,
+      negotiate: async (offer) => this.request(
+        `${endpoint}/api/dora/cameras/offer`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile: payload.profile ?? profile, ...options, ...offer }) },
+        "negotiate Edge camera stream",
+      ),
+    };
+  }
+
+  private async request<T>(url: string, init: RequestInit, operation = "request"): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 15_000);
+    const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(url, {
         ...init,
@@ -521,6 +1433,33 @@ export class Droid {
         throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
       }
       return payload as T;
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async requestBinary(url: string, init: RequestInit, operation = "request"): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+        headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) },
+      });
+      if (!response.ok) throw new Error(`Vitrus ${operation} failed (${response.status}): ${response.statusText}`);
+      return response;
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }

@@ -19,7 +19,9 @@ export type ZenohEdgePublishResult = {
   published: number;
 };
 
-const DEFAULT_TOPIC = "vitrus/servo/targets";
+// Keep the native edge path on the same atomic command topic consumed by
+// VitrusOS. One envelope per pose avoids per-joint publication skew.
+const DEFAULT_TOPIC = "vitrus/control/joint_targets";
 
 export class ZenohEdgeClient {
   private session: ZenohEdgeSession | null = null;
@@ -41,19 +43,14 @@ export class ZenohEdgeClient {
   async publish(command: ControlJointTargetsMessage): Promise<ZenohEdgePublishResult> {
     const session = await this.getSession();
     const topic = this.options.topic?.trim() || DEFAULT_TOPIC;
-    for (const target of command.targets) {
-      const payload = JSON.stringify({
-        schema: command.schema,
-        schema_version: command.schema_version,
-        source: command.source,
-        lease_id: this.leaseId,
-        seq: command.sequence,
-        issued_at_ms: command.sent_at_ms,
-        deadline_ms: command.deadline_ms,
-        target: targetToEdgeTarget(target),
-      });
-      await session.put(topic, payload, { express: true });
-    }
+    const payload = JSON.stringify({
+      ...command,
+      type: "clay_joint_targets",
+      robot_id: this.options.robotId,
+      lease_id: this.leaseId,
+      targets: command.targets.map(targetToEdgeTarget),
+    });
+    await session.put(topic, payload, { express: true });
     return { ok: true, transport: "zenoh", stream: "joint_targets", sequence: command.sequence, published: command.targets.length };
   }
 
@@ -72,7 +69,11 @@ export class ZenohEdgeClient {
   }
 
   private async openDefaultSession(): Promise<ZenohEdgeSession> {
-    const { Config, Session } = await import("@eclipse-zenoh/zenoh-ts");
+    // Zenoh is an optional transport. Keep its WASM package out of Bridge- or
+    // Golden-Edge-only browser bundles; applications that select Zenoh may
+    // provide a sessionFactory or make the package available at runtime.
+    const zenohPackage = "@eclipse-zenoh/zenoh-ts";
+    const { Config, Session } = await import(/* @vite-ignore */ zenohPackage);
     return Session.open(new Config(this.options.endpoint));
   }
 }
