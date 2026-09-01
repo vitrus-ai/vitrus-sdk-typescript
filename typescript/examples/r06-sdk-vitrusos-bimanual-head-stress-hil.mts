@@ -193,7 +193,7 @@ async function main(): Promise<void> {
     // The device's default profile is the latest Alignment Studio profile.
     // Omit the opaque profile id: profile files are device-local names, while
     // their embedded IDs are provenance, not lookup keys.
-    const left = await droid.motion.sendCartesianTrajectory({ leaseId, chain: "LEFT_ARM", points: leftPoints, ttlMs: PATH_TTL_MS });
+    const left = await droid.motion.sendCartesianTrajectory({ leaseId, jobId: `${leaseId}:left-arm`, inputSequence: 1, chain: "LEFT_ARM", points: leftPoints, ttlMs: PATH_TTL_MS });
     assert(left.status === "acknowledged" && record(left.result).accepted === true, `left IK rejected: ${JSON.stringify(left)}`);
     await sleep(2_500);
     // The table sample is intentionally marked transient: BLDC settling is
@@ -203,7 +203,7 @@ async function main(): Promise<void> {
     await renewSameLease(droid, leaseId);
 
     await sleep(1_500);
-    const right = await droid.motion.sendCartesianTrajectory({ leaseId, chain: "RIGHT_ARM", points: rightPoints, ttlMs: PATH_TTL_MS });
+    const right = await droid.motion.sendCartesianTrajectory({ leaseId, jobId: `${leaseId}:right-arm`, inputSequence: 1, chain: "RIGHT_ARM", points: rightPoints, ttlMs: PATH_TTL_MS });
     assert(right.status === "acknowledged" && record(right.result).accepted === true, `right IK rejected: ${JSON.stringify(right)}`);
     await sleep(2_500);
     evidence.push({ ...(await capture("right_transient", false)), applied: proveApplied(await edge.controlState() as unknown as Json, RIGHT, "right transient") });

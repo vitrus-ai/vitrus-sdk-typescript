@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Droid, DroidRequestTimeoutError } from "./droid-live.js";
+import { DEFAULT_CAMERA_FRAME_OPTIONS, Droid, DroidRequestTimeoutError } from "./droid-live.js";
 import { semanticEffectorManifest } from "./effectors.test.js";
 
 const originalFetch = globalThis.fetch;
@@ -16,6 +16,45 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("Droid camera calibration", () => {
+  test("uses the inspection-image defaults for getFrame(camera)", async () => {
+    let requested: URL | null = null;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1" });
+      if (url.pathname === "/api/dora/cameras/frame") {
+        requested = url;
+        return new Response(new Uint8Array([1, 2, 3]), {
+          headers: { "content-type": "image/jpeg", "x-vitrus-frame-id": "head:42", "x-vitrus-captured-at": "2026-08-27T00:00:00Z" },
+        });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("R05", { apiKey: "test-key", endpoint: "https://relay.test", edgeCameraEndpoint: "http://edge.test" });
+    const frame = await droid.camera.getFrame("head_camera");
+    expect(requested?.searchParams.get("width")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.width));
+    expect(requested?.searchParams.get("height")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.height));
+    expect(requested?.searchParams.get("quality")).toBe(String(DEFAULT_CAMERA_FRAME_OPTIONS.quality));
+    expect(requested?.searchParams.get("consistency")).toBe("latest");
+    expect(frame.bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  test("opens a realtime stream without a snapshot profile", async () => {
+    const calls: URL[] = [];
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      calls.push(url);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1" });
+      if (url.pathname === "/api/dora/cameras/streams") return jsonResponse({ id: "stream-1", droidId: "droid-1", camera: "head_camera", expiresAt: "", transport: "webrtc", route: "direct", profile: "realtime", width: 640, height: 360, fps: 30 });
+      if (url.pathname === "/api/dora/cameras/offer") return jsonResponse({ sdp: "answer", type: "answer", camera: "head_camera" });
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("R05", { apiKey: "test-key", endpoint: "https://relay.test", edgeCameraEndpoint: "http://edge.test" });
+    const stream = await droid.camera.openStream("head_camera");
+    expect(stream.profile).toBe("realtime");
+    await stream.negotiate?.({ sdp: "offer", type: "offer" });
+    expect(calls.map((url) => url.pathname)).toEqual(["/v1/droids/resolve", "/api/dora/cameras/streams", "/api/dora/cameras/offer"]);
+  });
+
   test("combines VitrusOS fisheye intrinsics with Clay camera extrinsics", async () => {
     globalThis.fetch = async (input) => {
       const url = new URL(String(input));
@@ -439,8 +478,45 @@ describe("Droid realtime and control sessions", () => {
     expect(ready.appliedTargetCount).toBe(1);
   });
 
+  test("continues bounded Edge priming after one transient readiness observation failure", async () => {
+    let controlStateReads = 0;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X", model: "R06", displayName: "R-06", organizationId: "org-1", status: "online", enrollmentState: "enrolled" });
+      }
+      if (url.pathname === "/api/dora/joint-targets") {
+        return jsonResponse({ ok: true, transport: "broker-direct", stream: "joint_targets", sdkSequence: 1 });
+      }
+      if (url.pathname === "/api/dora/control-heartbeat") {
+        return jsonResponse({ ok: true, transport: "broker-direct", lease_id: "lease-1", hold_active: true });
+      }
+      if (url.pathname === "/api/dora/control-state") {
+        controlStateReads += 1;
+        if (controlStateReads === 1) return jsonResponse({ ok: false, error: "timed out" }, 400);
+        return jsonResponse({
+          ok: true, transport: "broker-direct", access_mode: "read_write", control_phase: "ready_for_realtime", exclusive_lease_id: "lease-1",
+          motors: [{ joint_name: "RIGHT_WRIST_B", accepted_origin_sequence: 1, applied_origin_sequence: 1 }],
+        });
+      }
+      return jsonResponse({ detail: `not found: ${url.pathname}` }, 404);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://edge.test:8782", motionTransport: "edge", motionAdmissionTimeoutMs: 1_000,
+    });
+    const ready = await droid.motion.primeAndWaitReady(
+      [{ jointName: "RIGHT_WRIST_B", displayDeg: -28.2 }],
+      { leaseId: "lease-1", ttlMs: 5_000, edgeKeepaliveMs: 1_000, readinessTimeoutMs: 1_000, pollIntervalMs: 10 },
+    );
+
+    expect(ready).toMatchObject({ phase: "ready_for_realtime", leaseId: "lease-1", acceptedTargetCount: 1, appliedTargetCount: 1 });
+    expect(controlStateReads).toBe(2);
+  });
+
   test("sends motion through the explicit local Golden Edge transport", async () => {
     const requestedPaths: string[] = [];
+    let activeEdgeLeaseId = "";
     globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
       requestedPaths.push(url.pathname);
@@ -459,9 +535,23 @@ describe("Droid realtime and control sessions", () => {
         const command = JSON.parse(String(init?.body)) as { sequence: number };
         return jsonResponse({ ok: true, transport: "dora", stream: "joint_targets", sequence: command.sequence });
       }
+      if (url.pathname === "/api/dora/control-heartbeat") {
+        return jsonResponse({ ok: true, transport: "dora", lease_id: activeEdgeLeaseId, hold_active: true });
+      }
+      if (url.pathname === "/api/dora/control-state") {
+        return jsonResponse({
+          ok: true,
+          transport: "broker-direct",
+          access_mode: "read_write",
+          control_phase: "ready_for_realtime",
+          exclusive_lease_id: activeEdgeLeaseId,
+          motors: [{ joint_name: "NECK_HEAD", accepted_origin_sequence: 3, applied_origin_sequence: 3 }],
+        });
+      }
       if (url.pathname === "/api/dora/acquire") {
         const acquireBody = JSON.parse(String(init?.body)) as { lease_id: string };
         const leaseId = String(acquireBody.lease_id);
+        activeEdgeLeaseId = leaseId;
         return jsonResponse({ ok: true, transport: "dora", acquired: true, lease_id: leaseId });
       }
       if (url.pathname === "/api/dora/release") {
@@ -498,17 +588,25 @@ describe("Droid realtime and control sessions", () => {
       [{ jointName: "NECK_HEAD", displayDeg: 6 }],
       { leaseId: lease.id, timeoutMs: 250 },
     );
+    const primed = await droid.motion.primeAndWaitReady(
+      [{ jointName: "NECK_HEAD", displayDeg: 6 }],
+      { leaseId: lease.id, ttlMs: 5_000, edgeKeepaliveMs: 1_000, readinessTimeoutMs: 100, pollIntervalMs: 10 },
+    );
     const telemetry = await droid.telemetry.snapshot();
     await droid.control.release(lease.id);
 
     expect(result).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
     expect(second.requestId).toBe("2");
+    expect(primed).toMatchObject({ phase: "ready_for_realtime", acceptedTargetCount: 1, appliedTargetCount: 1, originSequence: 3 });
     expect(telemetry.joints.NECK_HEAD?.feedback_generation).toBe(7);
     expect(requestedPaths).toEqual([
       "/v1/droids/resolve",
       "/api/dora/acquire",
       "/api/dora/joint-targets",
       "/api/dora/joint-targets",
+      "/api/dora/joint-targets",
+      "/api/dora/control-heartbeat",
+      "/api/dora/control-state",
       "/api/motor-bridge/status",
       "/api/dora/release",
     ]);

@@ -59,6 +59,7 @@ describe("GoldenEdgeClient", () => {
       endpoint: "http://r-05-edge:8782",
       robotId: "R06.cannon",
       leaseId: "lease-ik",
+      modelBinding: { configuration_revision: "a".repeat(64), effective_urdf_sha256: "b".repeat(64), model_epoch: 2 },
       fetch: (async (input, init) => {
         path = new URL(String(input)).pathname;
         body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -70,7 +71,10 @@ describe("GoldenEdgeClient", () => {
     });
 
     await client.submitIkTrajectory({
+      jobId: "left-arm-session-1",
+      inputSequence: 1,
       chain: "left_arm",
+      controlledChains: ["left_arm", "right_arm"],
       ttlMs: 800,
       alignmentProfile: "rough-r06",
       points: [
@@ -81,7 +85,8 @@ describe("GoldenEdgeClient", () => {
 
     expect(path).toBe("/api/dora/ik-targets");
     expect(body).toMatchObject({
-      lease_id: "lease-ik", session_id: "lease-ik", chain: "LEFT_ARM", ttl_ms: 800,
+      lease_id: "lease-ik", session_id: "lease-ik", job_id: "left-arm-session-1", input_sequence: 1, chain: "LEFT_ARM", controlled_chains: ["LEFT_ARM", "RIGHT_ARM"], ttl_ms: 800,
+      configuration_revision: "a".repeat(64), effective_urdf_sha256: "b".repeat(64), model_epoch: 2,
       alignment_profile: "rough-r06",
       points: [{ position: [0.1, 0.2, 0.3] }, { position: [0.1, 0.2, 0.35], time_ms: 400 }],
     });
@@ -190,6 +195,41 @@ describe("GoldenEdgeClient", () => {
     expect(path).toBe("/api/dora/control-state");
     expect(state.complete).toBe(true);
     expect(state.motors?.map((row) => row.joint_name)).toEqual(["LEFT_WRIST_B", "NECK_HEAD"]);
+  });
+
+  test("discovers generic module products and configures declared settings", async () => {
+    const requests: Array<{ path: string; body?: Record<string, unknown> }> = [];
+    const client = new GoldenEdgeClient({
+      endpoint: "http://r-05-edge:8781", robotId: "module-client", leaseId: "module-readonly",
+      fetch: (async (input, init) => {
+        const path = new URL(String(input)).pathname;
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+        requests.push({ path, body });
+        if (path === "/api/modules") return new Response(JSON.stringify({
+          ok: true, schema: "vitrus.modules.v1",
+          modules: [{
+            id: "thermal-camera", type: "sensor.thermal_camera", display_name: "Thermal camera", state: "ready",
+            data_products: [{ id: "thermal_frame", mime_type: "application/json", url: "/api/modules/thermal-frame", width: 32, height: 24 }],
+            settings: { thermalPalette: "iron" },
+            settings_schema: { type: "object", properties: { thermalPalette: { type: "string", enum: ["iron", "white_hot"] } } },
+            visualization: { renderer: "thermal_grid", primary_product_id: "thermal_frame", profiles: [{ id: "iron", settings: { thermalPalette: "iron" } }] },
+          }],
+        }));
+        return new Response(JSON.stringify({ ok: true, module_id: "thermal-camera", settings: { thermalPalette: "white_hot" } }));
+      }) as typeof fetch,
+    });
+
+    const catalog = await client.modules();
+    expect(catalog.modules[0]).toMatchObject({
+      id: "thermal-camera", type: "sensor.thermal_camera", dataProducts: [{ id: "thermal_frame", mimeType: "application/json", width: 32, height: 24 }],
+      visualization: { renderer: "thermal_grid", primary_product_id: "thermal_frame" },
+    });
+    await expect(client.configureModule("thermal-camera", { thermalPalette: "white_hot" }))
+      .resolves.toEqual({ thermalPalette: "white_hot" });
+    expect(requests).toEqual([
+      { path: "/api/modules" },
+      { path: "/api/modules/config", body: { module_id: "thermal-camera", settings: { thermalPalette: "white_hot" } } },
+    ]);
   });
 
   test("reports a typed local admission timeout", async () => {

@@ -1,7 +1,8 @@
 import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry, validateDroidLeaseDurationMs } from "./droid.js";
 import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 export * from "./droid.js";
-import type { CameraFrame, ControlLease as BaseControlLease, DroidCartesianTrajectoryOptions, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { CameraFrame, CameraFrameOptions, CameraStream, CameraStreamOptions, ControlLease as BaseControlLease, DroidCartesianTrajectoryOptions, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { GoldenEdgeModuleCatalog } from "./golden-edge.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -84,10 +85,11 @@ export class Droid {
   readonly description;
   readonly presets;
   readonly effectors;
-  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
+  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string, options?: CameraFrameOptions): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openStream(camera: string, options?: CameraStreamOptions): Promise<CameraStream>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
   readonly telemetry: { snapshot(): Promise<DroidTelemetry>; subscribe(listener: (value: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly status: { snapshot(): Promise<DeviceStatus>; subscribe(listener: (value: DeviceStatus) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly events: { subscribe(listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
+  readonly modules: { list(): Promise<GoldenEdgeModuleCatalog>; configure(moduleId: string, settings: Record<string, unknown>): Promise<Record<string, unknown>> };
   readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
   readonly motion: {
     sendTargets(targets: JointTarget[], options: DroidTargetOptions): Promise<DroidCommandResult>;
@@ -108,10 +110,11 @@ export class Droid {
     this.safety = base.safety;
     this.camera = {
       list: () => base.camera.list() as Promise<DroidCamera[]>,
-      getFrame: (camera) => base.camera.getFrame(camera),
+      getFrame: (camera, request = {}) => base.camera.getFrame(camera, request),
       getCalibration: (camera) => this.calibration(camera),
-      openSession: (camera, request = {}) => this.post("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
-      closeSession: (sessionId) => this.remove(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`),
+      openStream: (camera, request = {}) => base.camera.openStream(camera, request),
+      openSession: (camera, request = {}) => base.camera.openSession(camera, request),
+      closeSession: (sessionId) => base.camera.closeSession(sessionId),
     };
     this.telemetry = {
       snapshot: () => base.telemetry.snapshot(),
@@ -128,6 +131,7 @@ export class Droid {
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribe(listener, request) };
+    this.modules = { list: () => base.modules.list(), configure: (moduleId, settings) => base.modules.configure(moduleId, settings) };
     this.control = {
       // BaseDroid owns the Edge transport client and performs the synchronous
       // local acquire after creating the authenticated control-plane lease.

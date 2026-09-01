@@ -5,6 +5,12 @@ export const VITRUS_CONTRACT_VERSION = "0.1.0";
 export const CONTROL_JOINT_TARGETS_SCHEMA = "vitrus.control.joint_targets";
 export const DEFAULT_CONTROL_TTL_MS = 250;
 
+export type ControlModelBinding = {
+  configuration_revision: string;
+  effective_urdf_sha256: string;
+  model_epoch: number;
+};
+
 export type ControlJointTarget = {
   joint_name: string;
   position_deg?: number;
@@ -39,6 +45,9 @@ export type ControlJointTargetsMessage = {
   edge_keepalive_ms?: number;
   lease_id: string;
   robot_id: string;
+  configuration_revision?: string;
+  effective_urdf_sha256?: string;
+  model_epoch?: number;
   /** VitrusOS owns the only physical velocity/acceleration/jerk trajectory. */
   trajectory_owner: "edge";
   flush: true;
@@ -69,6 +78,7 @@ export function createJointTargetsMessage(options: {
   source?: string;
   ttlMs?: number;
   edgeKeepaliveMs?: number;
+  modelBinding?: ControlModelBinding;
   semanticEffectors?: EffectorCommandEnvelope;
   sentAtMs?: number;
   targets: ControlJointTarget[];
@@ -96,6 +106,14 @@ export function createJointTargetsMessage(options: {
   ) {
     throw new Error("edgeKeepaliveMs must be an integer between 1 and 15000 ms");
   }
+  if (options.modelBinding) {
+    const binding = options.modelBinding;
+    if (!/^[a-f0-9]{64}$/.test(binding.configuration_revision)
+      || !/^[a-f0-9]{64}$/.test(binding.effective_urdf_sha256)
+      || !Number.isSafeInteger(binding.model_epoch) || binding.model_epoch < 1) {
+      throw new Error("modelBinding must contain a valid revision, effective URDF SHA-256, and positive epoch");
+    }
+  }
 
   const sentAtMs = Math.trunc(options.sentAtMs ?? Date.now());
   const ttlMs = Math.max(1, Math.trunc(options.ttlMs ?? DEFAULT_CONTROL_TTL_MS));
@@ -113,6 +131,7 @@ export function createJointTargetsMessage(options: {
     }),
     lease_id: options.leaseId,
     robot_id: options.robotId,
+    ...(options.modelBinding ?? {}),
     trajectory_owner: "edge",
     flush: true,
     safety: {

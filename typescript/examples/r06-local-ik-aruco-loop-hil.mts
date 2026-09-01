@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     const lease = await droid.control.acquire({ durationMs: LEASE_MS, owner: "sdk-local-ik-aruco-loop", jointNames: ARM_JOINTS });
     leaseId = lease.id; edge.setLease(lease.id);
     await waitForLease(edge, lease.id);
-    const admission = await droid.motion.sendCartesianTrajectory({ leaseId: lease.id, chain: CHAIN, points, ttlMs: TRAJECTORY_TTL_MS });
+    const admission = await droid.motion.sendCartesianTrajectory({ leaseId: lease.id, jobId: `${lease.id}:aruco-loop`, inputSequence: 1, chain: CHAIN, points, ttlMs: TRAJECTORY_TTL_MS });
     const result = object(admission.result);
     assert(admission.status === "acknowledged" && result.accepted === true && result.mode === "ik", `local IK was not accepted: ${JSON.stringify(admission)}`);
     assert(object(result.alignment_profile).id === current.alignment_profile.id, "local IK did not use the device default alignment profile");

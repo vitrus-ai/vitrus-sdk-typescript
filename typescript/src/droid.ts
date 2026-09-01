@@ -1,4 +1,4 @@
-import { createJointTargetsMessage, type ControlJointTarget, type ControlJointTargetsMessage } from "./contracts.js";
+import { createJointTargetsMessage, type ControlJointTarget, type ControlJointTargetsMessage, type ControlModelBinding } from "./contracts.js";
 import {
   EFFECTOR_COMMANDS_SCHEMA,
   createEffectorCommand,
@@ -8,7 +8,7 @@ import {
   type EffectorCommandEnvelope,
   type EffectorInstance,
 } from "./effectors.js";
-import { GoldenEdgeClient } from "./golden-edge.js";
+import { GoldenEdgeClient, type GoldenEdgeModuleCatalog } from "./golden-edge.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
 import { normalizeDeviceStatus, type DeviceStatus } from "./device-status.js";
 
@@ -260,8 +260,26 @@ export type CameraFrame = {
   capturedAt: string;
   imageUrl?: string;
   dataBase64?: string;
+  /** JPEG/PNG payload when the frame was read directly from VitrusOS. */
+  bytes?: Uint8Array;
   width?: number;
   height?: number;
+};
+
+/** One finite image read. Omitted fields use the device's normal inspection image. */
+export type CameraFrameOptions = {
+  width?: number;
+  height?: number;
+  quality?: number;
+  /** `latest` never waits for an older buffered image. */
+  consistency?: "latest";
+};
+
+export const DEFAULT_CAMERA_FRAME_OPTIONS: Required<CameraFrameOptions> = {
+  width: 1280,
+  height: 720,
+  quality: 90,
+  consistency: "latest",
 };
 
 export type DroidCamera = Record<string, unknown> & {
@@ -325,6 +343,24 @@ export type CameraMediaSession = {
   requiresAuthorization?: boolean;
 };
 
+export type CameraStreamProfile = "realtime" | "high-definition";
+
+/** Continuous-video options. `snapshot` is deliberately not a stream profile. */
+export type CameraStreamOptions = {
+  profile?: CameraStreamProfile;
+  width?: number;
+  height?: number;
+  fps?: number;
+  audio?: boolean;
+  preferredTransport?: Exclude<CameraMediaTransport, "snapshot"> | "auto";
+};
+
+export type CameraStream = CameraMediaSession & {
+  profile: CameraStreamProfile;
+  /** Sends a browser WebRTC offer through the authenticated SDK/Edge route. */
+  negotiate?: (offer: { sdp: string; type: string }) => Promise<{ sdp: string; type: string; camera: string; video?: { width: number; height: number; fps: number } }>;
+};
+
 export type DroidTelemetry = {
   schema: string;
   timestamp: string;
@@ -367,6 +403,8 @@ export type JointTarget = {
 
 export type DroidTargetOptions = {
   leaseId: string;
+  /** Exact active VitrusOS model used to derive this target. */
+  modelBinding?: ControlModelBinding;
   /** End-to-end command lifetime; this is not the HTTP request timeout. */
   ttlMs?: number;
   /**
@@ -394,7 +432,19 @@ export type CartesianTargetPoint = {
 
 export type DroidCartesianTrajectoryOptions = {
   leaseId: string;
+  /** Stable per-lease job identity; Edge retains this job, not the browser. */
+  jobId: string;
+  /** Strictly increasing Cartesian target revision within the job. */
+  inputSequence: number;
+  /** Exact active VitrusOS model used to solve this Cartesian request. */
+  modelBinding?: ControlModelBinding;
   chain: string;
+  /**
+   * Immutable Cartesian chains covered by this broker lease.  The Edge
+   * publishes one complete target batch for this exact set on every cycle;
+   * omitted means the requested `chain` only for backwards compatibility.
+   */
+  controlledChains?: string[];
   points: CartesianTargetPoint[];
   /** Lifetime of this robot-local trajectory, including its final hold. */
   ttlMs?: number;
@@ -437,6 +487,10 @@ export type DroidConnectionOptions = {
   relayUrl?: string;
   endpoint?: string;
   edgeEndpoint?: string;
+  /** Edge endpoint that serves module discovery, products, and module settings. Defaults to edgeEndpoint. */
+  moduleEndpoint?: string;
+  /** Edge gateway used exclusively for camera media. Defaults to edgeEndpoint. */
+  edgeCameraEndpoint?: string;
   /** Full URL for an Edge-local telemetry snapshot compatible with DroidTelemetry. */
   edgeTelemetryUrl?: string;
   /** Full URL for the canonical Edge-local vitrus.device.status.v1 snapshot. */
@@ -596,8 +650,10 @@ export class Droid {
   };
   readonly camera: {
     list: () => Promise<DroidCamera[]>;
-    getFrame: (camera: string) => Promise<CameraFrame>;
+    getFrame: (camera: string, options?: CameraFrameOptions) => Promise<CameraFrame>;
     getCalibration: (camera: string) => Promise<CameraCalibration | null>;
+    openStream: (camera: string, options?: CameraStreamOptions) => Promise<CameraStream>;
+    /** @deprecated Use openStream(camera, options). */
     openSession: (camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }) => Promise<CameraMediaSession>;
     closeSession: (sessionId: string) => Promise<void>;
   };
@@ -611,6 +667,11 @@ export class Droid {
   };
   readonly events: {
     subscribe: (listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
+  };
+  /** Module discovery/configuration is device-local and independent of motor authority. */
+  readonly modules: {
+    list: () => Promise<GoldenEdgeModuleCatalog>;
+    configure: (moduleId: string, settings: Record<string, unknown>) => Promise<Record<string, unknown>>;
   };
   readonly control: {
     acquire: (options?: { durationMs?: number; owner?: string; jointNames?: string[] }) => Promise<ControlLease>;
@@ -627,6 +688,7 @@ export class Droid {
   private sequence = 0;
   private identityCache: DroidIdentity | null = null;
   private edgeClient: GoldenEdgeClient | null = null;
+  private moduleClient: GoldenEdgeClient | null = null;
   private edgeLeaseId: string | null = null;
   private edgeControlOwner: string | null = null;
   private edgeControlJointNames: string[] = [];
@@ -680,10 +742,17 @@ export class Droid {
       }),
     };
     this.camera = {
-      list: () => this.get<DroidCamera[]>("/v1/droids/cameras"),
-      getFrame: (camera) => this.get<CameraFrame>("/v1/droids/cameras/frame", { camera }),
+      list: () => this.edgeCameraUrl() ? this.edgeCameraList() : this.get<DroidCamera[]>("/v1/droids/cameras"),
+      getFrame: (camera, request = {}) => this.getCameraFrame(camera, request),
       getCalibration: (camera) => this.getCameraCalibration(camera),
-      openSession: (camera, request = {}) => this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
+      openStream: (camera, request = {}) => this.openCameraStream(camera, request),
+      openSession: async (camera, request = {}) => {
+        // Compatibility only: a finite image is now getFrame(), never a stream profile.
+        if (request.preferredTransport === "snapshot") {
+          return this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: "snapshot" });
+        }
+        return this.openCameraStream(camera, { preferredTransport: request.preferredTransport });
+      },
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
     };
     this.telemetry = {
@@ -713,6 +782,10 @@ export class Droid {
       }, request),
     };
     this.events = { subscribe: (listener, request) => this.subscribeEvents(listener, request) };
+    this.modules = {
+      list: () => this.moduleEdgeClient().modules(),
+      configure: (moduleId, settings) => this.moduleEdgeClient().configureModule(moduleId, settings),
+    };
     this.control = {
       acquire: async (request = {}) => {
         const durationMs = validateDroidLeaseDurationMs(request.durationMs) ?? 15_000;
@@ -798,6 +871,22 @@ export class Droid {
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),
     };
+  }
+
+  private moduleEdgeClient(): GoldenEdgeClient {
+    const endpoint = this.options.moduleEndpoint ?? this.options.edgeEndpoint;
+    if (!endpoint) throw new Error("Droid modules require moduleEndpoint or edgeEndpoint");
+    if (!this.moduleClient) {
+      this.moduleClient = new GoldenEdgeClient({
+        endpoint,
+        robotId: this.identityCache?.id || "module-discovery",
+        // Module reads/configuration never borrow or mutate a motor lease.
+        leaseId: "vitrus-sdk-module-readonly",
+        source: "vitrus-sdk",
+        requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 3_000,
+      });
+    }
+    return this.moduleClient;
   }
 
   private async getCameraCalibration(camera: string): Promise<CameraCalibration | null> {
@@ -951,6 +1040,7 @@ export class Droid {
       ttlMs: request.ttlMs ?? request.timeoutMs,
       edgeKeepaliveMs: request.edgeKeepaliveMs,
       semanticEffectors,
+      modelBinding: request.modelBinding,
       targets: controlTargets,
     });
     const motionTransport = this.options.motionTransport ?? "bridge";
@@ -964,6 +1054,7 @@ export class Droid {
           robotId: identity.id,
           leaseId: request.leaseId,
           source: command.source,
+          modelBinding: request.modelBinding,
           requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
         });
         this.edgeLeaseId = request.leaseId;
@@ -1018,12 +1109,18 @@ export class Droid {
     if ((this.options.motionTransport ?? "bridge") !== "edge" || !this.options.edgeEndpoint) {
       throw new Error("Cartesian trajectories require the robot-local Edge motion transport");
     }
-    if (!request.leaseId.trim() || !request.chain.trim() || !request.points.length) {
-      throw new Error("Cartesian trajectory requires leaseId, chain, and points");
+    if (!request.leaseId.trim() || !request.jobId.trim() || !Number.isSafeInteger(request.inputSequence) || request.inputSequence < 1 || !request.chain.trim() || !request.points.length) {
+      throw new Error("Cartesian trajectory requires leaseId, jobId, inputSequence, chain, and points");
     }
     const ttlMs = request.ttlMs ?? 500;
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 50 || ttlMs > 30_000) {
       throw new Error("Cartesian trajectory ttlMs must be in [50, 30000]");
+    }
+    const controlledChains = request.controlledChains == null
+      ? undefined
+      : [...new Set(request.controlledChains.map((chain) => chain.trim().toUpperCase()))];
+    if (controlledChains && (!controlledChains.length || controlledChains.some((chain) => !chain) || !controlledChains.includes(request.chain.trim().toUpperCase()))) {
+      throw new Error("controlledChains must be a non-empty unique set containing chain");
     }
     for (const point of request.points) {
       if (point.positionM.length !== 3 || !point.positionM.every(Number.isFinite)
@@ -1039,6 +1136,7 @@ export class Droid {
         robotId: identity.id,
         leaseId: request.leaseId,
         source: "vitrus-sdk",
+        modelBinding: request.modelBinding,
         requestTimeoutMs: this.options.motionAdmissionTimeoutMs ?? 1_000,
       });
       this.edgeLeaseId = request.leaseId;
@@ -1047,10 +1145,14 @@ export class Droid {
       this.edgeLeaseId = request.leaseId;
     }
     const result = await this.edgeClient.submitIkTrajectory({
+      jobId: request.jobId,
+      inputSequence: request.inputSequence,
       chain: request.chain,
       points: request.points,
       ttlMs,
+      controlledChains,
       alignmentProfile: request.alignmentProfile,
+      modelBinding: request.modelBinding,
     });
     return { requestId: `${request.leaseId}:${result.chain}`, status: "acknowledged", route: "local", result };
   }
@@ -1077,14 +1179,45 @@ export class Droid {
     }
     const timeoutMs = Math.max(1, Math.trunc(request.readinessTimeoutMs ?? 15_000));
     const pollIntervalMs = Math.max(10, Math.trunc(request.pollIntervalMs ?? 100));
+    const edgeHoldMs = request.edgeKeepaliveMs ?? 1_500;
+    // Priming can wait for native controller application longer than the
+    // first local static plan. Renew only the already-accepted hold while
+    // waiting; this does not emit a second target or extend a lease.
+    const heartbeatIntervalMs = Math.max(100, Math.min(1_000, Math.floor(edgeHoldMs / 3)));
+    let nextHeartbeatAtMs = 0;
     const admissions = new Map<number, DroidCommandResult>([[originSequence, admission]]);
     const startedAt = Date.now();
     let lastPhase = "unknown";
     let lastLease: string | null = null;
     let lastAcceptedTargetCount = 0;
     let lastAppliedTargetCount = 0;
+    let lastObservationError: string | null = null;
     while (Date.now() - startedAt < timeoutMs) {
-      const telemetry = await this.telemetry.snapshot();
+      if ((this.options.motionTransport ?? "bridge") === "edge" && Date.now() >= nextHeartbeatAtMs) {
+        await this.edgeClient!.controlHeartbeat(request.leaseId, edgeHoldMs);
+        nextHeartbeatAtMs = Date.now() + heartbeatIntervalMs;
+      }
+      // The Edge gateway admitted the hold and owns its broker-local plan.
+      // Cloud/relay telemetry is intentionally asynchronous, and can still
+      // report a pre-acquire read_only snapshot after the Edge has already
+      // accepted the command. It must not revoke a healthy local lease.
+      let telemetry: DroidTelemetry;
+      try {
+        telemetry = (this.options.motionTransport ?? "bridge") === "edge"
+          ? await this.edgeClient!.controlState() as unknown as DroidTelemetry
+          : await this.telemetry.snapshot();
+        lastObservationError = null;
+      } catch (error) {
+        // A readiness observation is evidence, not a motor command.  The
+        // first hold has already been admitted and is renewed independently;
+        // fail closed only if exact accepted/applied evidence does not arrive
+        // within the caller's bounded readiness window.  Treating one slow
+        // observer response as a command failure unnecessarily released a
+        // healthy lease on a loaded Edge.
+        lastObservationError = error instanceof Error ? error.message : String(error);
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        continue;
+      }
       const telemetryRecord = parseJsonRecord(telemetry);
       const raw = parseJsonRecord(telemetryRecord.raw);
       const motorBridge = firstRecord(
@@ -1150,7 +1283,8 @@ export class Droid {
       + `broker lease=${lastLease ?? "none"}, `
       + `accepted=${lastAcceptedTargetCount}/${targets.length}, `
       + `applied=${lastAppliedTargetCount}/${targets.length}, `
-      + `origin=${originSequence})`,
+      + `origin=${originSequence}`
+      + `${lastObservationError ? `, last observer error=${lastObservationError}` : ""})`,
     );
   }
 
@@ -1201,6 +1335,85 @@ export class Droid {
     if (this.ref.alias) params.set("alias", this.ref.alias);
   }
 
+  private edgeCameraUrl(): string | null {
+    const endpoint = this.options.edgeCameraEndpoint ?? this.options.edgeEndpoint;
+    return endpoint?.trim() ? cleanUrl(endpoint) : null;
+  }
+
+  private async edgeCameraList(): Promise<DroidCamera[]> {
+    const endpoint = this.edgeCameraUrl();
+    if (!endpoint) throw new Error("Vitrus Edge camera endpoint is not configured");
+    const payload = await this.request<{ cameras?: unknown }>(
+      `${endpoint}/api/dora/cameras`, { method: "GET" }, "GET Edge cameras",
+    );
+    return Array.isArray(payload.cameras) ? payload.cameras as DroidCamera[] : [];
+  }
+
+  private cameraFrameOptions(options: CameraFrameOptions): Required<CameraFrameOptions> {
+    const resolved = { ...DEFAULT_CAMERA_FRAME_OPTIONS, ...options };
+    for (const [name, value] of [["width", resolved.width], ["height", resolved.height], ["quality", resolved.quality]] as const) {
+      if (!Number.isInteger(value) || value < 1 || (name !== "quality" && value > 4096) || (name === "quality" && value > 100)) {
+        throw new RangeError(`camera frame ${name} is out of range`);
+      }
+    }
+    if (resolved.consistency !== "latest") throw new RangeError("camera frame consistency must be latest");
+    return resolved;
+  }
+
+  private async getCameraFrame(camera: string, options: CameraFrameOptions): Promise<CameraFrame> {
+    const resolved = this.cameraFrameOptions(options);
+    const endpoint = this.edgeCameraUrl();
+    if (!endpoint) {
+      return this.get<CameraFrame>("/v1/droids/cameras/frame", {
+        camera,
+        ...Object.fromEntries(Object.entries(resolved).map(([key, value]) => [key, String(value)])),
+      });
+    }
+    const url = new URL(`${endpoint}/api/dora/cameras/frame`);
+    url.searchParams.set("camera", camera);
+    for (const [key, value] of Object.entries(resolved)) url.searchParams.set(key, String(value));
+    const response = await this.requestBinary(url.toString(), { method: "GET", headers: { accept: "image/jpeg" } }, "GET Edge camera frame");
+    const capturedAt = response.headers.get("x-vitrus-captured-at") || new Date().toISOString();
+    return {
+      camera,
+      frameId: response.headers.get("x-vitrus-frame-id") || `${camera}:${capturedAt}`,
+      mimeType: response.headers.get("content-type") || "image/jpeg",
+      capturedAt,
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      width: resolved.width,
+      height: resolved.height,
+    };
+  }
+
+  private async openCameraStream(camera: string, options: CameraStreamOptions): Promise<CameraStream> {
+    const endpoint = this.edgeCameraUrl();
+    const profile = options.profile ?? "realtime";
+    if (!endpoint) {
+      const session = await this.post<CameraMediaSession>("/v1/droids/cameras/sessions", {
+        camera,
+        preferredTransport: options.preferredTransport ?? "webrtc",
+        ...options,
+      });
+      return { ...session, profile };
+    }
+    const payload = await this.request<CameraMediaSession & { profile?: CameraStreamProfile }>(
+      `${endpoint}/api/dora/cameras/streams`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile, ...options }) },
+      "open Edge camera stream",
+    );
+    return {
+      ...payload,
+      camera,
+      ...(payload.offerUrl ? { offerUrl: new URL(payload.offerUrl, `${endpoint}/`).toString() } : {}),
+      profile: payload.profile ?? profile,
+      negotiate: async (offer) => this.request(
+        `${endpoint}/api/dora/cameras/offer`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile: payload.profile ?? profile, ...options, ...offer }) },
+        "negotiate Edge camera stream",
+      ),
+    };
+  }
+
   private async request<T>(url: string, init: RequestInit, operation = "request"): Promise<T> {
     const controller = new AbortController();
     const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
@@ -1220,6 +1433,28 @@ export class Droid {
         throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
       }
       return payload as T;
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async requestBinary(url: string, init: RequestInit, operation = "request"): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+        headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) },
+      });
+      if (!response.ok) throw new Error(`Vitrus ${operation} failed (${response.status}): ${response.statusText}`);
+      return response;
     } catch (error) {
       if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
         throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
