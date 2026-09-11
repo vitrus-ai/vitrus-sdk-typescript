@@ -85,7 +85,9 @@ export class DirectMotionJobClient implements MotionJobTransport {
   async startWithReceipt(options: MotionJobStartOptions): Promise<DirectMotionStartReceipt> {
     if (options.mode !== "device_ik") throw new Error("native direct control only supports device_ik jobs");
     const names = normalizeScope(options.jointNames);
-    const auxiliaryNames = options.auxiliaryJointNames === undefined ? undefined : normalizeScope(options.auxiliaryJointNames);
+    // An explicit empty auxiliary declaration means this device-IK job has no
+    // servo-only scope.  Primary jointNames remain non-empty and unique.
+    const auxiliaryNames = options.auxiliaryJointNames === undefined ? undefined : normalizeOptionalAuxiliaryScope(options.auxiliaryJointNames);
     if (auxiliaryNames !== undefined && auxiliaryNames.some(name => !names.includes(name))) {
       throw new Error("auxiliaryJointNames must be a subset of jointNames");
     }
@@ -172,6 +174,10 @@ function normalizeScope(names: string[]): string[] {
   const scope = names.map(name => requiredText(name, "jointNames[]"));
   if (!scope.length || new Set(scope).size !== scope.length) throw new Error("jointNames must be a unique non-empty scope");
   return scope;
+}
+function normalizeOptionalAuxiliaryScope(names: string[]): string[] {
+  if (!Array.isArray(names)) throw new Error("auxiliaryJointNames must be an array when specified");
+  return names.length === 0 ? [] : normalizeScope(names);
 }
 function validIntent(value: MotionIntentMode): MotionIntentMode {
   if (value !== "continuous_setpoint" && value !== "execute_goal") throw new Error("intentMode is invalid");

@@ -102,6 +102,32 @@ test("Droid.connect exposes native direct motion only through the public datapla
   }
 });
 
+test("direct start preserves an explicit empty auxiliary scope for an 18-joint canary", async () => {
+  const jointNames = Array.from({ length: 18 }, (_, index) => `JOINT_${index + 1}`);
+  let startPayload: Record<string, unknown> | undefined;
+  const client = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.onrender.com",
+    apiKey: "test-api-key",
+    ref: "VTRS-R06-2607-R2D2X",
+    fetch: (async (input, init) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe("/v1/droids/motion/direct/start");
+      startPayload = (JSON.parse(String(init?.body)) as { payload: Record<string, unknown> }).payload;
+      return response({ ok: true, job: {
+        job_id: "arm-neck-18", epoch: 1, mode: "device_ik", state: "hold",
+        joint_names: jointNames, auxiliary_joint_names: [], configuration_revision: "rev-1", last_sequence: 0,
+      }, initial_feedback: { motors: [] }, prime_receipt: { accepted: true } });
+    }) as typeof fetch,
+  });
+  const started = await client.startWithReceipt({
+    mode: "device_ik", owner: "public-arm-canary", jointNames, auxiliaryJointNames: [], configurationRevision: "rev-1",
+  });
+  expect(started.session.id).toBe("arm-neck-18");
+  expect(started.session.jointNames).toEqual(jointNames);
+  expect(started.session.auxiliaryJointNames).toEqual([]);
+  expect(startPayload).toMatchObject({ joint_names: jointNames, auxiliary_joint_names: [] });
+});
+
 test("direct motion rejects arbitrary local paths and preserves typed public failures", async () => {
   const client = new DirectMotionJobClient({
     endpoint: "https://vitrus-dataplane.onrender.com",
