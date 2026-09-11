@@ -160,8 +160,53 @@ describe("Droid camera calibration", () => {
 });
 
 describe("Droid realtime and control sessions", () => {
+  test("retries transient read-only registry discovery within a bounded budget", async () => {
+    let calls = 0;
+    globalThis.fetch = async (input) => {
+      expect(new URL(String(input)).pathname).toBe("/v1/droids/resolve");
+      calls += 1;
+      return calls < 3
+        ? jsonResponse({ detail: "Droid registry unavailable" }, 502)
+        : jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+    });
+    expect((await droid.identity.get()).id).toBe("droid-1");
+    expect(calls).toBe(3);
+  });
+
+  test("does not retry non-transient registry failures", async () => {
+    for (const status of [401, 403, 404]) {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return jsonResponse({ detail: `HTTP ${status}` }, status);
+      };
+      await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+        apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+      })).rejects.toThrow(`(${status})`);
+      expect(calls).toBe(1);
+    }
+  });
+
+  test("caps transient registry discovery at two retries", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return jsonResponse({ detail: "Droid registry unavailable" }, 502);
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+    })).rejects.toThrow("(502)");
+    expect(calls).toBe(3);
+  });
+
   test("separates control-plane timeout and reports the timed-out operation", async () => {
+    let calls = 0;
     globalThis.fetch = ((_, init) => new Promise((_, reject) => {
+      calls += 1;
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     })) as typeof fetch;
 
@@ -181,6 +226,8 @@ describe("Droid realtime and control sessions", () => {
         path: "/v1/droids/resolve",
         timeoutMs: 5,
       });
+      // Deadline aborts the first attempt; it never starts a retry after expiry.
+      expect(calls).toBe(1);
     }
   });
 

@@ -459,6 +459,26 @@ export class DroidRequestTimeoutError extends Error {
 }
 
 const DEFAULT_ZENOH_WS_ENDPOINT = "ws://127.0.0.1:7448";
+/** A temporary public registry outage must not prevent a read-only client bootstrap. */
+const REGISTRY_DISCOVERY_ATTEMPTS = 3;
+const REGISTRY_RETRY_BASE_MS = 25;
+
+function isRetryableRegistryStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 504);
+}
+
+function registryRetryDelayMs(attempt: number): number {
+  // Keep the recovery short and desynchronize simultaneous reconnecting viewers.
+  return REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
+}
+
+function registryDeadlineError(operation: string, url: string, timeoutMs: number): DroidRequestTimeoutError {
+  return new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+}
+
+function pauseRegistryRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
 
 function cleanUrl(url: string): string {
   return url.replace(/\/+$/, "");
@@ -626,7 +646,7 @@ export class Droid {
     this.clientId = options.clientId?.trim() || `vitrus-sdk-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
     this.identity = { get: async () => {
       if (this.identityCache) return this.identityCache;
-      const identity = await this.get<DroidIdentity>("/v1/droids/resolve");
+      const identity = await this.resolveIdentity();
       this.identityCache = identity;
       return identity;
     } };
@@ -1096,6 +1116,61 @@ export class Droid {
       + `applied=${lastAppliedTargetCount}/${targets.length}, `
       + `origin=${originSequence})`,
     );
+  }
+
+  /**
+   * Resolve the public registry identity with a small, deadline-bounded retry
+   * budget. This is deliberately narrower than `get()`: no command, lease,
+   * camera, feedback, or arbitrary GET request is retried by this helper.
+   */
+  private async resolveIdentity(): Promise<DroidIdentity> {
+    const url = new URL(`${this.baseUrl()}/v1/droids/resolve`);
+    this.appendRef(url.searchParams);
+    const response = await this.fetchRegistryIdentity(url.toString(), "GET /v1/droids/resolve");
+    const payload: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = parseJsonRecord(payload).detail;
+      throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
+    }
+    return payload as DroidIdentity;
+  }
+
+  private async fetchRegistryIdentity(url: string, operation: string): Promise<Response> {
+    const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
+    const deadlineMs = Date.now() + timeoutMs;
+    let lastTransportError: unknown;
+    for (let attempt = 0; attempt < REGISTRY_DISCOVERY_ATTEMPTS; attempt += 1) {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) throw registryDeadlineError(operation, url, timeoutMs);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), remainingMs);
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers: { authorization: `Bearer ${this.options.apiKey}` },
+        });
+        if (!isRetryableRegistryStatus(response.status) || attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) {
+          return response;
+        }
+        // The response will not be exposed to a caller, so release its body
+        // before waiting. A retry never creates a history buffer in the SDK.
+        void response.body?.cancel().catch(() => undefined);
+      } catch (error) {
+        if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+          throw registryDeadlineError(operation, url, timeoutMs);
+        }
+        lastTransportError = error;
+        if (attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const delayMs = registryRetryDelayMs(attempt);
+      if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
+      await pauseRegistryRetry(delayMs);
+    }
+    throw lastTransportError ?? registryDeadlineError(operation, url, timeoutMs);
   }
 
   private async get<T>(path: string, params: Record<string, string> = {}): Promise<T> {
