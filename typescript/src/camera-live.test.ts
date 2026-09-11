@@ -1,5 +1,5 @@
 import {expect,test} from 'bun:test';
-import {observeCameraFrames} from './camera-live';
+import {CameraStreamError,observeCameraFrames} from './camera-live';
 const bytes=new Uint8Array([255,216,255,217]);
 const event=(id:string,at:string)=>JSON.stringify({type:'frame',camera:'head_camera',frameId:id,capturedAt:at,mimeType:'image/jpeg',dataBase64:Buffer.from(bytes).toString('base64'),receivedAtMs:123})+'\n';
 const stream=(text:string)=>new ReadableStream<Uint8Array>({start(controller){controller.enqueue(new TextEncoder().encode(text));controller.close();}});
@@ -34,6 +34,18 @@ test('camera.observeFrames bounds an unterminated public NDJSON record',async()=
  const oversized='x'.repeat(2_100_000);
  const iterator=observeCameraFrames({endpoint:'https://vitrus-dataplane.example',apiKey:'test-key',ref:'VTRS-R06',camera:'head_camera',fetch:async()=>new Response(stream(oversized)) as typeof globalThis.fetch,reconnect:false});
  await expect(iterator.next()).rejects.toThrow('bounded NDJSON line size');
+});
+
+test('camera.observeFrames propagates a definite Bridge rendition error without reconnecting',async()=>{
+ for(const reconnect of [false,true]){
+  let calls=0;
+  const iterator=observeCameraFrames({endpoint:'https://vitrus-dataplane.example',apiKey:'test-key',ref:'VTRS-R06',camera:'head_camera',reconnect,reconnectDelayMs:0,fetch:(async()=>{
+   calls++;return new Response(stream(JSON.stringify({type:'error',error:'rendition_unavailable',status:503,message:'requested rendition is not available',camera:'head_camera',requestedProfile:{maxFps:30},actualDeliveryProfile:{width:640,height:360,quality:75,maxFps:10},actualSourceProfile:{width:1280,height:720,fps:29.97,fourcc:'MJPG'},sourceProfileEpoch:'profile-8'})+'\n'));
+  }) as typeof globalThis.fetch});
+  try{await expect(iterator.next()).rejects.toMatchObject({name:'CameraStreamError',code:'rendition_unavailable',status:503,camera:'head_camera',requestedProfile:{maxFps:30},actualDeliveryProfile:{width:640,height:360,quality:75,maxFps:10},actualSourceProfile:{width:1280,height:720,fps:29.97,fourcc:'MJPG'},sourceProfileEpoch:'profile-8'} satisfies Partial<CameraStreamError>);}
+  finally{await iterator.return?.();}
+  expect(calls).toBe(1);
+ }
 });
 
 test('Droid.connect forwards camera.observeFrames only to the public dataplane',async()=>{

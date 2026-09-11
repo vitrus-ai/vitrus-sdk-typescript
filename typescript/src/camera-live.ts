@@ -19,6 +19,28 @@ export type CameraObservationOptions={
 };
 export type ObserveCameraFramesOptions={endpoint:string;apiKey:string;ref:DroidRef;camera:string}&CameraObservationOptions;
 export type LiveCameraFrame=CameraFrame&{bytes:Uint8Array;receivedAtMs:number};
+export type CameraStreamErrorDetails={
+ code:string;
+ status?:number;
+ message:string;
+ camera?:string;
+ requestedProfile?:CameraOutputProfile;
+ actualDeliveryProfile?:CameraOutputProfile;
+ actualSourceProfile?:CameraCaptureProfile;
+ sourceProfileEpoch?:string|number;
+};
+/** A definite, server-emitted live-camera failure; it is never reconnectable media expiry. */
+export class CameraStreamError extends Error{
+ readonly code:string;readonly status?:number;readonly camera?:string;
+ readonly requestedProfile?:CameraOutputProfile;readonly actualDeliveryProfile?:CameraOutputProfile;
+ readonly actualSourceProfile?:CameraCaptureProfile;readonly sourceProfileEpoch?:string|number;
+ constructor(details:CameraStreamErrorDetails){
+  super(`Vitrus live camera stream error (${details.code}${details.status===undefined?'':`/${details.status}`}): ${details.message}`);
+  this.name='CameraStreamError';this.code=details.code;this.status=details.status;this.camera=details.camera;
+  this.requestedProfile=details.requestedProfile;this.actualDeliveryProfile=details.actualDeliveryProfile;
+  this.actualSourceProfile=details.actualSourceProfile;this.sourceProfileEpoch=details.sourceProfileEpoch;
+ }
+}
 type FetchRequest=(input:Parameters<typeof globalThis.fetch>[0],init?:Parameters<typeof globalThis.fetch>[1])=>Promise<Response>;
 const MAX_FRAME_BYTES=1_500_000;
 // A public line can contain a maximum-size base64 JPEG plus its small JSON
@@ -72,6 +94,20 @@ function outputProfile(value:unknown):CameraOutputProfile|undefined{
   ...(typeof maxFps==="number"?{maxFps}:{}),
  };
 }
+function stringValue(value:unknown):string|undefined{return typeof value==='string'&&value.trim()?value.trim():undefined;}
+function parseSourceProfileEpoch(value:unknown):string|number|undefined{return typeof value==='string'||typeof value==='number'?value:undefined;}
+function serverError(value:Record<string,unknown>):CameraStreamError{
+ const code=stringValue(value.code)??stringValue(value.error);
+ if(!code)throw Error('live camera stream error has no code');
+ const rawStatus=value.status??value.httpStatus??value.http_status;
+ if(rawStatus!==undefined&&(!Number.isInteger(rawStatus)||typeof rawStatus!=="number"||rawStatus<100||rawStatus>599))throw Error('live camera stream error has invalid status');
+ const requestedProfile=outputProfile(value.requestedProfile);
+ const actualDeliveryProfile=outputProfile(value.actualDeliveryProfile??value.outputProfile);
+ const actualSourceProfile=sourceProfile(value.actualSourceProfile);
+ const epoch=parseSourceProfileEpoch(value.sourceProfileEpoch);
+ if(value.sourceProfileEpoch!==undefined&&epoch===undefined)throw Error('live camera stream error has invalid sourceProfileEpoch');
+ return new CameraStreamError({code,status:rawStatus as number|undefined,message:stringValue(value.message)??stringValue(value.detail)??code,...(stringValue(value.camera)?{camera:stringValue(value.camera)}:{}),...(requestedProfile?{requestedProfile}:{}),...(actualDeliveryProfile?{actualDeliveryProfile}:{}),...(actualSourceProfile?{actualSourceProfile}:{}),...(epoch===undefined?{}:{sourceProfileEpoch:epoch})});
+}
 function optionInteger(value:number|undefined,name:string,maximum:number):number|undefined{
  if(value===undefined)return undefined;
  if(!Number.isInteger(value)||value<1||value>maximum)throw new RangeError(`camera observation ${name} is out of range`);
@@ -92,7 +128,7 @@ function parseFrame(value:unknown):LiveCameraFrame|undefined{
  const requestedProfile=outputProfile(frame.requestedProfile);
  const actualDeliveryProfile=outputProfile(frame.actualDeliveryProfile??frame.outputProfile);
  const actualSourceProfile=sourceProfile(frame.actualSourceProfile);
- const sourceProfileEpoch=typeof frame.sourceProfileEpoch==='string'||typeof frame.sourceProfileEpoch==='number'?frame.sourceProfileEpoch:undefined;
+ const sourceProfileEpoch=parseSourceProfileEpoch(frame.sourceProfileEpoch);
  if(frame.sourceProfileEpoch!==undefined&&sourceProfileEpoch===undefined)throw Error('live camera frame has invalid sourceProfileEpoch');
  if(frame.resolutionLimitedBySource!==undefined&&typeof frame.resolutionLimitedBySource!=="boolean")throw Error('live camera frame has invalid resolutionLimitedBySource');
  return {camera,frameId,capturedAt,mimeType,dataBase64,bytes:decodeFrame(dataBase64),receivedAtMs,...(typeof frame.width==='number'?{width:frame.width}:{}),...(typeof frame.height==='number'?{height:frame.height}:{}),...(requestedProfile?{requestedProfile}:{}),...(actualDeliveryProfile?{actualDeliveryProfile}:{}),...(actualSourceProfile?{actualSourceProfile}:{}),...(sourceProfileEpoch===undefined?{}:{sourceProfileEpoch}),...(typeof frame.resolutionLimitedBySource==='boolean'?{resolutionLimitedBySource:frame.resolutionLimitedBySource}:{})};
@@ -131,6 +167,7 @@ export async function* observeCameraFrames(config:ObserveCameraFramesOptions):As
     for(const line of lines){
      if(!line.trim())continue;let event:unknown;try{event=JSON.parse(line);}catch{throw Error('live camera stream emitted malformed NDJSON');}
      if(event&&typeof event==='object'&&(event as Record<string,unknown>).type==='reconnect'){serverRequestedReconnect=true;continue;}
+     if(event&&typeof event==='object'&&(event as Record<string,unknown>).type==='error')throw serverError(event as Record<string,unknown>);
      const frame=parseFrame(event);if(!frame)continue;
      const capturedAtMs=Date.parse(frame.capturedAt);
      // The public stream already rejects replay; retain this client-side check
