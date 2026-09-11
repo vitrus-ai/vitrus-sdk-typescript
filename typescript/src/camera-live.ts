@@ -1,7 +1,22 @@
 /** Public, latest-only camera frames from the Vitrus dataplane. */
-import type {CameraFrame,DroidRef} from './droid.js';
+import type {CameraCaptureProfile,CameraFrame,DroidRef} from './droid.js';
 
-export type CameraObservationOptions={signal?:AbortSignal;reconnect?:boolean;reconnectDelayMs?:number;fetch?:typeof globalThis.fetch};
+/**
+ * A consumer-local rendition request. These fields never reconfigure the
+ * shared camera source; the public service may deliver a lower truthful
+ * rendition when the source cannot satisfy a request.
+ */
+export type CameraObservationOptions={
+ signal?:AbortSignal;
+ reconnect?:boolean;
+ reconnectDelayMs?:number;
+ fetch?:typeof globalThis.fetch;
+ width?:number;
+ height?:number;
+ quality?:number;
+ maxFps?:number;
+ requireExactResolution?:boolean;
+};
 export type ObserveCameraFramesOptions={endpoint:string;apiKey:string;ref:DroidRef;camera:string}&CameraObservationOptions;
 export type LiveCameraFrame=CameraFrame&{bytes:Uint8Array;receivedAtMs:number};
 type FetchRequest=(input:Parameters<typeof globalThis.fetch>[0],init?:Parameters<typeof globalThis.fetch>[1])=>Promise<Response>;
@@ -26,6 +41,32 @@ function decodeFrame(value:string):Uint8Array{
  if(!binary.length||binary.length>MAX_FRAME_BYTES)throw Error('live camera frame exceeds the public size bound');
  const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index++)bytes[index]=binary.charCodeAt(index);return bytes;
 }
+type CameraOutputProfile={width:number;height:number;quality?:number;fps?:number};
+function positiveInteger(value:unknown,name:string,maximum:number):number{
+ if(typeof value!=="number"||!Number.isInteger(value)||value<1||value>maximum)throw Error(`live camera frame has invalid ${name}`);return value;
+}
+function sourceProfile(value:unknown):CameraCaptureProfile|undefined{
+ if(value===undefined)return undefined;
+ if(!value||typeof value!=="object"||Array.isArray(value))throw Error("live camera frame has invalid actualSourceProfile");
+ const profile=value as Record<string,unknown>;
+ const fourcc=profile.fourcc;
+ if(fourcc!==undefined&&(typeof fourcc!=="string"||!/^[A-Za-z0-9]{4}$/.test(fourcc)))throw Error("live camera frame has invalid source fourcc");
+ return {width:positiveInteger(profile.width,"source width",4096),height:positiveInteger(profile.height,"source height",4096),fps:positiveInteger(profile.fps,"source fps",30),...(typeof fourcc==="string"?{fourcc}:{})};
+}
+function outputProfile(value:unknown):CameraOutputProfile|undefined{
+ if(value===undefined)return undefined;
+ if(!value||typeof value!=="object"||Array.isArray(value))throw Error("live camera frame has invalid output profile");
+ const profile=value as Record<string,unknown>;
+ const quality=profile.quality,fps=profile.fps;
+ if(quality!==undefined)positiveInteger(quality,"output quality",100);
+ if(fps!==undefined)positiveInteger(fps,"output fps",30);
+ return {width:positiveInteger(profile.width,"output width",4096),height:positiveInteger(profile.height,"output height",4096),...(typeof quality==="number"?{quality}:{}),...(typeof fps==="number"?{fps}:{})};
+}
+function optionInteger(value:number|undefined,name:string,maximum:number):number|undefined{
+ if(value===undefined)return undefined;
+ if(!Number.isInteger(value)||value<1||value>maximum)throw new RangeError(`camera observation ${name} is out of range`);
+ return value;
+}
 function parseFrame(value:unknown):LiveCameraFrame|undefined{
  if(!value||typeof value!=='object'||Array.isArray(value))throw Error('live camera stream returned invalid JSON');
  const frame=value as Record<string,unknown>;
@@ -38,7 +79,13 @@ function parseFrame(value:unknown):LiveCameraFrame|undefined{
  const receivedAtMs=typeof frame.receivedAtMs==='number'&&Number.isFinite(frame.receivedAtMs)?frame.receivedAtMs:NaN;
  if(!camera||!frameId||!capturedAt||mimeType!=='image/jpeg'||!Number.isFinite(receivedAtMs))throw Error('live camera frame has invalid metadata');
  if(!Number.isFinite(Date.parse(capturedAt)))throw Error('live camera frame has invalid capturedAt');
- return {camera,frameId,capturedAt,mimeType,dataBase64,bytes:decodeFrame(dataBase64),receivedAtMs,...(typeof frame.width==='number'?{width:frame.width}:{}),...(typeof frame.height==='number'?{height:frame.height}:{})};
+ const requestedProfile=outputProfile(frame.requestedProfile);
+ const actualDeliveryProfile=outputProfile(frame.actualDeliveryProfile??frame.outputProfile);
+ const actualSourceProfile=sourceProfile(frame.actualSourceProfile);
+ const sourceProfileEpoch=typeof frame.sourceProfileEpoch==='string'||typeof frame.sourceProfileEpoch==='number'?frame.sourceProfileEpoch:undefined;
+ if(frame.sourceProfileEpoch!==undefined&&sourceProfileEpoch===undefined)throw Error('live camera frame has invalid sourceProfileEpoch');
+ if(frame.resolutionLimitedBySource!==undefined&&typeof frame.resolutionLimitedBySource!=="boolean")throw Error('live camera frame has invalid resolutionLimitedBySource');
+ return {camera,frameId,capturedAt,mimeType,dataBase64,bytes:decodeFrame(dataBase64),receivedAtMs,...(typeof frame.width==='number'?{width:frame.width}:{}),...(typeof frame.height==='number'?{height:frame.height}:{}),...(requestedProfile?{requestedProfile}:{}),...(actualDeliveryProfile?{actualDeliveryProfile}:{}),...(actualSourceProfile?{actualSourceProfile}:{}),...(sourceProfileEpoch===undefined?{}:{sourceProfileEpoch}),...(typeof frame.resolutionLimitedBySource==='boolean'?{resolutionLimitedBySource:frame.resolutionLimitedBySource}:{})};
 }
 const pause=(ms:number,signal?:AbortSignal)=>new Promise<void>((resolve,reject)=>{
  if(signal?.aborted){reject(signal.reason??new DOMException('Aborted','AbortError'));return;}
@@ -53,13 +100,16 @@ const pause=(ms:number,signal?:AbortSignal)=>new Promise<void>((resolve,reject)=
 export async function* observeCameraFrames(config:ObserveCameraFramesOptions):AsyncGenerator<LiveCameraFrame>{
  const endpoint=config.endpoint.replace(/\/+$/,'');if(!endpoint)throw Error('camera.observeFrames requires a dataplane endpoint');
  const apiKey=config.apiKey.trim();if(!apiKey)throw Error('camera.observeFrames requires apiKey');
- const ref=serialRef(config.ref),fetchImpl:FetchRequest=config.fetch??((input,init)=>globalThis.fetch(input,init));
+  const ref=serialRef(config.ref),fetchImpl:FetchRequest=config.fetch??((input,init)=>globalThis.fetch(input,init));
+ const width=optionInteger(config.width,'width',4096),height=optionInteger(config.height,'height',4096),quality=optionInteger(config.quality,'quality',100),maxFps=optionInteger(config.maxFps,'maxFps',30);
+ if(config.requireExactResolution!==undefined&&typeof config.requireExactResolution!=="boolean")throw new TypeError('camera observation requireExactResolution must be boolean');
  const reconnect=config.reconnect??true,reconnectDelayMs=Math.max(0,Math.min(5_000,Math.trunc(config.reconnectDelayMs??100)));
  let lastFrameId:string|undefined,lastCapturedAtMs=-Infinity;
  while(!config.signal?.aborted){
   const controller=new AbortController();const abort=()=>controller.abort(config.signal?.reason);config.signal?.addEventListener('abort',abort,{once:true});
   try{
    const url=new URL(`${endpoint}/v1/droids/cameras/live`);url.searchParams.set('ref',ref);url.searchParams.set('camera',config.camera);
+   if(width!==undefined)url.searchParams.set('width',String(width));if(height!==undefined)url.searchParams.set('height',String(height));if(quality!==undefined)url.searchParams.set('quality',String(quality));if(maxFps!==undefined)url.searchParams.set('max_fps',String(maxFps));if(config.requireExactResolution)url.searchParams.set('require_exact_resolution','true');
    const response=await fetchImpl(url.toString(),{method:'GET',headers:{authorization:`Bearer ${apiKey}`,accept:'application/x-ndjson'},signal:controller.signal});
    if(!response.ok)throw Error(`Vitrus live camera request failed (${response.status}): ${response.statusText}`);
    if(!response.body)throw Error('Vitrus live camera stream has no response body');

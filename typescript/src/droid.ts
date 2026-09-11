@@ -271,6 +271,80 @@ export type CameraFrame = {
   dataBase64?: string;
   width?: number;
   height?: number;
+  /** Consumer profile requested through the public dataplane. */
+  requestedProfile?: CameraOutputProfile;
+  /** Edge-delivered rendition; the Bridge never invents an upscale. */
+  actualDeliveryProfile?: CameraOutputProfile;
+  /** Physical capture profile last measured by the Edge. */
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+  /** True when the source could not meet the requested resolution. */
+  resolutionLimitedBySource?: boolean;
+};
+
+/** A physical source profile reported by the camera-owning Edge. */
+export type CameraCaptureProfile = {
+  width: number;
+  height: number;
+  fps: number;
+  fourcc?: string;
+};
+
+/** One consumer's delivered rendition. */
+export type CameraOutputProfile = {
+  width: number;
+  height: number;
+  quality?: number;
+  fps?: number;
+};
+
+export type CameraFrameOptions = {
+  width?: number;
+  height?: number;
+  quality?: number;
+  consistency?: "latest";
+  /** Reject a lower-resolution source rather than accepting a limited frame. */
+  requireExactResolution?: boolean;
+};
+
+export const DEFAULT_CAMERA_FRAME_OPTIONS: Required<CameraFrameOptions> = {
+  width: 1280,
+  height: 720,
+  quality: 90,
+  consistency: "latest",
+  requireExactResolution: false,
+};
+
+export type CameraCapabilities = {
+  camera: string;
+  capabilities: {
+    captureProfiles: CameraCaptureProfile[];
+    output: {
+      maxWidth: number;
+      maxHeight: number;
+      qualityRange: readonly [number, number];
+      maxFps: number;
+    };
+  };
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+};
+
+export type CameraCaptureOptions = {
+  width: number;
+  height: number;
+  fps: number;
+  fourcc?: string;
+};
+
+export type CameraCaptureReceipt = {
+  requestId: string;
+  ok: boolean;
+  camera: string;
+  requestedProfile: CameraCaptureProfile;
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+  appliedAtMs?: number;
 };
 
 export type DroidCamera = Record<string, unknown> & {
@@ -511,6 +585,49 @@ function cleanUrl(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
+function requiredCameraName(camera: string): string {
+  const value = camera.trim();
+  if (!value) throw new Error("camera name is required");
+  return value;
+}
+
+function boundedCameraInteger(value: number, name: string, maximum: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > maximum) throw new RangeError(`camera ${name} is out of range`);
+  return value;
+}
+
+function validateCameraCaptureProfile(options: CameraCaptureOptions): CameraCaptureOptions {
+  const fourcc = options.fourcc?.trim();
+  if (fourcc !== undefined && (!/^[A-Za-z0-9]{4}$/.test(fourcc))) throw new RangeError("camera fourcc must be a four-character code");
+  return {
+    width: boundedCameraInteger(options.width, "width", 4096),
+    height: boundedCameraInteger(options.height, "height", 4096),
+    fps: boundedCameraInteger(options.fps, "fps", 30),
+    ...(fourcc ? { fourcc } : {}),
+  };
+}
+
+function createCameraRequestId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (token) => {
+    const value = Math.floor(Math.random() * 16);
+    return (token === "x" ? value : (value & 0x3) | 0x8).toString(16);
+  });
+}
+
+/**
+ * Bridge originally named its delivered rendition `outputProfile`.  Keep that
+ * wire-compatible alias at the boundary while exposing one public field.  The
+ * alias describes an Edge-produced rendition; this does not infer dimensions
+ * or turn a source profile into a delivery profile.
+ */
+function normalizeCameraFrame(frame: CameraFrame & { outputProfile?: CameraOutputProfile }): CameraFrame {
+  if (frame.actualDeliveryProfile || !frame.outputProfile) return frame;
+  const { outputProfile, ...publicFrame } = frame;
+  return { ...publicFrame, actualDeliveryProfile: outputProfile };
+}
+
 function parseJsonRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -631,8 +748,10 @@ export class Droid {
   };
   readonly camera: {
     list: () => Promise<DroidCamera[]>;
-    getFrame: (camera: string) => Promise<CameraFrame>;
+    getFrame: (camera: string, options?: CameraFrameOptions) => Promise<CameraFrame>;
     observeFrames: (camera: string, options?: CameraObservationOptions) => AsyncGenerator<LiveCameraFrame>;
+    getCapabilities: (camera: string) => Promise<CameraCapabilities>;
+    configureCapture: (camera: string, options: CameraCaptureOptions) => Promise<CameraCaptureReceipt>;
     getCalibration: (camera: string) => Promise<CameraCalibration | null>;
     openSession: (camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }) => Promise<CameraMediaSession>;
     closeSession: (sessionId: string) => Promise<void>;
@@ -714,8 +833,10 @@ export class Droid {
     };
     this.camera = {
       list: () => this.get<DroidCamera[]>("/v1/droids/cameras"),
-      getFrame: (camera) => this.get<CameraFrame>("/v1/droids/cameras/frame", { camera }),
+      getFrame: (camera, options = {}) => this.getCameraFrame(camera, options),
       observeFrames: (camera, request = {}) => observeCameraFrames({ endpoint: this.baseUrl(), apiKey: this.options.apiKey, ref: publicDroidRef(this.ref), camera, ...request }),
+      getCapabilities: (camera) => this.getCameraCapabilities(camera),
+      configureCapture: (camera, options) => this.configureCameraCapture(camera, options),
       getCalibration: (camera) => this.getCameraCalibration(camera),
       openSession: (camera, request = {}) => this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
@@ -830,6 +951,43 @@ export class Droid {
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),
     };
+  }
+
+  private cameraFrameOptions(options: CameraFrameOptions): Required<CameraFrameOptions> {
+    const resolved = { ...DEFAULT_CAMERA_FRAME_OPTIONS, ...options };
+    for (const [name, value] of [["width", resolved.width], ["height", resolved.height], ["quality", resolved.quality]] as const) {
+      if (!Number.isInteger(value) || value < 1 || (name === "quality" ? value > 100 : value > 4096)) {
+        throw new RangeError(`camera frame ${name} is out of range`);
+      }
+    }
+    if (resolved.consistency !== "latest") throw new RangeError("camera frame consistency must be latest");
+    if (typeof resolved.requireExactResolution !== "boolean") throw new TypeError("camera frame requireExactResolution must be boolean");
+    return resolved;
+  }
+
+  private async getCameraFrame(camera: string, options: CameraFrameOptions): Promise<CameraFrame> {
+    const resolved = this.cameraFrameOptions(options);
+    const frame = await this.get<CameraFrame & { outputProfile?: CameraOutputProfile }>("/v1/droids/cameras/frame", {
+      camera: requiredCameraName(camera),
+      width: String(resolved.width),
+      height: String(resolved.height),
+      quality: String(resolved.quality),
+      consistency: resolved.consistency,
+      ...(resolved.requireExactResolution ? { require_exact_resolution: "true" } : {}),
+    });
+    return normalizeCameraFrame(frame);
+  }
+
+  private async getCameraCapabilities(camera: string): Promise<CameraCapabilities> {
+    return this.get<CameraCapabilities>("/v1/droids/cameras/capabilities", { camera: requiredCameraName(camera) });
+  }
+
+  private async configureCameraCapture(camera: string, options: CameraCaptureOptions): Promise<CameraCaptureReceipt> {
+    const profile = validateCameraCaptureProfile(options);
+    return this.post<CameraCaptureReceipt>(
+      `/v1/droids/cameras/capture?camera=${encodeURIComponent(requiredCameraName(camera))}`,
+      { requestId: createCameraRequestId(), ...profile },
+    );
   }
 
   private async getCameraCalibration(camera: string): Promise<CameraCalibration | null> {
