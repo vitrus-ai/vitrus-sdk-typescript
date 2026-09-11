@@ -1,4 +1,9 @@
-import { createJointTargetsMessage, type ControlJointTarget, type ControlJointTargetsMessage } from "./contracts.js";
+import {
+  createJointTargetsMessage,
+  type ControlJointTarget,
+  type ControlJointTargetsMessage,
+  type ControlModelBinding,
+} from "./contracts.js";
 import {
   EFFECTOR_COMMANDS_SCHEMA,
   createEffectorCommand,
@@ -9,9 +14,19 @@ import {
   type EffectorInstance,
 } from "./effectors.js";
 import { GoldenEdgeClient } from "./golden-edge.js";
+import { DirectMotionJobClient, type LatestUpdateObservation } from "./direct-motion.js";
+import { observeCameraFrames, type CameraObservationOptions, type LiveCameraFrame } from "./camera-live.js";
+import { DeviceModulesClient, type DeviceModuleCatalog, type ModuleConfigureResult } from "./device-modules.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
 
-export type DroidRef = string | { serialNumber?: string; droidId?: string; alias?: string };
+export type DroidRef = string | {
+  serialNumber?: string;
+  /** Canonical public identifier. Serialized as the legacy droid_id wire field. */
+  deviceId?: string;
+  /** @deprecated Use deviceId. */
+  droidId?: string;
+  alias?: string;
+};
 
 export type DroidIdentity = {
   id: string;
@@ -259,8 +274,67 @@ export type CameraFrame = {
   capturedAt: string;
   imageUrl?: string;
   dataBase64?: string;
+  bytes?: Uint8Array;
   width?: number;
   height?: number;
+  /** Consumer profile requested through the public dataplane. */
+  requestedProfile?: CameraOutputProfile;
+  /** Edge-delivered rendition; the Bridge never invents an upscale. */
+  actualDeliveryProfile?: CameraOutputProfile;
+  /** Physical capture profile last measured by the camera-owning Edge. */
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+  /** True when the source could not meet the requested resolution. */
+  resolutionLimitedBySource?: boolean;
+};
+
+/** A physical source profile reported by the camera-owning Edge. */
+export type CameraCaptureProfile = { width: number; height: number; fps: number; fourcc?: string };
+/** One physically supported source format, with its discrete advertised rates. */
+export type CameraCaptureCapability = { width: number; height: number; fourcc?: string; frameIntervalsFps: number[] };
+/** One consumer's requested or delivered rendition. */
+export type CameraOutputProfile = {
+  /** Omitted when the consumer only asks to pace delivery. */
+  width?: number;
+  /** Omitted when the consumer only asks to pace delivery. */
+  height?: number;
+  quality?: number;
+  /** Legacy Bridge spelling for a measured delivery rate. */
+  fps?: number;
+  /** Requested or selected maximum delivery rate. */
+  maxFps?: number;
+};
+export type CameraFrameOptions = {
+  width?: number;
+  height?: number;
+  quality?: number;
+  consistency?: "latest";
+  /** Reject a lower-resolution source rather than accepting a limited frame. */
+  requireExactResolution?: boolean;
+};
+export const DEFAULT_CAMERA_FRAME_OPTIONS: Required<CameraFrameOptions> = { width: 1280, height: 720, quality: 90, consistency: "latest", requireExactResolution: false };
+
+/** Capabilities the Edge reported for one camera; no values are inferred locally. */
+export type CameraCapabilities = {
+  camera: string;
+  capabilities: {
+    captureProfiles: CameraCaptureCapability[];
+    output: { maxWidth: number; maxHeight: number; qualityRange: readonly [number, number]; maxFps: number };
+  };
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+};
+
+/** A camera-only request to change the shared physical source profile. */
+export type CameraCaptureOptions = CameraCaptureProfile;
+export type CameraCaptureReceipt = {
+  requestId: string;
+  ok: boolean;
+  camera: string;
+  requestedProfile: CameraCaptureProfile;
+  actualSourceProfile?: CameraCaptureProfile;
+  sourceProfileEpoch?: string | number;
+  appliedAtMs?: number;
 };
 
 export type DroidCamera = Record<string, unknown> & {
@@ -324,12 +398,44 @@ export type CameraMediaSession = {
   requiresAuthorization?: boolean;
 };
 
+export type CameraStreamProfile = "realtime" | "high-definition";
+export type CameraStreamOptions = { profile?: CameraStreamProfile; width?: number; height?: number; fps?: number; audio?: boolean; preferredTransport?: Exclude<CameraMediaTransport, "snapshot"> | "auto" };
+export type CameraStream = CameraMediaSession & { profile: CameraStreamProfile; negotiate?: (offer: { sdp: string; type: string }) => Promise<{ sdp: string; type: string; camera: string; video?: { width: number; height: number; fps: number } }> };
+
+/** Latest Edge-published device health; it is observational and grants no control authority. */
+export type DroidDeviceStatus = Record<string, unknown> & {
+  schema: "vitrus.device.status.v1";
+  schema_version: string;
+  timestamp: string;
+  /** Optional because the current Edge `vitrus.device.status.v1` producer does not emit a source field. */
+  source?: string;
+  state?: "online" | "offline" | "degraded" | "unknown" | string;
+  connection?: Record<string, unknown>;
+  safety?: Record<string, unknown>;
+  control: {
+    mode?: string;
+    phase?: string;
+    owner?: string | null;
+    lease_id?: string | null;
+    /** Snapshot wire value; for direct control it can be Edge-plan authorization, not ownership lifetime. */
+    lease_expires_at?: string | null;
+    [field: string]: unknown;
+  };
+  robot?: Record<string, unknown>;
+  telemetry?: Record<string, unknown>;
+  components?: Record<string, unknown>;
+  errors?: Array<Record<string, unknown>>;
+  extensions?: Record<string, unknown>;
+};
+
 export type DroidTelemetry = {
   schema: string;
   timestamp: string;
   joints?: Record<string, unknown>;
   cameras?: Array<Record<string, unknown>>;
   motorBridge?: Record<string, unknown>;
+  /** Model revision carried by Edge telemetry when canonical binding is enabled. */
+  deviceModel?: ControlModelBinding;
   raw: Record<string, unknown>;
 };
 
@@ -338,6 +444,25 @@ export type ControlLease = {
   droidId: string;
   owner: string;
   expiresAt: string;
+};
+
+export type DroidControlSessionOptions = {
+  owner?: string;
+  jointNames: string[];
+  /** Pin every session command to the Edge model observed before leasing. */
+  modelBinding?: ControlModelBinding;
+  /** Renewable broker window, not the total session duration. */
+  leaseWindowMs?: number;
+  /** Renew on the next active command when less than this remains. */
+  renewAheadMs?: number;
+};
+
+export type DroidControlSession = {
+  readonly lease: ControlLease;
+  readonly closed: boolean;
+  sendTargets(targets: JointTarget[], options?: Omit<DroidTargetOptions, "leaseId">): Promise<DroidCommandResult>;
+  primeAndWaitReady(targets: JointTarget[], options?: Omit<DroidPrimeAndWaitReadyOptions, "leaseId">): Promise<DroidMotionReady>;
+  release(): Promise<void>;
 };
 
 export type DroidRealtimeState = "connecting" | "connected" | "reconnecting" | "closed" | "error";
@@ -355,6 +480,9 @@ export type DroidRealtimeSubscription = {
 
 export type JointTarget = {
   jointName: string;
+  /** Model-space angle (effective URDF coordinate) for canonical control. */
+  positionModelRad?: number;
+  /** @deprecated Use positionModelRad. This remains the model-space angle in degrees. */
   displayDeg: number;
   durationS?: number;
   maxVelocityDegS?: number;
@@ -365,6 +493,8 @@ export type JointTarget = {
 
 export type DroidTargetOptions = {
   leaseId: string;
+  /** Exact device model used to derive the target. Required when Edge enables binding enforcement. */
+  modelBinding?: ControlModelBinding;
   /** End-to-end command lifetime; this is not the HTTP request timeout. */
   ttlMs?: number;
   /**
@@ -417,6 +547,9 @@ export type DroidConnectionOptions = {
   relayUrl?: string;
   endpoint?: string;
   edgeEndpoint?: string;
+  edgeCameraEndpoint?: string;
+  /** Explicit Edge configuration-service origin for auxiliary module discovery and settings. */
+  edgeModuleEndpoint?: string;
   /** Full URL for an Edge-local telemetry snapshot compatible with DroidTelemetry. */
   edgeTelemetryUrl?: string;
   /** Lease lifecycle route. Edge keeps acquire/renew/release robot-local. */
@@ -429,6 +562,12 @@ export type DroidConnectionOptions = {
   controlPlaneTimeoutMs?: number;
   /** Timeout for local Edge admission of one motion frame. */
   motionAdmissionTimeoutMs?: number;
+  /** Opt into the public latest-only Device-IK mailbox after Bridge rollout. */
+  directLatestOnlyUpdates?: boolean;
+  /** Public latest-only target receipt/failure observation. */
+  directOnLatestUpdate?: (observation: LatestUpdateObservation) => void;
+  /** Optional bounded public latest requests; defaults to one for compatibility. */
+  directLatestMaxInFlight?: number;
   /** @deprecated Use controlPlaneTimeoutMs. */
   timeoutMs?: number;
   clientId?: string;
@@ -449,9 +588,94 @@ export class DroidRequestTimeoutError extends Error {
 }
 
 const DEFAULT_ZENOH_WS_ENDPOINT = "ws://127.0.0.1:7448";
+/** A temporary public registry outage must not prevent a read-only client bootstrap. */
+const REGISTRY_DISCOVERY_ATTEMPTS = 3;
+const REGISTRY_RETRY_BASE_MS = 25;
+
+function isRetryableRegistryStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 504);
+}
+
+function registryRetryDelayMs(attempt: number, response: Response): number {
+  const retryAfter = response.headers.get("retry-after")?.trim();
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  }
+  // Keep the recovery short and desynchronize simultaneous reconnecting viewers.
+  return REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
+}
+
+async function parseRegistryBody(response: Response, signal: AbortSignal): Promise<unknown> {
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException("aborted", "AbortError"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    // A mocked or non-conforming fetch may resolve headers without wiring its
+    // body reader to the request signal. Race it explicitly so bootstrap has
+    // the same total deadline in browsers, Bun, and tests.
+    return await Promise.race([response.json(), aborted]);
+  } catch (error) {
+    if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+    return null;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function registryDeadlineError(operation: string, url: string, timeoutMs: number): DroidRequestTimeoutError {
+  return new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs);
+}
+
+function pauseRegistryRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
 
 function cleanUrl(url: string): string {
   return url.replace(/\/+$/, "");
+}
+
+function requiredCameraName(camera: string): string {
+  const value = camera.trim();
+  if (!value) throw new Error("camera name is required");
+  return value;
+}
+
+function boundedCameraInteger(value: number, name: string, maximum: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > maximum) throw new RangeError(`camera ${name} is out of range`);
+  return value;
+}
+
+function validateCameraCaptureProfile(options: CameraCaptureOptions): CameraCaptureOptions {
+  const fourcc = options.fourcc?.trim();
+  if (fourcc !== undefined && !/^[A-Za-z0-9]{4}$/.test(fourcc)) throw new RangeError("camera fourcc must be a four-character code");
+  return {
+    width: boundedCameraInteger(options.width, "width", 4096),
+    height: boundedCameraInteger(options.height, "height", 4096),
+    fps: boundedCameraInteger(options.fps, "fps", 30),
+    ...(fourcc ? { fourcc } : {}),
+  };
+}
+
+function createCameraRequestId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (token) => {
+    const value = Math.floor(Math.random() * 16);
+    return (token === "x" ? value : (value & 0x3) | 0x8).toString(16);
+  });
+}
+
+/** Map Bridge's transitional outputProfile wire alias without inventing data. */
+function normalizeCameraFrame(frame: CameraFrame & { outputProfile?: CameraOutputProfile }): CameraFrame {
+  if (frame.actualDeliveryProfile || !frame.outputProfile) return frame;
+  const { outputProfile, ...publicFrame } = frame;
+  return { ...publicFrame, actualDeliveryProfile: outputProfile };
 }
 
 function parseJsonRecord(value: unknown): Record<string, unknown> {
@@ -532,17 +756,24 @@ export function normalizeDroidTelemetry(value: unknown): DroidTelemetry {
     joints,
     cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
     motorBridge,
+    ...(raw.device_model && typeof raw.device_model === "object" ? { deviceModel: raw.device_model as ControlModelBinding } : {}),
     raw,
   };
 }
 
-/** Validate the lease window accepted by the VitrusOS embodiment relay. */
+/** Normalize the internal broker window; callers control a session, not timers. */
 export function validateDroidLeaseDurationMs(value: number | undefined): number | undefined {
   if (value == null) return undefined;
-  if (!Number.isInteger(value) || value < 1_000 || value > 30_000) {
-    throw new RangeError("Vitrus control lease durationMs must be an integer in [1000, 30000]");
-  }
-  return value;
+  if (!Number.isFinite(value)) return undefined;
+  return Math.max(1_000, Math.min(30_000, Math.round(value)));
+}
+
+/** The public direct-control route accepts one device reference, never an Edge URL. */
+function publicDroidRef(ref: DroidRef): string {
+  if (typeof ref === "string") return ref.trim();
+  const candidate = ref.serialNumber ?? ref.alias ?? ref.deviceId ?? ref.droidId;
+  if (!candidate?.trim()) throw new Error("Droid direct motion requires a serial, alias, or device id reference");
+  return candidate.trim();
 }
 
 export class Droid {
@@ -554,6 +785,8 @@ export class Droid {
 
   readonly identity: { get: () => Promise<DroidIdentity> };
   readonly description: { get: () => Promise<DroidDescription> };
+  /** Read-only latest device status. A returned control section is observational, never write permission. */
+  readonly status: { snapshot: () => Promise<DroidDeviceStatus> };
   readonly presets: {
     list: () => Promise<DroidPresetInstance[]>;
     instances: () => Promise<DroidPresetInstance[]>;
@@ -574,11 +807,16 @@ export class Droid {
   };
   readonly camera: {
     list: () => Promise<DroidCamera[]>;
-    getFrame: (camera: string) => Promise<CameraFrame>;
+    getFrame: (camera: string, options?: CameraFrameOptions) => Promise<CameraFrame>;
+    observeFrames: (camera: string, options?: CameraObservationOptions) => AsyncGenerator<LiveCameraFrame>;
+    getCapabilities: (camera: string) => Promise<CameraCapabilities>;
+    configureCapture: (camera: string, options: CameraCaptureOptions) => Promise<CameraCaptureReceipt>;
     getCalibration: (camera: string) => Promise<CameraCalibration | null>;
+    openStream: (camera: string, options?: CameraStreamOptions) => Promise<CameraStream>;
     openSession: (camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }) => Promise<CameraMediaSession>;
     closeSession: (sessionId: string) => Promise<void>;
   };
+  readonly modules: { list: () => Promise<DeviceModuleCatalog>; configure: (id: string, settings: Record<string, unknown>) => Promise<ModuleConfigureResult> };
   readonly telemetry: {
     snapshot: () => Promise<DroidTelemetry>;
     subscribe: (listener: (telemetry: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }) => Promise<DroidRealtimeSubscription>;
@@ -590,10 +828,14 @@ export class Droid {
     acquire: (options?: { durationMs?: number; owner?: string; jointNames?: string[] }) => Promise<ControlLease>;
     renew: (leaseId: string, options?: { durationMs?: number }) => Promise<ControlLease>;
     release: (leaseId: string) => Promise<void>;
+    openSession: (options: DroidControlSessionOptions) => Promise<DroidControlSession>;
+    withSession: <T>(options: DroidControlSessionOptions, run: (session: DroidControlSession) => Promise<T>) => Promise<T>;
   };
   readonly motion: {
     sendTargets: (targets: JointTarget[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
     primeAndWaitReady: (targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions) => Promise<DroidMotionReady>;
+    /** Native device-IK lifecycle through the authenticated public dataplane. */
+    direct: DirectMotionJobClient;
   };
   readonly safety: { emergencyStop: (reason?: string) => Promise<DroidCommandResult> };
 
@@ -613,11 +855,12 @@ export class Droid {
     this.clientId = options.clientId?.trim() || `vitrus-sdk-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
     this.identity = { get: async () => {
       if (this.identityCache) return this.identityCache;
-      const identity = await this.get<DroidIdentity>("/v1/droids/resolve");
+      const identity = await this.resolveIdentity();
       this.identityCache = identity;
       return identity;
     } };
     this.description = { get: () => this.get<DroidDescription>("/v1/droids/description") };
+    this.status = { snapshot: () => this.get<DroidDeviceStatus>("/v1/droids/status") };
     this.presets = {
       list: async () => presetInstancesFromDescription(await this.description.get()),
       instances: async () => presetInstancesFromDescription(await this.description.get()),
@@ -653,11 +896,31 @@ export class Droid {
       }),
     };
     this.camera = {
-      list: () => this.get<DroidCamera[]>("/v1/droids/cameras"),
-      getFrame: (camera) => this.get<CameraFrame>("/v1/droids/cameras/frame", { camera }),
+      list: () => this.edgeCameraUrl() ? this.edgeCameraList() : this.get<DroidCamera[]>("/v1/droids/cameras"),
+      getFrame: (camera, request = {}) => this.getCameraFrame(camera, request),
+      observeFrames: (camera, request = {}) => observeCameraFrames({ endpoint: this.baseUrl(), apiKey: this.options.apiKey, ref: this.ref, camera, ...request }),
+      getCapabilities: (camera) => this.getCameraCapabilities(camera),
+      configureCapture: (camera, options) => this.configureCameraCapture(camera, options),
       getCalibration: (camera) => this.getCameraCalibration(camera),
-      openSession: (camera, request = {}) => this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
+      openStream: (camera, request = {}) => this.openCameraStream(camera, request),
+      openSession: (camera, request = {}) => request.preferredTransport === "snapshot"
+        ? this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: "snapshot" })
+        : this.openCameraStream(camera, { preferredTransport: request.preferredTransport }),
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
+    };
+    // Modules are served by the Edge configuration service, not the motion
+    // gateway and not the public dataplane. Require an explicit endpoint so
+    // a read cannot be misrouted to a control port.
+    const moduleEndpoint = options.edgeModuleEndpoint?.trim();
+    this.modules = {
+      list: async () => {
+        if (!moduleEndpoint) throw new Error("Droid modules require edgeModuleEndpoint (the Edge configuration-service origin)");
+        return new DeviceModulesClient({ endpoint: moduleEndpoint, requestTimeoutMs: options.controlPlaneTimeoutMs ?? options.timeoutMs }).list();
+      },
+      configure: async (id, settings) => {
+        if (!moduleEndpoint) throw new Error("Droid modules require edgeModuleEndpoint (the Edge configuration-service origin)");
+        return new DeviceModulesClient({ endpoint: moduleEndpoint, requestTimeoutMs: options.controlPlaneTimeoutMs ?? options.timeoutMs }).configure(id, settings);
+      },
     };
     this.telemetry = {
       snapshot: async () => normalizeDroidTelemetry(
@@ -721,11 +984,7 @@ export class Droid {
           if (!this.edgeClient || leaseId !== this.edgeLeaseId || !this.edgeControlOwner || !this.edgeControlJointNames.length) {
             throw new Error("Cannot renew a non-active Edge lease");
           }
-          await this.edgeClient.acquire(leaseId, {
-            owner: this.edgeControlOwner,
-            durationMs,
-            jointNames: this.edgeControlJointNames,
-          });
+          await this.edgeClient.renew(leaseId, durationMs);
           return {
             id: leaseId,
             droidId: (await this.identity.get()).id,
@@ -755,14 +1014,69 @@ export class Droid {
         this.edgeControlJointNames = [];
         if (edgeError) throw edgeError;
       },
+      openSession: (request) => this.openControlSession(request),
+      withSession: async (request, run) => {
+        const session = await this.openControlSession(request);
+        try { return await run(session); }
+        finally { await session.release(); }
+      },
     };
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
       primeAndWaitReady: (targets, request) => this.primeAndWaitReady(targets, request),
+      direct: new DirectMotionJobClient({
+        endpoint: this.baseUrl(),
+        apiKey: this.options.apiKey,
+        ref: publicDroidRef(this.ref),
+        requestTimeoutMs: this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs,
+        latestOnlyUpdates: this.options.directLatestOnlyUpdates,
+        onLatestUpdate: this.options.directOnLatestUpdate,
+        latestMaxInFlight: this.options.directLatestMaxInFlight,
+      }),
     };
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),
     };
+  }
+
+  private async openControlSession(options: DroidControlSessionOptions): Promise<DroidControlSession> {
+    if (!Array.isArray(options.jointNames) || !options.jointNames.length || new Set(options.jointNames).size !== options.jointNames.length) {
+      throw new Error("Droid control session requires a unique non-empty joint scope");
+    }
+    const leaseWindowMs = validateDroidLeaseDurationMs(options.leaseWindowMs ?? 10_000)!;
+    const requestedRenewAheadMs = Number(options.renewAheadMs ?? Math.min(3_000, Math.floor(leaseWindowMs * .4)));
+    const renewAheadMs = Math.max(1, Math.min(leaseWindowMs - 1, Number.isFinite(requestedRenewAheadMs) ? Math.round(requestedRenewAheadMs) : 1_000));
+    let lease = await this.control.acquire({ durationMs: leaseWindowMs, owner: options.owner, jointNames: options.jointNames });
+    let closed = false, renewal: Promise<void> | null = null;
+    const requireOpen = () => { if (closed) throw new Error("Droid control session is closed"); };
+    const ensureFresh = async () => {
+      requireOpen();
+      if (Date.parse(lease.expiresAt) - Date.now() > renewAheadMs) return;
+      renewal ??= this.control.renew(lease.id, { durationMs: leaseWindowMs }).then(next => { lease = next; }).finally(() => { renewal = null; });
+      await renewal;
+      // release() closes first and then waits for an in-flight renewal.  Check
+      // again so a command waiting on that renewal can never race past a stop.
+      requireOpen();
+    };
+    const session: DroidControlSession = {
+      get lease() { return lease; },
+      get closed() { return closed; },
+      sendTargets: async (targets, request = {}) => {
+        await ensureFresh();
+        return this.motion.sendTargets(targets, { ...request, modelBinding: request.modelBinding ?? options.modelBinding, leaseId: lease.id });
+      },
+      primeAndWaitReady: async (targets, request = {}) => {
+        await ensureFresh();
+        return this.motion.primeAndWaitReady(targets, { ...request, modelBinding: request.modelBinding ?? options.modelBinding, leaseId: lease.id });
+      },
+      release: async () => {
+        if (closed) return;
+        closed = true;
+        await renewal?.catch(() => undefined);
+        await this.control.release(lease.id);
+      },
+    };
+    return session;
   }
 
   private async getCameraCalibration(camera: string): Promise<CameraCalibration | null> {
@@ -866,7 +1180,11 @@ export class Droid {
     let semanticEffectors: EffectorCommandEnvelope | undefined;
     const controlTargets: ControlJointTarget[] = targets.map((target) => ({
       joint_name: target.jointName,
-      position_deg: target.displayDeg,
+      ...(target.positionModelRad == null ? {
+        position_deg: target.displayDeg,
+      } : {
+        position_rad: target.positionModelRad,
+      }),
       ...(target.maxVelocityDegS == null ? {} : {
         // Keep the canonical field for older consumers and also name the
         // Edge positional-track limit explicitly. VitrusOS owns the actual
@@ -915,6 +1233,7 @@ export class Droid {
       sequence: ++this.sequence,
       ttlMs: request.ttlMs ?? request.timeoutMs,
       edgeKeepaliveMs: request.edgeKeepaliveMs,
+      modelBinding: request.modelBinding,
       semanticEffectors,
       targets: controlTargets,
     });
@@ -1078,6 +1397,83 @@ export class Droid {
     );
   }
 
+  /**
+   * Resolve the public registry identity with a small, deadline-bounded retry
+   * budget. This is deliberately narrower than `get()`: no command, lease,
+   * camera, feedback, or arbitrary GET request is retried by this helper.
+   */
+  private async resolveIdentity(): Promise<DroidIdentity> {
+    const url = new URL(`${this.baseUrl()}/v1/droids/resolve`);
+    this.appendRef(url.searchParams);
+    const response = await this.fetchRegistryIdentity(url.toString(), "GET /v1/droids/resolve");
+    if (!response.ok) {
+      const detail = parseJsonRecord(response.payload).detail;
+      throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
+    }
+    if (!response.payload || typeof response.payload !== "object" || Array.isArray(response.payload)) {
+      throw new Error("Vitrus Droid registry returned an invalid identity response");
+    }
+    return response.payload as DroidIdentity;
+  }
+
+  private async fetchRegistryIdentity(
+    url: string,
+    operation: string,
+  ): Promise<{ ok: boolean; status: number; statusText: string; payload: unknown }> {
+    const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
+    const deadlineMs = Date.now() + timeoutMs;
+    for (let attempt = 0; attempt < REGISTRY_DISCOVERY_ATTEMPTS; attempt += 1) {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) throw registryDeadlineError(operation, url, timeoutMs);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), remainingMs);
+      let response: Response;
+      try {
+        // This is the only operation whose failure enters the transport retry
+        // path: once headers exist, status and body handling are definitive.
+        response = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers: { authorization: `Bearer ${this.options.apiKey}` },
+        });
+      } catch (error) {
+        clearTimeout(timeout);
+        if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+          throw registryDeadlineError(operation, url, timeoutMs);
+        }
+        if (attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) throw error;
+        const delayMs = REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
+        if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
+        await pauseRegistryRetry(delayMs);
+        continue;
+      }
+
+      try {
+        if (!isRetryableRegistryStatus(response.status) || attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) {
+          let payload: unknown;
+          try {
+            payload = await parseRegistryBody(response, controller.signal);
+          } catch (error) {
+            if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+              throw registryDeadlineError(operation, url, timeoutMs);
+            }
+            throw error;
+          }
+          return { ok: response.ok, status: response.status, statusText: response.statusText, payload };
+        }
+        // The response will not be exposed to a caller, so release its body
+        // before waiting. A retry never creates a history buffer in the SDK.
+        void response.body?.cancel().catch(() => undefined);
+        const delayMs = registryRetryDelayMs(attempt, response);
+        if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
+        await pauseRegistryRetry(delayMs);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw registryDeadlineError(operation, url, timeoutMs);
+  }
+
   private async get<T>(path: string, params: Record<string, string> = {}): Promise<T> {
     const url = new URL(`${this.baseUrl()}${path}`);
     this.appendRef(url.searchParams);
@@ -1121,8 +1517,60 @@ export class Droid {
       return;
     }
     if (this.ref.serialNumber) params.set("serial_number", this.ref.serialNumber);
-    if (this.ref.droidId) params.set("droid_id", this.ref.droidId);
+    if (this.ref.deviceId ?? this.ref.droidId) params.set("droid_id", this.ref.deviceId ?? this.ref.droidId ?? "");
     if (this.ref.alias) params.set("alias", this.ref.alias);
+  }
+
+  private edgeCameraUrl(): string | null { const endpoint = this.options.edgeCameraEndpoint ?? this.options.edgeEndpoint; return endpoint?.trim() ? cleanUrl(endpoint) : null; }
+  private async edgeCameraList(): Promise<DroidCamera[]> {
+    const endpoint = this.edgeCameraUrl();
+    if (!endpoint) throw new Error("Vitrus Edge camera endpoint is not configured");
+    const payload = await this.request<{ cameras?: unknown }>(`${endpoint}/api/dora/cameras`, { method: "GET" }, "GET Edge cameras");
+    return Array.isArray(payload.cameras) ? payload.cameras as DroidCamera[] : [];
+  }
+  private cameraFrameOptions(options: CameraFrameOptions): Required<CameraFrameOptions> {
+    const resolved = { ...DEFAULT_CAMERA_FRAME_OPTIONS, ...options };
+    for (const [name, value] of [["width", resolved.width], ["height", resolved.height], ["quality", resolved.quality]] as const) if (!Number.isInteger(value) || value < 1 || (name !== "quality" && value > 4096) || (name === "quality" && value > 100)) throw new RangeError(`camera frame ${name} is out of range`);
+    if (resolved.consistency !== "latest") throw new RangeError("camera frame consistency must be latest");
+    if (typeof resolved.requireExactResolution !== "boolean") throw new TypeError("camera frame requireExactResolution must be boolean");
+    return resolved;
+  }
+  private async getCameraFrame(camera: string, options: CameraFrameOptions): Promise<CameraFrame> {
+    const resolved = this.cameraFrameOptions(options), endpoint = this.edgeCameraUrl();
+    if (!endpoint) {
+      const frame = await this.get<CameraFrame & { outputProfile?: CameraOutputProfile }>("/v1/droids/cameras/frame", {
+        camera: requiredCameraName(camera),
+        width: String(resolved.width),
+        height: String(resolved.height),
+        quality: String(resolved.quality),
+        consistency: resolved.consistency,
+        ...(resolved.requireExactResolution ? { require_exact_resolution: "true" } : {}),
+      });
+      return normalizeCameraFrame(frame);
+    }
+    const url = new URL(`${endpoint}/api/dora/cameras/frame`); url.searchParams.set("camera", camera); for (const [key, value] of Object.entries(resolved)) url.searchParams.set(key, String(value));
+    const response = await this.requestBinary(url.toString(), { method: "GET", headers: { accept: "image/jpeg" } }, "GET Edge camera frame"), capturedAt = response.headers.get("x-vitrus-captured-at") || new Date().toISOString();
+    return { camera, frameId: response.headers.get("x-vitrus-frame-id") || `${camera}:${capturedAt}`, mimeType: response.headers.get("content-type") || "image/jpeg", capturedAt, bytes: new Uint8Array(await response.arrayBuffer()), width: resolved.width, height: resolved.height };
+  }
+  private async getCameraCapabilities(camera: string): Promise<CameraCapabilities> {
+    return this.get<CameraCapabilities>("/v1/droids/cameras/capabilities", { camera: requiredCameraName(camera) });
+  }
+  private async configureCameraCapture(camera: string, options: CameraCaptureOptions): Promise<CameraCaptureReceipt> {
+    const profile = validateCameraCaptureProfile(options);
+    const url = new URL(`${this.baseUrl()}/v1/droids/cameras/capture`);
+    this.appendRef(url.searchParams);
+    url.searchParams.set("camera", requiredCameraName(camera));
+    return this.request<CameraCaptureReceipt>(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: createCameraRequestId(), ...profile }),
+    }, "POST /v1/droids/cameras/capture");
+  }
+  private async openCameraStream(camera: string, options: CameraStreamOptions): Promise<CameraStream> {
+    const endpoint = this.edgeCameraUrl(), profile = options.profile ?? "realtime";
+    if (!endpoint) return { ...await this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: options.preferredTransport ?? "webrtc", ...options }), profile };
+    const payload = await this.request<CameraMediaSession & { profile?: CameraStreamProfile }>(`${endpoint}/api/dora/cameras/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile, ...options }) }, "open Edge camera stream");
+    return { ...payload, camera, ...(payload.offerUrl ? { offerUrl: new URL(payload.offerUrl, `${endpoint}/`).toString() } : {}), profile: payload.profile ?? profile, negotiate: (offer) => this.request(`${endpoint}/api/dora/cameras/offer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, profile: payload.profile ?? profile, ...options, ...offer }) }, "negotiate Edge camera stream") };
   }
 
   private async request<T>(url: string, init: RequestInit, operation = "request"): Promise<T> {
@@ -1141,7 +1589,7 @@ export class Droid {
       const payload: unknown = await response.json().catch(() => null);
       if (!response.ok) {
         const detail = parseJsonRecord(payload).detail;
-        throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
+        throw new Error(`Vitrus Device request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
       }
       return payload as T;
     } catch (error) {
@@ -1153,6 +1601,13 @@ export class Droid {
       clearTimeout(timeout);
     }
   }
+
+  private async requestBinary(url: string, init: RequestInit, operation = "request"): Promise<Response> {
+    const controller = new AbortController(), timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000, timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try { const response = await fetch(url, { ...init, signal: controller.signal, headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) } }); if (!response.ok) throw new Error(`Vitrus Device ${operation} failed (${response.status}): ${response.statusText}`); return response; }
+    catch (error) { if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw new DroidRequestTimeoutError(operation, new URL(url).pathname, timeoutMs); throw error; }
+    finally { clearTimeout(timeout); }
+  }
 }
 
 function zenohTransportEndpoint(transports: Record<string, unknown> | undefined): string | undefined {
@@ -1163,3 +1618,39 @@ function zenohTransportEndpoint(transports: Record<string, unknown> | undefined)
   }
   return undefined;
 }
+
+/** Canonical device-first API. Droid remains a compatibility name. */
+export { Droid as Device };
+export { DroidRequestTimeoutError as DeviceRequestTimeoutError };
+export const normalizeDeviceTelemetry = normalizeDroidTelemetry;
+export const validateDeviceLeaseDurationMs = validateDroidLeaseDurationMs;
+
+export type DeviceRef = DroidRef;
+export type DeviceIdentity = DroidIdentity;
+export type DeviceDescription = DroidDescription;
+export type DevicePresetVariable = DroidPresetVariable;
+export type DevicePresetActuatorKind = DroidPresetActuatorKind;
+export type DevicePresetCommandMode = DroidPresetCommandMode;
+export type DevicePresetFeedbackField = DroidPresetFeedbackField;
+export type DevicePresetActuatorSlot = DroidPresetActuatorSlot;
+export type DevicePresetOutput = DroidPresetOutput;
+export type DevicePresetDefinition = DroidPresetDefinition;
+export type DevicePresetInstance = DroidPresetInstance;
+export type DevicePresetRun = DroidPresetRun;
+export type DevicePresetState = DroidPresetState;
+export type DevicePresetStartOptions = DroidPresetStartOptions;
+export type DevicePresetInputOptions = DroidPresetInputOptions;
+export type DeviceCamera = DroidCamera;
+export type DeviceTelemetry = DroidTelemetry;
+export type DeviceStatus = DroidDeviceStatus;
+export type DeviceControlSessionOptions = DroidControlSessionOptions;
+export type DeviceControlSession = DroidControlSession;
+export type DeviceRealtimeState = DroidRealtimeState;
+export type DeviceRealtimeEvent = DroidRealtimeEvent;
+export type DeviceRealtimeSubscription = DroidRealtimeSubscription;
+export type DeviceTargetOptions = DroidTargetOptions;
+export type DeviceEffectorCommandOptions = DroidEffectorCommandOptions;
+export type DevicePrimeAndWaitReadyOptions = DroidPrimeAndWaitReadyOptions;
+export type DeviceMotionReady = DroidMotionReady;
+export type DeviceCommandResult = DroidCommandResult;
+export type DeviceConnectionOptions = DroidConnectionOptions;

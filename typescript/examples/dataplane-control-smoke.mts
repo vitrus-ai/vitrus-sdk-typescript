@@ -1,4 +1,4 @@
-import { Droid, type DroidTelemetry, type JointTarget } from "../src/droid-live.ts";
+import { Device, type DeviceTelemetry, type JointTarget } from "../src/droid-live.ts";
 
 const endpoint = process.env.VITRUS_DATAPLANE_URL?.trim()
   || "https://vitrus-dataplane.onrender.com";
@@ -21,17 +21,17 @@ if (hil && requestedJoints.length === 0) {
   throw new Error("HIL requires an explicit VITRUS_SMOKE_JOINTS allowlist");
 }
 
-const droid = await Droid.connect(droidRef, {
+const device = await Device.connect(droidRef, {
   apiKey,
   endpoint,
   clientId: `sdk-dataplane-smoke-${Date.now()}`,
 });
 
-function bridge(telemetry: DroidTelemetry): Record<string, unknown> {
+function bridge(telemetry: DeviceTelemetry): Record<string, unknown> {
   return telemetry.motorBridge ?? {};
 }
 
-function summary(telemetry: DroidTelemetry): Record<string, unknown> {
+function summary(telemetry: DeviceTelemetry): Record<string, unknown> {
   const status = bridge(telemetry);
   const motors = Array.isArray(status.motors) ? status.motors : [];
   return {
@@ -58,7 +58,7 @@ function summary(telemetry: DroidTelemetry): Record<string, unknown> {
 }
 
 function requireHealthyReadOnly(
-  telemetry: DroidTelemetry,
+  telemetry: DeviceTelemetry,
   source: string,
   requiredJoints: string[] = [],
 ): void {
@@ -109,7 +109,7 @@ function requireHealthyReadOnly(
   }
 }
 
-async function realtimeSample(timeoutMs = 10_000): Promise<DroidTelemetry> {
+async function realtimeSample(timeoutMs = 10_000): Promise<DeviceTelemetry> {
   let subscription: { close(): void } | null = null;
   let settled = false;
   return new Promise((resolve, reject) => {
@@ -118,7 +118,7 @@ async function realtimeSample(timeoutMs = 10_000): Promise<DroidTelemetry> {
       subscription?.close();
       reject(new Error(`no authenticated Dataplane WebSocket telemetry within ${timeoutMs} ms`));
     }, timeoutMs);
-    void droid.telemetry.subscribe((telemetry) => {
+    void device.telemetry.subscribe((telemetry) => {
       settled = true;
       clearTimeout(timer);
       subscription?.close();
@@ -142,7 +142,7 @@ async function realtimeSample(timeoutMs = 10_000): Promise<DroidTelemetry> {
   });
 }
 
-function measuredHold(telemetry: DroidTelemetry): JointTarget[] {
+function measuredHold(telemetry: DeviceTelemetry): JointTarget[] {
   const status = bridge(telemetry);
   const motors = Array.isArray(status.motors)
     ? status.motors.filter((value): value is Record<string, unknown> =>
@@ -174,14 +174,14 @@ function measuredHold(telemetry: DroidTelemetry): JointTarget[] {
   });
 }
 
-async function waitReleased(timeoutMs = 10_000): Promise<DroidTelemetry> {
+async function waitReleased(timeoutMs = 10_000): Promise<DeviceTelemetry> {
   const startedAt = Date.now();
-  let last = await droid.telemetry.snapshot();
+  let last = await device.telemetry.snapshot();
   while (Date.now() - startedAt < timeoutMs) {
     const status = bridge(last);
     if (status.access_mode === "read_only" && !status.exclusive_lease_id) return last;
     await Bun.sleep(100);
-    last = await droid.telemetry.snapshot();
+    last = await device.telemetry.snapshot();
   }
   const status = bridge(last);
   throw new Error(
@@ -190,7 +190,7 @@ async function waitReleased(timeoutMs = 10_000): Promise<DroidTelemetry> {
   );
 }
 
-const initial = await droid.telemetry.snapshot();
+const initial = await device.telemetry.snapshot();
 requireHealthyReadOnly(initial, "HTTP snapshot", requestedJoints);
 const realtime = await realtimeSample();
 requireHealthyReadOnly(realtime, "WebSocket telemetry", requestedJoints);
@@ -206,16 +206,16 @@ if (!hil) {
 }
 
 const hold = measuredHold(initial);
-const lease = await droid.control.acquire({ durationMs: 30_000, owner: "sdk-dataplane-smoke" });
+const lease = await device.control.acquire({ durationMs: 30_000, owner: "sdk-dataplane-smoke" });
 try {
-  const first = await droid.motion.primeAndWaitReady(hold, {
+  const first = await device.motion.primeAndWaitReady(hold, {
     leaseId: lease.id,
     ttlMs: 5_000,
     edgeKeepaliveMs: 1_000,
     readinessTimeoutMs: 15_000,
     pollIntervalMs: 100,
   });
-  const second = await droid.motion.primeAndWaitReady(hold, {
+  const second = await device.motion.primeAndWaitReady(hold, {
     leaseId: lease.id,
     ttlMs: 5_000,
     edgeKeepaliveMs: 1_000,
@@ -241,7 +241,7 @@ try {
     },
   }, null, 2));
 } finally {
-  await droid.control.release(lease.id);
+  await device.control.release(lease.id);
   const released = await waitReleased();
   requireHealthyReadOnly(released, "post-release HTTP snapshot", requestedJoints);
   console.log(JSON.stringify({ released: true, final: summary(released) }, null, 2));

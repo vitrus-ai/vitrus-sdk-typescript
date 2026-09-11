@@ -1,6 +1,9 @@
-import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry, validateDroidLeaseDurationMs } from "./droid.js";
+import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry } from "./droid.js";
 export * from "./droid.js";
-import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { CameraCapabilities, CameraCaptureOptions, CameraCaptureReceipt, CameraFrame, CameraFrameOptions, CameraStream, CameraStreamOptions, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidControlSession, DroidControlSessionOptions, DroidDescription, DroidDeviceStatus, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { DirectMotionJobClient } from "./direct-motion.js";
+import type { CameraObservationOptions, LiveCameraFrame } from "./camera-live.js";
+import type { DeviceModuleCatalog, ModuleConfigureResult } from "./device-modules.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -32,11 +35,11 @@ export class Droid {
     const response = await controlPlaneFetch(`${baseUrl}/v1/droids`, { headers }, options, "GET /v1/droids");
     const payload = await response.json().catch(() => null) as unknown;
     if (response.ok) {
-      if (!Array.isArray(payload)) throw new Error("Vitrus Bridge returned an invalid droid catalog");
+      if (!Array.isArray(payload)) throw new Error("Vitrus Bridge returned an invalid device catalog");
       return payload as DroidIdentity[];
     }
     if (response.status !== 404 && response.status !== 405) {
-      throw new Error(`Vitrus Droid request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`);
+      throw new Error(`Vitrus Device request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`);
     }
 
     // The deployed Render dataplane currently exposes registered runtime robots
@@ -82,13 +85,23 @@ export class Droid {
   readonly description;
   readonly presets;
   readonly effectors;
-  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
+  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string, options?: CameraFrameOptions): Promise<CameraFrame>; observeFrames(camera: string, options?: CameraObservationOptions): AsyncGenerator<LiveCameraFrame>; getCapabilities(camera: string): Promise<CameraCapabilities>; configureCapture(camera: string, options: CameraCaptureOptions): Promise<CameraCaptureReceipt>; getCalibration(camera: string): Promise<CameraCalibration | null>; openStream(camera: string, options?: CameraStreamOptions): Promise<CameraStream>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
+  readonly modules: { list(): Promise<DeviceModuleCatalog>; configure(id: string, settings: Record<string, unknown>): Promise<ModuleConfigureResult> };
+  /** Read-only latest device state; it is an observation, not control authority. */
+  readonly status: { snapshot(): Promise<DroidDeviceStatus> };
   readonly telemetry: { snapshot(): Promise<DroidTelemetry>; subscribe(listener: (value: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly events: { subscribe(listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
-  readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
+  readonly control: {
+    acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>;
+    renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>;
+    release(leaseId: string): Promise<void>;
+    openSession(options: DroidControlSessionOptions): Promise<DroidControlSession>;
+    withSession<T>(options: DroidControlSessionOptions, run: (session: DroidControlSession) => Promise<T>): Promise<T>;
+  };
   readonly motion: {
     sendTargets(targets: JointTarget[], options: DroidTargetOptions): Promise<DroidCommandResult>;
     primeAndWaitReady(targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions): Promise<DroidMotionReady>;
+    direct: DirectMotionJobClient;
   };
   readonly safety;
   private identityCache: DroidIdentity | null = null;
@@ -104,11 +117,17 @@ export class Droid {
     this.safety = base.safety;
     this.camera = {
       list: () => base.camera.list() as Promise<DroidCamera[]>,
-      getFrame: (camera) => base.camera.getFrame(camera),
+      getFrame: (camera, request = {}) => base.camera.getFrame(camera, request),
+      observeFrames: (camera, request = {}) => base.camera.observeFrames(camera, request),
+      getCapabilities: (camera) => base.camera.getCapabilities(camera),
+      configureCapture: (camera, request) => base.camera.configureCapture(camera, request),
       getCalibration: (camera) => this.calibration(camera),
-      openSession: (camera, request = {}) => this.post("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
-      closeSession: (sessionId) => this.remove(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`),
+      openStream: (camera, request = {}) => base.camera.openStream(camera, request),
+      openSession: (camera, request = {}) => base.camera.openSession(camera, request),
+      closeSession: (sessionId) => base.camera.closeSession(sessionId),
     };
+    this.modules = base.modules;
+    this.status = base.status;
     this.telemetry = {
       snapshot: () => base.telemetry.snapshot(),
       subscribe: (listener, request) => this.subscribe((event) => {
@@ -121,12 +140,14 @@ export class Droid {
       // BaseDroid owns the Edge transport client and performs the synchronous
       // local acquire after creating the authenticated control-plane lease.
       acquire: (request = {}) => base.control.acquire(request) as Promise<ControlLease>,
-      renew: async (leaseId, request = {}) => this.post(`/v1/droids/control/leases/${encodeURIComponent(leaseId)}/renew`, {
-        durationMs: validateDroidLeaseDurationMs(request.durationMs),
-      }),
+      // Delegate renewal so direct-Edge sessions use /api/dora/renew instead
+      // of accidentally calling the cloud lease route.
+      renew: (leaseId, request = {}) => base.control.renew(leaseId, request) as Promise<ControlLease>,
       // BaseDroid owns the active Edge transport client. Delegate release so
       // local broker torque-off acknowledgement happens before cloud revoke.
       release: (leaseId) => base.control.release(leaseId),
+      openSession: (request) => base.control.openSession(request),
+      withSession: (request, run) => base.control.withSession(request, run),
     };
   }
 
@@ -189,12 +210,16 @@ export class Droid {
   }
 
   private baseUrl(): string { return (this.options.endpoint || this.options.relayUrl || DEFAULT_DATAPLANE_URL).replace(/\/+$/, ""); }
-  private appendRef(params: URLSearchParams): void { if (typeof this.ref === "string") params.set("ref", this.ref); else { if (this.ref.serialNumber) params.set("serial_number", this.ref.serialNumber); if (this.ref.droidId) params.set("droid_id", this.ref.droidId); if (this.ref.alias) params.set("alias", this.ref.alias); } }
+  private appendRef(params: URLSearchParams): void { if (typeof this.ref === "string") params.set("ref", this.ref); else { if (this.ref.serialNumber) params.set("serial_number", this.ref.serialNumber); if (this.ref.deviceId ?? this.ref.droidId) params.set("droid_id", this.ref.deviceId ?? this.ref.droidId ?? ""); if (this.ref.alias) params.set("alias", this.ref.alias); } }
   private async post<T>(path: string, body: unknown): Promise<T> { return this.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); }
   private async remove(path: string): Promise<void> { await this.request(path, { method: "DELETE" }); }
-  private async request<T>(path: string, init: RequestInit): Promise<T> { const url = new URL(`${this.baseUrl()}${path}`); this.appendRef(url.searchParams); const response = await controlPlaneFetch(url.toString(), { ...init, headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) } }, this.options, `${init.method ?? "GET"} ${path}`); const payload = await response.json().catch(() => null) as unknown; if (!response.ok) throw new Error(`Vitrus Droid request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`); return payload as T; }
+  private async request<T>(path: string, init: RequestInit): Promise<T> { const url = new URL(`${this.baseUrl()}${path}`); this.appendRef(url.searchParams); const response = await controlPlaneFetch(url.toString(), { ...init, headers: { authorization: `Bearer ${this.options.apiKey}`, ...(init.headers ?? {}) } }, this.options, `${init.method ?? "GET"} ${path}`); const payload = await response.json().catch(() => null) as unknown; if (!response.ok) throw new Error(`Vitrus Device request failed (${response.status}): ${String(record(payload).detail ?? response.statusText)}`); return payload as T; }
   private realtimeUrl(): string { const url = new URL(this.baseUrl()); url.protocol = url.protocol === "https:" ? "wss:" : "ws:"; url.pathname = `${url.pathname.replace(/\/+$/, "")}/realtime`; url.search = ""; url.searchParams.set("api_key", this.options.apiKey); return url.toString(); }
 }
+
+/** Canonical device-first API. Droid remains a compatibility name. */
+export { Droid as Device };
+export type LiveDeviceConnectionOptions = LiveDroidConnectionOptions;
 
 async function controlPlaneFetch(
   url: string,

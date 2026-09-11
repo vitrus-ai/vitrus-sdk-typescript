@@ -2,6 +2,7 @@ import {
   createJointTargetsMessage,
   type ControlJointTarget,
   type ControlJointTargetsMessage,
+  type ControlModelBinding,
 } from "./contracts.js";
 
 export type GoldenEdgeHealth = {
@@ -17,12 +18,14 @@ export type GoldenEdgePublishResult = {
   sequence?: number;
   dropped?: string;
   error?: string;
+  broker?: Record<string, unknown>;
 };
 
 export type GoldenEdgeReleaseResult = {
   ok: boolean;
   transport: "dora";
   released: boolean;
+  superseded?: boolean;
   lease_id: string;
   broker?: Record<string, unknown>;
 };
@@ -58,6 +61,8 @@ export type GoldenEdgeClientOptions = {
   robotId: string;
   leaseId: string;
   source?: string;
+  /** Binding attached to all targets emitted by this client. */
+  modelBinding?: ControlModelBinding;
   requestTimeoutMs?: number;
   fetch?: typeof globalThis.fetch;
 };
@@ -75,12 +80,19 @@ export class GoldenEdgeClient {
   private sequence = 0;
   private leaseId: string;
   private readonly endpoint: string;
-  private readonly fetchImpl: typeof globalThis.fetch;
+  private readonly fetchImpl: (
+    input: Parameters<typeof globalThis.fetch>[0],
+    init?: Parameters<typeof globalThis.fetch>[1],
+  ) => ReturnType<typeof globalThis.fetch>;
 
   constructor(private readonly options: GoldenEdgeClientOptions) {
     this.endpoint = options.endpoint.replace(/\/+$/, "");
     this.leaseId = options.leaseId.trim();
-    this.fetchImpl = options.fetch ?? globalThis.fetch;
+    // WebKit's native Window.fetch is brand-checked: extracting it into a
+    // class field and calling it later loses the Window receiver and throws
+    // "Can only call Window.fetch on instances of Window". Keep injected
+    // transports untouched, but invoke the ambient fetch through globalThis.
+    this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     if (!this.endpoint) throw new Error("Golden Edge client requires endpoint");
     if (!options.robotId.trim()) throw new Error("Golden Edge client requires robotId");
     if (!this.leaseId) throw new Error("Golden Edge client requires leaseId");
@@ -133,7 +145,7 @@ export class GoldenEdgeClient {
 
   async sendJointTargets(
     targets: ControlJointTarget[],
-    options: { ttlMs?: number; sentAtMs?: number; edgeKeepaliveMs?: number } = {},
+    options: { ttlMs?: number; sentAtMs?: number; edgeKeepaliveMs?: number; modelBinding?: ControlModelBinding } = {},
   ): Promise<GoldenEdgePublishResult> {
     const command = createJointTargetsMessage({
       robotId: this.options.robotId,
@@ -143,6 +155,7 @@ export class GoldenEdgeClient {
       ttlMs: options.ttlMs,
       sentAtMs: options.sentAtMs,
       edgeKeepaliveMs: options.edgeKeepaliveMs,
+      modelBinding: options.modelBinding ?? this.options.modelBinding,
       targets,
     });
     return this.publish(command);
@@ -176,6 +189,26 @@ export class GoldenEdgeClient {
     if (!result.ok || result.dropped) {
       throw new Error(result.error || result.dropped || "Golden Edge rejected joint targets");
     }
+    // HTTP 200 only proves that the gateway returned JSON. When the gateway
+    // includes broker evidence, it must also prove that the robot-local plan
+    // is live. Accepting a response with an active deadman or inactive plan is
+    // a false ACK: the command never reached mechanical authority.
+    const broker = result.broker;
+    if (broker) {
+      const deadman = broker.deadman && typeof broker.deadman === "object" && !Array.isArray(broker.deadman)
+        ? broker.deadman as Record<string, unknown>
+        : {};
+      const plan = broker.plan && typeof broker.plan === "object" && !Array.isArray(broker.plan)
+        ? broker.plan as Record<string, unknown>
+        : {};
+      const rejected = Array.isArray(broker.rejected) ? broker.rejected : [];
+      if (rejected.length) throw new Error(`Golden Edge broker rejected joint targets: ${JSON.stringify(rejected)}`);
+      if (deadman.active === true) throw new Error("Golden Edge broker admission failed: deadman is active");
+      if (Object.keys(plan).length && plan.active !== true) throw new Error("Golden Edge broker admission failed: control plan is inactive");
+      if (typeof broker.access_mode === "string" && broker.access_mode !== "read_write") {
+        throw new Error(`Golden Edge broker admission failed: access_mode=${broker.access_mode}`);
+      }
+    }
     return result;
   }
 
@@ -189,7 +222,10 @@ export class GoldenEdgeClient {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ lease_id: requested }),
     }, 8_000);
-    if (!result.ok || !result.released) throw new Error("Golden Edge did not confirm release");
+    // A controller that was superseded no longer owns anything to release.
+    // Treat that broker-confirmed no-op as successful, and never stop the
+    // newer controller from a late cleanup callback.
+    if (!result.ok || (!result.released && !result.superseded)) throw new Error("Golden Edge did not confirm release");
     return result;
   }
 

@@ -1,6 +1,10 @@
-import { Droid } from './droid-live.js';
+import { Device, Droid } from './droid-live.js';
 export * from './edge-control-session.js';
 export * from './golden-edge.js';
+export * from './motion-job.js';
+export * from './direct-motion.js';
+export * from './camera-live.js';
+export * from './ik-execution.js';
 
 export * from './droid-live.js';
 export * from './contracts.js';
@@ -8,6 +12,9 @@ export * from './golden-edge.js';
 export * from './zenoh-edge.js';
 export * from './joint-stop-calibration.js';
 export * from './effectors.js';
+export * from './device-telemetry-stream.js';
+export * from './device-configuration.js';
+export * from './device-modules.js';
 
 /**
  * Vitrus SDK
@@ -388,8 +395,10 @@ interface EventEmitter {
 class Vitrus {
     /**
      * Modern device-first API. It intentionally does not use the legacy
-     * DAO actor protocol: Droid requests target the Vitrus data plane.
+     * DAO actor protocol: Device requests target the Vitrus data plane.
      */
+    static readonly Device = Device;
+    /** @deprecated Use Vitrus.Device. */
     static readonly Droid = Droid;
     private ws: EventEmitter | null = null;
     private apiKey: string;

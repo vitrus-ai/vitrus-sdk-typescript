@@ -2,7 +2,7 @@
   "name": "vitrus",
   "version": "0.2.8",
   "type": "module",
-  "description": "TypeScript client for interfacing with the Vitrus SDK",
+  "description": "TypeScript SDK for connecting applications to Vitrus devices",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -16,7 +16,8 @@
     "test": "bun test",
     "smoke:dataplane-control": "bun run examples/dataplane-control-smoke.mts",
     "prepublishOnly": "bun run build",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "smoke:dataplane-direct-readonly": "bun run examples/dataplane-direct-readonly.mts"
   },
   "keywords": [
     "vitrus",

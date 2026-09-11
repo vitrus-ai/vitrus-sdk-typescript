@@ -160,8 +160,99 @@ describe("Droid camera calibration", () => {
 });
 
 describe("Droid realtime and control sessions", () => {
+  test("retries transient read-only registry discovery within a bounded budget", async () => {
+    let calls = 0;
+    globalThis.fetch = async (input) => {
+      expect(new URL(String(input)).pathname).toBe("/v1/droids/resolve");
+      calls += 1;
+      return calls < 3
+        ? jsonResponse({ detail: "Droid registry unavailable" }, 502)
+        : jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+    });
+    expect((await droid.identity.get()).id).toBe("droid-1");
+    expect(calls).toBe(3);
+  });
+
+  test("does not retry non-transient registry failures", async () => {
+    for (const status of [401, 403, 404]) {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return jsonResponse({ detail: `HTTP ${status}` }, status);
+      };
+      await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+        apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+      })).rejects.toThrow(`(${status})`);
+      expect(calls).toBe(1);
+    }
+  });
+
+  test("caps transient registry discovery at two retries", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return jsonResponse({ detail: "Droid registry unavailable" }, 502);
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 1_000,
+    })).rejects.toThrow("(502)");
+    expect(calls).toBe(3);
+  });
+
+  test("does not outlive the shared deadline when identity headers precede a stalled body", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      // Deliberately ignore the request abort signal: the SDK must still bound
+      // response parsing instead of treating an unread body as a success.
+      return {
+        ok: true, status: 200, statusText: "OK", headers: new Headers(),
+        json: () => new Promise<never>(() => undefined),
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 5,
+    })).rejects.toMatchObject({
+      code: "VITRUS_REQUEST_TIMEOUT", operation: "GET /v1/droids/resolve", timeoutMs: 5,
+    });
+    expect(calls).toBe(1);
+  });
+
+  test("does not retry Retry-After beyond the shared registry deadline", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ detail: "try later" }), {
+        status: 429, headers: { "content-type": "application/json", "retry-after": "60" },
+      });
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 500,
+    })).rejects.toMatchObject({ code: "VITRUS_REQUEST_TIMEOUT", timeoutMs: 500 });
+    expect(calls).toBe(1);
+  });
+
+  test("does not retry an authorization response with an invalid JSON body", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response("not-json", { status: 401, statusText: "Unauthorized" });
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 500,
+    })).rejects.toThrow("Vitrus Droid request failed (401): Unauthorized");
+    expect(calls).toBe(1);
+  });
+
   test("separates control-plane timeout and reports the timed-out operation", async () => {
+    let calls = 0;
     globalThis.fetch = ((_, init) => new Promise((_, reject) => {
+      calls += 1;
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     })) as typeof fetch;
 
@@ -181,6 +272,8 @@ describe("Droid realtime and control sessions", () => {
         path: "/v1/droids/resolve",
         timeoutMs: 5,
       });
+      // Deadline aborts the first attempt; it never starts a retry after expiry.
+      expect(calls).toBe(1);
     }
   });
 
@@ -514,6 +607,83 @@ describe("Droid realtime and control sessions", () => {
     ]);
   });
 
+  test("keeps a responsive direct-Edge session alive without exposing total duration", async () => {
+    const requestedPaths: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input)); requestedPaths.push(url.pathname);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      if (url.pathname === "/api/dora/acquire") {
+        const body = JSON.parse(String(init?.body)) as { lease_id: string };
+        return jsonResponse({ ok: true, acquired: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/renew") {
+        const body = JSON.parse(String(init?.body)) as { lease_id: string };
+        return jsonResponse({ ok: true, renewed: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/joint-targets") {
+        const body = JSON.parse(String(init?.body)) as { sequence: number };
+        return jsonResponse({ ok: true, sequence: body.sequence });
+      }
+      if (url.pathname === "/api/dora/release") return jsonResponse({ ok: true, released: true });
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    };
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://r06-edge:8782",
+      motionTransport: "edge", controlTransport: "edge",
+    });
+    const session = await droid.control.openSession({ jointNames: ["LEFT_SHOULDER_A"], leaseWindowMs: 1_000, renewAheadMs: 999 });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await session.sendTargets([{ jointName: "LEFT_SHOULDER_A", displayDeg: -20 }], { ttlMs: 400 });
+    await session.release();
+    expect(session.closed).toBe(true);
+    expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/acquire", "/api/dora/renew", "/api/dora/joint-targets", "/api/dora/release"]);
+  });
+
+  test("withSession always releases authority when controller work fails", async () => {
+    const requestedPaths: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input)); requestedPaths.push(url.pathname);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      if (url.pathname === "/api/dora/acquire") {
+        const body = JSON.parse(String(init?.body)) as { lease_id: string };
+        return jsonResponse({ ok: true, acquired: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/release") return jsonResponse({ ok: true, released: true });
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    };
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://r06-edge:8782",
+      motionTransport: "edge", controlTransport: "edge",
+    });
+    await expect(droid.control.withSession(
+      { jointNames: ["LEFT_SHOULDER_A"] },
+      async () => { throw new Error("controller failed"); },
+    )).rejects.toThrow("controller failed");
+    expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/acquire", "/api/dora/release"]);
+  });
+
+  test("does not renew an idle session in the background", async () => {
+    const requestedPaths: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input)); requestedPaths.push(url.pathname);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      if (url.pathname === "/api/dora/acquire") {
+        const body = JSON.parse(String(init?.body)) as { lease_id: string };
+        return jsonResponse({ ok: true, acquired: true, lease_id: body.lease_id });
+      }
+      if (url.pathname === "/api/dora/release") return jsonResponse({ ok: true, released: true });
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    };
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://r06-edge:8782",
+      motionTransport: "edge", controlTransport: "edge",
+    });
+    const session = await droid.control.openSession({ jointNames: ["LEFT_SHOULDER_A"], leaseWindowMs: 1_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await session.release();
+    expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/acquire", "/api/dora/release"]);
+  });
+
   test("publishes motion through a persistent Zenoh session", async () => {
     const published: Array<{ topic: string; payload: Record<string, unknown> }> = [];
     let opens = 0;
@@ -624,12 +794,10 @@ describe("Droid realtime and control sessions", () => {
     await droid.control.release(lease.id);
     expect(requests.some((request) => request.method === "DELETE" && request.path.includes("media-1"))).toBe(true);
     expect(requests.some((request) => request.method === "DELETE" && request.path.includes("lease-1"))).toBe(true);
-    await expect(droid.control.acquire({ durationMs: 30_001 })).rejects.toThrow(
-      "durationMs must be an integer in [1000, 30000]",
-    );
-    await expect(droid.control.renew(lease.id, { durationMs: 999 })).rejects.toThrow(
-      "durationMs must be an integer in [1000, 30000]",
-    );
+    await droid.control.acquire({ durationMs: 120_000 });
+    await droid.control.renew(lease.id, { durationMs: 100 });
+    const leaseRequests = requests.filter(request => request.path === "/v1/droids/control/leases" && request.method === "POST");
+    expect(leaseRequests.at(-1)!.body).toMatchObject({ durationMs: 30_000 });
   });
 
   test("filters Bridge realtime telemetry to the connected droid", async () => {

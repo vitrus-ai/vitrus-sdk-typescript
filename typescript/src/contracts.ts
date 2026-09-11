@@ -5,6 +5,16 @@ export const VITRUS_CONTRACT_VERSION = "0.1.0";
 export const CONTROL_JOINT_TARGETS_SCHEMA = "vitrus.control.joint_targets";
 export const DEFAULT_CONTROL_TTL_MS = 250;
 
+/**
+ * Binding for the exact Edge-installed model that produced a control target.
+ * Wire keys remain snake_case because this envelope is consumed by VitrusOS.
+ */
+export type ControlModelBinding = {
+  configuration_revision: string;
+  effective_urdf_sha256: string;
+  model_epoch: number;
+};
+
 export type ControlJointTarget = {
   joint_name: string;
   position_deg?: number;
@@ -39,6 +49,9 @@ export type ControlJointTargetsMessage = {
   edge_keepalive_ms?: number;
   lease_id: string;
   robot_id: string;
+  configuration_revision?: string;
+  effective_urdf_sha256?: string;
+  model_epoch?: number;
   /** VitrusOS owns the only physical velocity/acceleration/jerk trajectory. */
   trajectory_owner: "edge";
   flush: true;
@@ -70,6 +83,7 @@ export function createJointTargetsMessage(options: {
   ttlMs?: number;
   edgeKeepaliveMs?: number;
   semanticEffectors?: EffectorCommandEnvelope;
+  modelBinding?: ControlModelBinding;
   sentAtMs?: number;
   targets: ControlJointTarget[];
 }): ControlJointTargetsMessage {
@@ -83,6 +97,18 @@ export function createJointTargetsMessage(options: {
     if (!target.joint_name.trim()) throw new Error("joint targets require joint_name");
     if (target.max_torque_nm != null && (!Number.isFinite(target.max_torque_nm) || target.max_torque_nm <= 0)) {
       throw new Error("joint target max_torque_nm must be a positive finite number");
+    }
+  }
+  if (options.modelBinding) {
+    const binding = options.modelBinding;
+    if (!/^[a-f0-9]{64}$/.test(binding.configuration_revision)) {
+      throw new Error("joint target model binding requires a SHA-256 configuration revision");
+    }
+    if (!/^[a-f0-9]{64}$/.test(binding.effective_urdf_sha256)) {
+      throw new Error("joint target model binding requires an effective URDF SHA-256");
+    }
+    if (!Number.isSafeInteger(binding.model_epoch) || binding.model_epoch < 1) {
+      throw new Error("joint target model binding requires a positive model epoch");
     }
   }
 
@@ -113,6 +139,7 @@ export function createJointTargetsMessage(options: {
     }),
     lease_id: options.leaseId,
     robot_id: options.robotId,
+    ...(options.modelBinding ? options.modelBinding : {}),
     trajectory_owner: "edge",
     flush: true,
     safety: {
