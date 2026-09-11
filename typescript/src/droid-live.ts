@@ -1,6 +1,8 @@
 import { Droid as BaseDroid, DroidRequestTimeoutError, normalizeDroidTelemetry, validateDroidLeaseDurationMs } from "./droid.js";
 export * from "./droid.js";
 import type { CameraFrame, ControlLease as BaseControlLease, DroidCommandResult, DroidConnectionOptions, DroidDescription, DroidIdentity, DroidMotionReady, DroidPrimeAndWaitReadyOptions, DroidRef, DroidTargetOptions, DroidTelemetry, JointTarget } from "./droid.js";
+import type { DirectMotionJobClient } from "./direct-motion.js";
+import type { CameraObservationOptions, LiveCameraFrame } from "./camera-live.js";
 
 export type DroidCamera = Record<string, unknown> & { name: string; ready?: boolean; fps?: number; stream_url?: string; snapshot_url?: string };
 export type CameraMediaTransport = "webrtc" | "moq" | "mjpeg" | "snapshot";
@@ -82,13 +84,14 @@ export class Droid {
   readonly description;
   readonly presets;
   readonly effectors;
-  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
+  readonly camera: { list(): Promise<DroidCamera[]>; getFrame(camera: string): Promise<CameraFrame>; observeFrames(camera: string, options?: CameraObservationOptions): AsyncGenerator<LiveCameraFrame>; getCalibration(camera: string): Promise<CameraCalibration | null>; openSession(camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }): Promise<CameraMediaSession>; closeSession(sessionId: string): Promise<void> };
   readonly telemetry: { snapshot(): Promise<DroidTelemetry>; subscribe(listener: (value: DroidTelemetry) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly events: { subscribe(listener: (event: DroidRealtimeEvent) => void, options?: { onStateChange?: (state: DroidRealtimeState, error?: Error) => void }): Promise<DroidRealtimeSubscription> };
   readonly control: { acquire(options?: { durationMs?: number; owner?: string; jointNames?: string[] }): Promise<ControlLease>; renew(leaseId: string, options?: { durationMs?: number }): Promise<ControlLease>; release(leaseId: string): Promise<void> };
   readonly motion: {
     sendTargets(targets: JointTarget[], options: DroidTargetOptions): Promise<DroidCommandResult>;
     primeAndWaitReady(targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions): Promise<DroidMotionReady>;
+    direct: DirectMotionJobClient;
   };
   readonly safety;
   private identityCache: DroidIdentity | null = null;
@@ -105,6 +108,7 @@ export class Droid {
     this.camera = {
       list: () => base.camera.list() as Promise<DroidCamera[]>,
       getFrame: (camera) => base.camera.getFrame(camera),
+      observeFrames: (camera, request = {}) => base.camera.observeFrames(camera, request),
       getCalibration: (camera) => this.calibration(camera),
       openSession: (camera, request = {}) => this.post("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
       closeSession: (sessionId) => this.remove(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`),

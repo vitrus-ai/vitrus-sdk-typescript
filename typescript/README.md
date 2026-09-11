@@ -115,3 +115,26 @@ Zenoh is loaded lazily, so Bridge and Dora users do not initialize the Zenoh WAS
 Vitrus and its affiliates may use this SDK commercially. Other recipients may
 use it only for non-commercial research. Commercial use by another organization
 requires written permission from Vitrus. See [LICENSE](LICENSE).
+
+## Public realtime camera and direct motion
+
+`Droid.connect()` also exposes public, authenticated realtime camera observations
+and the robot-local native direct-motion lifecycle through the Vitrus dataplane.
+Neither API accepts an Edge address, VPN endpoint, broker lease, or device token.
+
+```ts
+const droid = await Vitrus.Droid.connect("VTRS-<MODEL>-<YYMM>-<UNIQUE_ID>", {
+  apiKey: process.env.VITRUS_API_KEY!,
+});
+
+for await (const frame of droid.camera.observeFrames("head_camera")) {
+  // `bytes` is the decoded JPEG. The iterator retains no frame history.
+  render(frame.bytes);
+}
+```
+
+`droid.motion.direct` uses the same public API-key and serial boundary for
+status, feedback, execution evidence, and direct-motion sessions. The small
+read-only smoke probe is available as `npm run smoke:dataplane-direct-readonly`.
+Motion is admitted and executed only by the enrolled Edge service; the SDK does
+not expose its broker lease or a local robot route.

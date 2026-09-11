@@ -9,9 +9,19 @@ import {
   type EffectorInstance,
 } from "./effectors.js";
 import { GoldenEdgeClient } from "./golden-edge.js";
+import { DirectMotionJobClient } from "./direct-motion.js";
+import { observeCameraFrames, type CameraObservationOptions, type LiveCameraFrame } from "./camera-live.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
 
 export type DroidRef = string | { serialNumber?: string; droidId?: string; alias?: string };
+
+/** Return the public serial/alias identifier required by the dataplane. */
+function publicDroidRef(ref: DroidRef): string {
+  if (typeof ref === "string") return ref.trim();
+  const candidate = ref.serialNumber ?? ref.alias ?? ref.droidId;
+  if (!candidate?.trim()) throw new Error("Droid direct motion requires a serial, alias, or droid id reference");
+  return candidate.trim();
+}
 
 export type DroidIdentity = {
   id: string;
@@ -575,6 +585,7 @@ export class Droid {
   readonly camera: {
     list: () => Promise<DroidCamera[]>;
     getFrame: (camera: string) => Promise<CameraFrame>;
+    observeFrames: (camera: string, options?: CameraObservationOptions) => AsyncGenerator<LiveCameraFrame>;
     getCalibration: (camera: string) => Promise<CameraCalibration | null>;
     openSession: (camera: string, options?: { preferredTransport?: CameraMediaTransport | "auto" }) => Promise<CameraMediaSession>;
     closeSession: (sessionId: string) => Promise<void>;
@@ -594,6 +605,8 @@ export class Droid {
   readonly motion: {
     sendTargets: (targets: JointTarget[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
     primeAndWaitReady: (targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions) => Promise<DroidMotionReady>;
+    /** Native device-IK lifecycle through the authenticated public dataplane. */
+    direct: DirectMotionJobClient;
   };
   readonly safety: { emergencyStop: (reason?: string) => Promise<DroidCommandResult> };
 
@@ -655,6 +668,7 @@ export class Droid {
     this.camera = {
       list: () => this.get<DroidCamera[]>("/v1/droids/cameras"),
       getFrame: (camera) => this.get<CameraFrame>("/v1/droids/cameras/frame", { camera }),
+      observeFrames: (camera, request = {}) => observeCameraFrames({ endpoint: this.baseUrl(), apiKey: this.options.apiKey, ref: publicDroidRef(this.ref), camera, ...request }),
       getCalibration: (camera) => this.getCameraCalibration(camera),
       openSession: (camera, request = {}) => this.post<CameraMediaSession>("/v1/droids/cameras/sessions", { camera, preferredTransport: request.preferredTransport ?? "auto" }),
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
@@ -759,6 +773,12 @@ export class Droid {
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
       primeAndWaitReady: (targets, request) => this.primeAndWaitReady(targets, request),
+      direct: new DirectMotionJobClient({
+        endpoint: this.baseUrl(),
+        apiKey: this.options.apiKey,
+        ref: publicDroidRef(this.ref),
+        requestTimeoutMs: this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs,
+      }),
     };
     this.safety = {
       emergencyStop: (reason = "operator_requested") => this.post<DroidCommandResult>("/v1/droids/safety/emergency-stop", { reason }),

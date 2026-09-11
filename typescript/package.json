@@ -15,6 +15,7 @@
     "build": "tsc",
     "test": "bun test",
     "smoke:dataplane-control": "bun run examples/dataplane-control-smoke.mts",
+    "smoke:dataplane-direct-readonly": "bun run examples/dataplane-direct-readonly.mts",
     "prepublishOnly": "bun run build",
     "dev": "tsc --watch"
   },
