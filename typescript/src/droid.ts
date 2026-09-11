@@ -399,7 +399,18 @@ export type CameraMediaSession = {
 };
 
 export type CameraStreamProfile = "realtime" | "high-definition";
-export type CameraStreamOptions = { profile?: CameraStreamProfile; width?: number; height?: number; fps?: number; audio?: boolean; preferredTransport?: Exclude<CameraMediaTransport, "snapshot"> | "auto" };
+export type CameraStreamOptions = {
+  profile?: CameraStreamProfile;
+  width?: number;
+  height?: number;
+  fps?: number;
+  audio?: boolean;
+  preferredTransport?: Exclude<CameraMediaTransport, "snapshot"> | "auto";
+  /** Stable viewer identity used by Edge to bound peers per viewer and camera. */
+  clientId?: string;
+  /** Caller-generated identifier that correlates stream allocation and SDP negotiation. */
+  correlationId?: string;
+};
 export type CameraStream = CameraMediaSession & { profile: CameraStreamProfile; negotiate?: (offer: { sdp: string; type: string }) => Promise<{ sdp: string; type: string; camera: string; video?: { width: number; height: number; fps: number } }> };
 
 /** Latest Edge-published device health; it is observational and grants no control authority. */

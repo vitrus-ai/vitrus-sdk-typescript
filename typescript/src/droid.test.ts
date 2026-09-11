@@ -800,6 +800,48 @@ describe("Droid realtime and control sessions", () => {
     expect(leaseRequests.at(-1)!.body).toMatchObject({ durationMs: 30_000 });
   });
 
+  test("preserves viewer identity and correlation through Edge camera stream negotiation", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      requests.push({ path: url.pathname, body });
+      if (url.pathname === "/v1/droids/resolve") {
+        return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      }
+      if (url.pathname === "/api/dora/cameras/streams") {
+        return jsonResponse({
+          id: "edge-camera:head_camera", droidId: "edge", camera: "head_camera", expiresAt: "",
+          transport: "webrtc", route: "direct", profile: "realtime", offerUrl: "/api/dora/cameras/offer",
+        });
+      }
+      if (url.pathname === "/api/dora/cameras/offer") {
+        return jsonResponse({ sdp: "answer-sdp", type: "answer", camera: "head_camera" });
+      }
+      return jsonResponse({ detail: "unexpected request" }, 500);
+    };
+
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", edgeCameraEndpoint: "http://r06-edge:8782",
+    });
+    const stream = await droid.camera.openStream("head_camera", {
+      profile: "realtime", width: 640, height: 360, fps: 30,
+      clientId: "tcp-pivot-browser-4e8d", correlationId: "camera-offer-81",
+    });
+    await stream.negotiate?.({ sdp: "offer-sdp", type: "offer" });
+
+    const streamRequest = requests.find((request) => request.path === "/api/dora/cameras/streams");
+    const offerRequest = requests.find((request) => request.path === "/api/dora/cameras/offer");
+    expect(streamRequest?.body).toMatchObject({
+      camera: "head_camera", profile: "realtime", width: 640, height: 360, fps: 30,
+      clientId: "tcp-pivot-browser-4e8d", correlationId: "camera-offer-81",
+    });
+    expect(offerRequest?.body).toMatchObject({
+      camera: "head_camera", profile: "realtime", sdp: "offer-sdp", type: "offer",
+      clientId: "tcp-pivot-browser-4e8d", correlationId: "camera-offer-81",
+    });
+  });
+
   test("filters Bridge realtime telemetry to the connected droid", async () => {
     class FakeSocket extends EventTarget {
       sent: string[] = [];
