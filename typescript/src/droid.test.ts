@@ -203,6 +203,40 @@ describe("Droid realtime and control sessions", () => {
     expect(calls).toBe(3);
   });
 
+  test("does not outlive the shared deadline when identity headers precede a stalled body", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      // Deliberately ignore the request abort signal: the SDK must still bound
+      // response parsing instead of treating an unread body as a success.
+      return {
+        ok: true, status: 200, statusText: "OK", headers: new Headers(),
+        json: () => new Promise<never>(() => undefined),
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 5,
+    })).rejects.toMatchObject({
+      code: "VITRUS_REQUEST_TIMEOUT", operation: "GET /v1/droids/resolve", timeoutMs: 5,
+    });
+    expect(calls).toBe(1);
+  });
+
+  test("does not retry Retry-After beyond the shared registry deadline", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ detail: "try later" }), {
+        status: 429, headers: { "content-type": "application/json", "retry-after": "1" },
+      });
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 10,
+    })).rejects.toMatchObject({ code: "VITRUS_REQUEST_TIMEOUT", timeoutMs: 10 });
+    expect(calls).toBe(1);
+  });
+
   test("separates control-plane timeout and reports the timed-out operation", async () => {
     let calls = 0;
     globalThis.fetch = ((_, init) => new Promise((_, reject) => {

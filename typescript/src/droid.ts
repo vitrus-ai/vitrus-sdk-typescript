@@ -467,9 +467,36 @@ function isRetryableRegistryStatus(status: number): boolean {
   return status === 408 || status === 429 || (status >= 500 && status <= 504);
 }
 
-function registryRetryDelayMs(attempt: number): number {
+function registryRetryDelayMs(attempt: number, response: Response): number {
+  const retryAfter = response.headers.get("retry-after")?.trim();
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  }
   // Keep the recovery short and desynchronize simultaneous reconnecting viewers.
   return REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
+}
+
+async function parseRegistryBody(response: Response, signal: AbortSignal): Promise<unknown> {
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException("aborted", "AbortError"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    // A mocked or non-conforming fetch may resolve headers without wiring its
+    // body reader to the request signal. Race it explicitly so bootstrap has
+    // the same total deadline in browsers, Bun, and tests.
+    return await Promise.race([response.json(), aborted]);
+  } catch (error) {
+    if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+    return null;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function registryDeadlineError(operation: string, url: string, timeoutMs: number): DroidRequestTimeoutError {
@@ -1127,15 +1154,20 @@ export class Droid {
     const url = new URL(`${this.baseUrl()}/v1/droids/resolve`);
     this.appendRef(url.searchParams);
     const response = await this.fetchRegistryIdentity(url.toString(), "GET /v1/droids/resolve");
-    const payload: unknown = await response.json().catch(() => null);
     if (!response.ok) {
-      const detail = parseJsonRecord(payload).detail;
+      const detail = parseJsonRecord(response.payload).detail;
       throw new Error(`Vitrus Droid request failed (${response.status}): ${typeof detail === "string" ? detail : response.statusText}`);
     }
-    return payload as DroidIdentity;
+    if (!response.payload || typeof response.payload !== "object" || Array.isArray(response.payload)) {
+      throw new Error("Vitrus Droid registry returned an invalid identity response");
+    }
+    return response.payload as DroidIdentity;
   }
 
-  private async fetchRegistryIdentity(url: string, operation: string): Promise<Response> {
+  private async fetchRegistryIdentity(
+    url: string,
+    operation: string,
+  ): Promise<{ ok: boolean; status: number; statusText: string; payload: unknown }> {
     const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
     const deadlineMs = Date.now() + timeoutMs;
     let lastTransportError: unknown;
@@ -1151,11 +1183,16 @@ export class Droid {
           headers: { authorization: `Bearer ${this.options.apiKey}` },
         });
         if (!isRetryableRegistryStatus(response.status) || attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) {
-          return response;
+          const payload = await parseRegistryBody(response, controller.signal);
+          return { ok: response.ok, status: response.status, statusText: response.statusText, payload };
         }
         // The response will not be exposed to a caller, so release its body
         // before waiting. A retry never creates a history buffer in the SDK.
         void response.body?.cancel().catch(() => undefined);
+        const delayMs = registryRetryDelayMs(attempt, response);
+        if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
+        await pauseRegistryRetry(delayMs);
+        continue;
       } catch (error) {
         if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
           throw registryDeadlineError(operation, url, timeoutMs);
@@ -1166,7 +1203,9 @@ export class Droid {
         clearTimeout(timeout);
       }
 
-      const delayMs = registryRetryDelayMs(attempt);
+      // Transport failures have no Retry-After value. Use the same bounded
+      // jittered delay as a retryable HTTP registry response.
+      const delayMs = REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
       if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
       await pauseRegistryRetry(delayMs);
     }
