@@ -99,7 +99,7 @@ function parseSourceProfileEpoch(value:unknown):string|number|undefined{return t
 function serverError(value:Record<string,unknown>):CameraStreamError{
  const code=stringValue(value.code)??stringValue(value.error);
  if(!code)throw Error('live camera stream error has no code');
- const rawStatus=value.status??value.httpStatus??value.http_status;
+ const rawStatus=value.statusCode??value.status??value.httpStatus??value.http_status;
  if(rawStatus!==undefined&&(!Number.isInteger(rawStatus)||typeof rawStatus!=="number"||rawStatus<100||rawStatus>599))throw Error('live camera stream error has invalid status');
  const requestedProfile=outputProfile(value.requestedProfile);
  const actualDeliveryProfile=outputProfile(value.actualDeliveryProfile??value.outputProfile);

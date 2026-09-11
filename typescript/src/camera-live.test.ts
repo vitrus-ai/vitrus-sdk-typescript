@@ -40,7 +40,9 @@ test('camera.observeFrames propagates a definite Bridge rendition error without 
  for(const reconnect of [false,true]){
   let calls=0;
   const iterator=observeCameraFrames({endpoint:'https://vitrus-dataplane.example',apiKey:'test-key',ref:'VTRS-R06',camera:'head_camera',reconnect,reconnectDelayMs:0,fetch:(async()=>{
-   calls++;return new Response(stream(JSON.stringify({type:'error',error:'rendition_unavailable',status:503,message:'requested rendition is not available',camera:'head_camera',requestedProfile:{maxFps:30},actualDeliveryProfile:{width:640,height:360,quality:75,maxFps:10},actualSourceProfile:{width:1280,height:720,fps:29.97,fourcc:'MJPG'},sourceProfileEpoch:'profile-8'})+'\n'));
+   // Exact deployed Bridge error shape: `statusCode`, snake-free profiles,
+   // and a stable `error` code rather than a generic HTTP response body.
+   calls++;return new Response(stream(JSON.stringify({type:'error',error:'rendition_unavailable',statusCode:503,message:'requested rendition is not available',camera:'head_camera',requestedProfile:{maxFps:30},actualDeliveryProfile:{width:640,height:360,quality:75,maxFps:10},actualSourceProfile:{width:1280,height:720,fps:29.97,fourcc:'MJPG'},sourceProfileEpoch:'profile-8'})+'\n'));
   }) as typeof globalThis.fetch});
   try{await expect(iterator.next()).rejects.toMatchObject({name:'CameraStreamError',code:'rendition_unavailable',status:503,camera:'head_camera',requestedProfile:{maxFps:30},actualDeliveryProfile:{width:640,height:360,quality:75,maxFps:10},actualSourceProfile:{width:1280,height:720,fps:29.97,fourcc:'MJPG'},sourceProfileEpoch:'profile-8'} satisfies Partial<CameraStreamError>);}
   finally{await iterator.return?.();}
