@@ -290,12 +290,28 @@ export type CameraCaptureProfile = {
   fourcc?: string;
 };
 
-/** One consumer's delivered rendition. */
-export type CameraOutputProfile = {
+/**
+ * One physically supported capture format reported by the camera-owning Edge.
+ * Unlike an active source profile, this advertises its discrete FPS choices.
+ */
+export type CameraCaptureCapability = {
   width: number;
   height: number;
+  fourcc?: string;
+  frameIntervalsFps: number[];
+};
+
+/** One consumer's delivered rendition. */
+export type CameraOutputProfile = {
+  /** Omitted when a consumer only asks to pace delivery. */
+  width?: number;
+  /** Omitted when a consumer only asks to pace delivery. */
+  height?: number;
   quality?: number;
+  /** Legacy Bridge spelling for a measured delivery rate. */
   fps?: number;
+  /** Maximum delivery rate requested or selected for this consumer. */
+  maxFps?: number;
 };
 
 export type CameraFrameOptions = {
@@ -318,7 +334,7 @@ export const DEFAULT_CAMERA_FRAME_OPTIONS: Required<CameraFrameOptions> = {
 export type CameraCapabilities = {
   camera: string;
   capabilities: {
-    captureProfiles: CameraCaptureProfile[];
+    captureProfiles: CameraCaptureCapability[];
     output: {
       maxWidth: number;
       maxHeight: number;

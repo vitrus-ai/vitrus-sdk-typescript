@@ -1,5 +1,5 @@
 /** Public, latest-only camera frames from the Vitrus dataplane. */
-import type {CameraCaptureProfile,CameraFrame,DroidRef} from './droid.js';
+import type {CameraCaptureProfile,CameraFrame,CameraOutputProfile,DroidRef} from './droid.js';
 
 /**
  * A consumer-local rendition request. These fields never reconfigure the
@@ -41,9 +41,11 @@ function decodeFrame(value:string):Uint8Array{
  if(!binary.length||binary.length>MAX_FRAME_BYTES)throw Error('live camera frame exceeds the public size bound');
  const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index++)bytes[index]=binary.charCodeAt(index);return bytes;
 }
-type CameraOutputProfile={width:number;height:number;quality?:number;fps?:number};
 function positiveInteger(value:unknown,name:string,maximum:number):number{
  if(typeof value!=="number"||!Number.isInteger(value)||value<1||value>maximum)throw Error(`live camera frame has invalid ${name}`);return value;
+}
+function positiveFinite(value:unknown,name:string):number{
+ if(typeof value!=="number"||!Number.isFinite(value)||value<=0)throw Error(`live camera frame has invalid ${name}`);return value;
 }
 function sourceProfile(value:unknown):CameraCaptureProfile|undefined{
  if(value===undefined)return undefined;
@@ -51,16 +53,24 @@ function sourceProfile(value:unknown):CameraCaptureProfile|undefined{
  const profile=value as Record<string,unknown>;
  const fourcc=profile.fourcc;
  if(fourcc!==undefined&&(typeof fourcc!=="string"||!/^[A-Za-z0-9]{4}$/.test(fourcc)))throw Error("live camera frame has invalid source fourcc");
- return {width:positiveInteger(profile.width,"source width",4096),height:positiveInteger(profile.height,"source height",4096),fps:positiveInteger(profile.fps,"source fps",30),...(typeof fourcc==="string"?{fourcc}:{})};
+ return {width:positiveInteger(profile.width,"source width",4096),height:positiveInteger(profile.height,"source height",4096),fps:positiveFinite(profile.fps,"source fps"),...(typeof fourcc==="string"?{fourcc}:{})};
 }
 function outputProfile(value:unknown):CameraOutputProfile|undefined{
  if(value===undefined)return undefined;
  if(!value||typeof value!=="object"||Array.isArray(value))throw Error("live camera frame has invalid output profile");
  const profile=value as Record<string,unknown>;
- const quality=profile.quality,fps=profile.fps;
+ const width=profile.width,height=profile.height,quality=profile.quality,fps=profile.fps,maxFps=profile.maxFps;
+ if(width!==undefined)positiveInteger(width,"output width",4096);
+ if(height!==undefined)positiveInteger(height,"output height",4096);
  if(quality!==undefined)positiveInteger(quality,"output quality",100);
  if(fps!==undefined)positiveInteger(fps,"output fps",30);
- return {width:positiveInteger(profile.width,"output width",4096),height:positiveInteger(profile.height,"output height",4096),...(typeof quality==="number"?{quality}:{}),...(typeof fps==="number"?{fps}:{})};
+ if(maxFps!==undefined)positiveInteger(maxFps,"output maxFps",30);
+ if(width===undefined&&height===undefined&&quality===undefined&&fps===undefined&&maxFps===undefined)throw Error("live camera frame has empty output profile");
+ return {
+  ...(typeof width==="number"?{width}:{}),...(typeof height==="number"?{height}:{}),
+  ...(typeof quality==="number"?{quality}:{}),...(typeof fps==="number"?{fps}:{}),
+  ...(typeof maxFps==="number"?{maxFps}:{}),
+ };
 }
 function optionInteger(value:number|undefined,name:string,maximum:number):number|undefined{
  if(value===undefined)return undefined;

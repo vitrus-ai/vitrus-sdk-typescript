@@ -39,10 +39,10 @@ test("public camera methods serialize independent delivery requests and capture 
       return json({
         camera: "head_camera",
         capabilities: {
-          captureProfiles: [{ width: 1280, height: 720, fps: 30, fourcc: "MJPG" }],
+          captureProfiles: [{ width: 1280, height: 720, fourcc: "MJPG", frameIntervalsFps: [30, 15] }],
           output: { maxWidth: 1280, maxHeight: 720, qualityRange: [20, 95], maxFps: 30 },
         },
-        actualSourceProfile: { width: 1280, height: 720, fps: 30, fourcc: "MJPG" },
+        actualSourceProfile: { width: 1280, height: 720, fps: 29.97, fourcc: "MJPG" },
         sourceProfileEpoch: 7,
       });
     }
@@ -74,7 +74,8 @@ test("public camera methods serialize independent delivery requests and capture 
   try {
     const droid = await Droid.connect("VTRS-R06", { apiKey: "public-key" });
     const capabilities = await droid.camera.getCapabilities("head_camera");
-    expect(capabilities.actualSourceProfile?.fps).toBe(30);
+    expect(capabilities.capabilities.captureProfiles).toEqual([{ width: 1280, height: 720, fourcc: "MJPG", frameIntervalsFps: [30, 15] }]);
+    expect(capabilities.actualSourceProfile?.fps).toBe(29.97);
     const receipt = await droid.camera.configureCapture("head_camera", { width: 1280, height: 720, fps: 30, fourcc: "MJPG" });
     expect(receipt.requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     const frame = await droid.camera.getFrame("head_camera");
@@ -112,17 +113,19 @@ test("independent live consumers send separate options without capture mutation 
       type: "frame", camera: "head_camera", frameId: `f-${width}`,
       capturedAt: "2026-09-11T00:00:00.000Z", mimeType: "image/jpeg",
       dataBase64: Buffer.from(jpeg).toString("base64"), receivedAtMs: 100,
-      requestedProfile: { width, height, quality: width === 640 ? 70 : 90 },
-      outputProfile: { width, height, quality: width === 640 ? 70 : 90, fps: width === 640 ? 30 : 2 },
-      actualSourceProfile: { width: 1280, height: 720, fps: 30, fourcc: "MJPG" },
+      requestedProfile: width === 640 ? { width, height, quality: 70, maxFps: 30 } : { maxFps: 2 },
+      outputProfile: { width, height, quality: width === 640 ? 70 : 90, maxFps: width === 640 ? 30 : 2 },
+      actualSourceProfile: { width: 1280, height: 720, fps: 29.97, fourcc: "MJPG" },
       sourceProfileEpoch: "source-7",
     }) + "\n"]));
   };
   const low = observeCameraFrames({ endpoint: "https://public.example", apiKey: "key", ref: "VTRS-R06", camera: "head_camera", width: 640, height: 360, quality: 70, maxFps: 30, fetch: fetch as typeof globalThis.fetch, reconnect: false });
   const high = observeCameraFrames({ endpoint: "https://public.example", apiKey: "key", ref: "VTRS-R06", camera: "head_camera", width: 1280, height: 720, quality: 90, maxFps: 2, requireExactResolution: true, fetch: fetch as typeof globalThis.fetch, reconnect: false });
   const [lowFrame, highFrame] = await Promise.all([low.next(), high.next()]);
-  expect(lowFrame.value?.actualDeliveryProfile).toEqual({ width: 640, height: 360, quality: 70, fps: 30 });
-  expect(highFrame.value?.actualSourceProfile).toEqual({ width: 1280, height: 720, fps: 30, fourcc: "MJPG" });
+  expect(lowFrame.value?.actualDeliveryProfile).toEqual({ width: 640, height: 360, quality: 70, maxFps: 30 });
+  expect(highFrame.value?.requestedProfile).toEqual({ maxFps: 2 });
+  expect(highFrame.value?.actualDeliveryProfile).toEqual({ width: 1280, height: 720, quality: 90, maxFps: 2 });
+  expect(highFrame.value?.actualSourceProfile).toEqual({ width: 1280, height: 720, fps: 29.97, fourcc: "MJPG" });
   expect(urls).toHaveLength(2);
   expect(Object.fromEntries(urls[0].searchParams)).toMatchObject({ ref: "VTRS-R06", camera: "head_camera", width: "640", height: "360", quality: "70", max_fps: "30" });
   expect(Object.fromEntries(urls[1].searchParams)).toMatchObject({ ref: "VTRS-R06", camera: "head_camera", width: "1280", height: "720", quality: "90", max_fps: "2", require_exact_resolution: "true" });
