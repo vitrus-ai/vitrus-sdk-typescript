@@ -462,8 +462,8 @@ function validateAuxiliaryTargets(targets: AuxiliaryJointTarget[], scope: readon
     const torque = target.max_torque_nm === undefined ? 0.35 : target.max_torque_nm;
     const velocity = target.velocity_deg_s === undefined ? 5 : target.velocity_deg_s;
     if (!Number.isFinite(target.position_deg) || !Number.isFinite(torque) || !Number.isFinite(velocity)
-      || torque <= 0 || torque > 0.35 || velocity <= 0 || velocity > 5) {
-      throw new Error("auxiliary targets require finite position_deg, 0 < max_torque_nm <= 0.35 and 0 < velocity_deg_s <= 5");
+      || torque <= 0 || torque > 0.35 || velocity <= 0 || velocity > 30) {
+      throw new Error("auxiliary targets require finite position_deg, 0 < max_torque_nm <= 0.35 and 0 < velocity_deg_s <= 30");
     }
     return { joint_name: name, position_deg: target.position_deg, max_torque_nm: torque, velocity_deg_s: velocity };
   });
