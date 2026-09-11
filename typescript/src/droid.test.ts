@@ -228,12 +228,24 @@ describe("Droid realtime and control sessions", () => {
     globalThis.fetch = async () => {
       calls += 1;
       return new Response(JSON.stringify({ detail: "try later" }), {
-        status: 429, headers: { "content-type": "application/json", "retry-after": "1" },
+        status: 429, headers: { "content-type": "application/json", "retry-after": "60" },
       });
     };
     await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
-      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 10,
-    })).rejects.toMatchObject({ code: "VITRUS_REQUEST_TIMEOUT", timeoutMs: 10 });
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 500,
+    })).rejects.toMatchObject({ code: "VITRUS_REQUEST_TIMEOUT", timeoutMs: 500 });
+    expect(calls).toBe(1);
+  });
+
+  test("does not retry an authorization response with an invalid JSON body", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response("not-json", { status: 401, statusText: "Unauthorized" });
+    };
+    await expect(Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key", endpoint: "https://relay.test", controlPlaneTimeoutMs: 500,
+    })).rejects.toThrow("Vitrus Droid request failed (401): Unauthorized");
     expect(calls).toBe(1);
   });
 

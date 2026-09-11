@@ -1170,20 +1170,43 @@ export class Droid {
   ): Promise<{ ok: boolean; status: number; statusText: string; payload: unknown }> {
     const timeoutMs = this.options.controlPlaneTimeoutMs ?? this.options.timeoutMs ?? 15_000;
     const deadlineMs = Date.now() + timeoutMs;
-    let lastTransportError: unknown;
     for (let attempt = 0; attempt < REGISTRY_DISCOVERY_ATTEMPTS; attempt += 1) {
       const remainingMs = deadlineMs - Date.now();
       if (remainingMs <= 0) throw registryDeadlineError(operation, url, timeoutMs);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), remainingMs);
+      let response: Response;
       try {
-        const response = await fetch(url, {
+        // This is the only operation whose failure enters the transport retry
+        // path: once headers exist, status and body handling are definitive.
+        response = await fetch(url, {
           method: "GET",
           signal: controller.signal,
           headers: { authorization: `Bearer ${this.options.apiKey}` },
         });
+      } catch (error) {
+        clearTimeout(timeout);
+        if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+          throw registryDeadlineError(operation, url, timeoutMs);
+        }
+        if (attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) throw error;
+        const delayMs = REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
+        if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
+        await pauseRegistryRetry(delayMs);
+        continue;
+      }
+
+      try {
         if (!isRetryableRegistryStatus(response.status) || attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) {
-          const payload = await parseRegistryBody(response, controller.signal);
+          let payload: unknown;
+          try {
+            payload = await parseRegistryBody(response, controller.signal);
+          } catch (error) {
+            if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+              throw registryDeadlineError(operation, url, timeoutMs);
+            }
+            throw error;
+          }
           return { ok: response.ok, status: response.status, statusText: response.statusText, payload };
         }
         // The response will not be exposed to a caller, so release its body
@@ -1192,24 +1215,11 @@ export class Droid {
         const delayMs = registryRetryDelayMs(attempt, response);
         if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
         await pauseRegistryRetry(delayMs);
-        continue;
-      } catch (error) {
-        if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
-          throw registryDeadlineError(operation, url, timeoutMs);
-        }
-        lastTransportError = error;
-        if (attempt + 1 === REGISTRY_DISCOVERY_ATTEMPTS) throw error;
       } finally {
         clearTimeout(timeout);
       }
-
-      // Transport failures have no Retry-After value. Use the same bounded
-      // jittered delay as a retryable HTTP registry response.
-      const delayMs = REGISTRY_RETRY_BASE_MS * (2 ** attempt) + Math.floor(Math.random() * 10);
-      if (Date.now() + delayMs >= deadlineMs) throw registryDeadlineError(operation, url, timeoutMs);
-      await pauseRegistryRetry(delayMs);
     }
-    throw lastTransportError ?? registryDeadlineError(operation, url, timeoutMs);
+    throw registryDeadlineError(operation, url, timeoutMs);
   }
 
   private async get<T>(path: string, params: Record<string, string> = {}): Promise<T> {
