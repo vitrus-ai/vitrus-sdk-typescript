@@ -62,7 +62,7 @@ test("complete TCP frames retain all eight fingers at 20/30 deg/s and reject uns
   }, job);
   const frame = (speed: number) => ({controlledChains:["LEFT_ARM", "RIGHT_ARM", "NECK"], targets:["LEFT_ARM", "RIGHT_ARM", "NECK"].map(chain=>({chain,points:[{position_m:[0,0,0] as [number,number,number]}]})), auxiliaryJointTargets:fingers.map(joint_name=>({joint_name,position_deg:0,max_torque_nm:.3,velocity_deg_s:speed}))});
   for (const speed of [20,30]) {
-    await expect(session.updateDeviceIkFrame(frame(speed))).resolves.toEqual({accepted:true});
+    await expect(session.updateDeviceIkFrame(frame(speed))).resolves.toMatchObject({accepted:true,clientInputSequence:expect.any(Number)});
     expect(sent.at(-1)?.auxiliary_joint_targets).toEqual(frame(speed).auxiliaryJointTargets);
   }
   for (const speed of [31,0,NaN]) await expect(session.updateDeviceIkFrame(frame(speed))).rejects.toThrow("velocity_deg_s <= 30");
@@ -102,12 +102,14 @@ test("confirmed frame delivery keeps full scope and source timestamp on the corr
   const session = new MotionJobSession({
     status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
     publishLatestUpdate: (body) => { published.push(body); return { state: "queued" }; },
-    request: async <T>(_path: string, body?: Record<string, unknown>) => { requests.push(body!); return { ok: true, job, result: { accepted: true, input_sequence: body!.sequence } } as T; },
+    // Fixture captured from the public correlated-response projection: the
+    // native command id survives, while result.input_sequence is absent.
+    request: async <T>(_path: string, body?: Record<string, unknown>) => { requests.push(body!); return { ok: true, job, result: { accepted: true, command_id: 77 } } as T; },
   }, job);
   await expect(session.updateDeviceIkFrame({
     controlledChains: ["NECK"], targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] }] }],
     clientCreatedAtMs: 1_000, delivery: "confirmed",
-  })).resolves.toMatchObject({ accepted: true, input_sequence: 1 });
+  })).resolves.toEqual({ accepted: true, command_id: 77, clientInputSequence: 1 });
   expect(published).toEqual([]);
   expect(requests).toHaveLength(1);
   expect(requests[0]).toMatchObject({ sequence: 1, controlled_chains: ["NECK"], client_created_at_ms: 1_000, chain_targets: [{ chain: "NECK" }] });

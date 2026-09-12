@@ -354,7 +354,10 @@ export class MotionJobSession {
       ? { ok: true, job: this.job, result: this.client.publishLatestUpdate(body) } as UpdateResponse
       : await this.client.request<UpdateResponse>("/api/v2/motion/update", body);
     this.job = result.job;
-    return { ...result.result, ...(result.trace_id ? { trace_id: result.trace_id } : {}), ...(result.timing ? { edge_timing: result.timing } : {}) };
+    // This is the sequence serialized in this client request. It identifies the
+    // submitted frame even when a public relay projects a native response that
+    // omits result.input_sequence; it never asserts native execution.
+    return { ...result.result, clientInputSequence: body.sequence, ...(result.trace_id ? { trace_id: result.trace_id } : {}), ...(result.timing ? { edge_timing: result.timing } : {}) };
   }
 
   /** Return through the existing native publisher; completion never stops torque. */
