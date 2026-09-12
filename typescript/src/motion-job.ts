@@ -152,6 +152,8 @@ export type MotionHeartbeatOptions = {
 /** Narrow client boundary consumed by the shared session implementation. */
 export type MotionJobTransport = {
   request<T>(path: string, body?: Record<string, unknown>, method?: "GET" | "POST", timeoutMs?: number): Promise<T>;
+  /** Request a correlated update even when this transport also offers latest-only publication. */
+  requestConfirmed?<T>(path: string, body?: Record<string, unknown>, method?: "GET" | "POST", timeoutMs?: number): Promise<T>;
   status(): Promise<{ ok: true; job: MotionJob | null; service?: string; events?: Array<Record<string, unknown>> }>;
   /** Optional nonblocking, authenticated latest-only frame admission. */
   publishLatestUpdate?(body: Record<string, unknown>, timeoutMs?: number): Record<string, unknown>;
@@ -352,7 +354,9 @@ export class MotionJobSession {
     };
     const result = this.client.supportsLatestUpdates && this.client.publishLatestUpdate && input.delivery !== "confirmed"
       ? { ok: true, job: this.job, result: this.client.publishLatestUpdate(body) } as UpdateResponse
-      : await this.client.request<UpdateResponse>("/api/v2/motion/update", body);
+      : input.delivery === "confirmed" && this.client.requestConfirmed
+        ? await this.client.requestConfirmed<UpdateResponse>("/api/v2/motion/update", body)
+        : await this.client.request<UpdateResponse>("/api/v2/motion/update", body);
     this.job = result.job;
     // This is the sequence serialized in this client request. It identifies the
     // submitted frame even when a public relay projects a native response that

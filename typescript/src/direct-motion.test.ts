@@ -334,3 +334,28 @@ test("latest-only routing is limited to continuous device-IK frames; Hold remain
     "/v1/droids/motion/direct/update",
   ]);
 });
+
+test("confirmed frame delivery bypasses latest routing while retaining latest capability", async () => {
+  const paths: string[] = [];
+  const envelopes: Array<Record<string, unknown>> = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", latestOnlyUpdates: true,
+    fetch: (async (input, init) => {
+      const url = new URL(String(input)); paths.push(url.pathname);
+      const envelope = JSON.parse(String(init?.body)) as Record<string, unknown>; envelopes.push(envelope);
+      if (url.pathname.endsWith("/start")) return response({ ok: true, job: job() });
+      if (url.pathname.endsWith("/update")) return response({ ok: true, job: job("active"), result: { accepted: true, command_id: 77 } });
+      return response({ ok: false, error: `unexpected ${url.pathname}` }, 500);
+    }) as typeof fetch,
+  });
+  expect(client.supportsLatestUpdates).toBe(true);
+  const session = await client.startJob({ mode: "device_ik", owner: "confirmed-test", jointNames: ["NECK_A"] });
+  await expect(session.updateDeviceIkFrame({
+    controlledChains: ["NECK"],
+    targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] }] }],
+    clientCreatedAtMs: 1_000,
+    delivery: "confirmed",
+  })).resolves.toEqual({ accepted: true, command_id: 77, clientInputSequence: 1 });
+  expect(paths).toEqual(["/v1/droids/motion/direct/start", "/v1/droids/motion/direct/update"]);
+  expect(envelopes[1]).toMatchObject({ payload: { sequence: 1, controlled_chains: ["NECK"], client_created_at_ms: 1_000 } });
+});

@@ -221,6 +221,17 @@ export class DirectMotionJobClient implements MotionJobTransport {
   }
 
   /**
+   * Force the correlated update route while retaining this client's separate
+   * latest-only telemetry capability. This is only an Edge response; callers
+   * must still verify native execution independently.
+   */
+  async requestConfirmed<T>(path: string, payload?: Record<string, unknown>, _method: "GET" | "POST" = "POST", timeoutMs?: number): Promise<T> {
+    const operation = OPERATIONS[path];
+    if (!operation) throw new Error(`DirectMotionJobClient does not proxy local route ${path}`);
+    return this.call<T>(operation, payload ?? {}, timeoutMs, true);
+  }
+
+  /**
    * Coalesce continuous setpoints locally before they enter the authenticated
    * public mailbox.  This returns after local admission: native execution is
    * reported later by the existing execution and feedback reads.
@@ -379,7 +390,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
     try { this.options.onLatestUpdate?.(observation); } catch { /* Observer failures cannot affect control. */ }
   }
 
-  private async call<T>(operation: DirectMotionOperation, payload: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+  private async call<T>(operation: DirectMotionOperation, payload: Record<string, unknown>, timeoutMs?: number, forceConfirmed = false): Promise<T> {
     const timeout = boundedTimeout(timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS);
     const requestId = createRequestId();
     const readOnly = operation === "status" || operation === "execution" || operation === "feedback";
@@ -388,7 +399,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
     // Only continuous device-IK frames use the nonblocking mailbox route.
     // Start, stop, hold, heartbeat, safety, and all reads retain their exact
     // correlated Edge result semantics.
-    const path = operation === "update" && this.latestOnlyUpdates && isContinuousDeviceIkFrame(payload)
+    const path = operation === "update" && this.latestOnlyUpdates && !forceConfirmed && isContinuousDeviceIkFrame(payload)
       ? "/v1/droids/motion/direct/latest"
       : `/v1/droids/motion/direct/${operation}`;
     const url = new URL(`${this.endpoint}${path}`);
