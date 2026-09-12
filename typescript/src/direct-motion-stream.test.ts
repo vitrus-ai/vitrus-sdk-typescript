@@ -179,12 +179,14 @@ test("stream coalesces opt-in telemetry so a receipt is never synchronously behi
   ]);
   expect(telemetry.sent).toEqual([
     { type: "authenticate", api_key: "key", client_id: "direct-motion-sdk" },
-    { type: "subscribe", topics: ["telemetry"] },
+    { type: "subscribe", topics: ["telemetry"], telemetry_delivery_window: 4 },
   ]);
   expect(urls).toEqual([
     "wss://dataplane.example/v1/droids/motion/direct/stream?ref=R06",
     "wss://dataplane.example/v1/droids/motion/direct/telemetry/stream?ref=R06",
   ]);
+  // This is intentionally legacy: it omits delivery-window negotiation and
+  // therefore remains unacknowledged even though the SDK requested a window.
   telemetry.message({ type: "subscribed", topics: ["telemetry"] });
   telemetry.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 7, timestamp: "2026-09-11T00:00:00Z" }, received_at_ms: 9_000 });
   telemetry.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 8, timestamp: "2026-09-11T00:00:01Z" }, received_at_ms: 9_001 });
@@ -193,7 +195,9 @@ test("stream coalesces opt-in telemetry so a receipt is never synchronously behi
   control.message({ type: "receipt", request_id: "unrelated", result: { state: "queued" } });
   expect(samples).toEqual([]);
   await Bun.sleep(1);
-  expect(samples).toEqual([{ connectionEpoch: 2, sample: { type: "telemetry", serial: "R06", telemetry: { sequence: 8, timestamp: "2026-09-11T00:00:01Z" }, received_at_ms: 9_001 } }]);
+  expect(samples).toHaveLength(1);
+  expect(samples[0]).toMatchObject({ connectionEpoch: 2, sample: { type: "telemetry", serial: "R06", telemetry: { sequence: 8, timestamp: "2026-09-11T00:00:01Z" }, received_at_ms: 9_001 } });
+  expect(samples[0].callbackDispatchLatencyMs).toBeGreaterThanOrEqual(0);
   client.discardLatestUpdates();
 });
 
@@ -208,6 +212,122 @@ test("queued telemetry is discarded when the direct stream closes", async () => 
   client.discardLatestUpdates();
   await Bun.sleep(1);
   expect(samples).toEqual([]);
+});
+
+test("negotiated telemetry acknowledges each delivery only after its callback settles and stamps local timing", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0;
+  let resolveObserver: (() => void) | undefined;
+  let monotonicNow = 10;
+  const observations: Array<{ receivedAtMonotonicMs: number; callbackDispatchedAtMonotonicMs: number; callbackDispatchLatencyMs: number }> = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    telemetryMonotonicNow: () => monotonicNow,
+    onLatestStreamTelemetry: async (observation) => {
+      observations.push(observation);
+      await new Promise<void>(resolve => { resolveObserver = resolve; });
+    },
+    webSocketFactory: (() => ++connections === 1 ? control : telemetry) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  expect(telemetry.sent[1]).toEqual({ type: "subscribe", topics: ["telemetry"], telemetry_delivery_window: 4 });
+  telemetry.message({ type: "subscribed", topics: ["telemetry"], telemetry_delivery_window: 4 });
+  telemetry.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 1 } });
+  monotonicNow = 17;
+  await Bun.sleep(1);
+  expect(observations).toEqual([expect.objectContaining({ receivedAtMonotonicMs: 10, callbackDispatchedAtMonotonicMs: 17, callbackDispatchLatencyMs: 7 })]);
+  expect(telemetry.sent).toHaveLength(2);
+  resolveObserver?.();
+  await Bun.sleep(1);
+  expect(telemetry.sent[2]).toEqual({ type: "telemetry_ack", delivery_seq: 1 });
+  client.discardLatestUpdates();
+});
+
+test("legacy telemetry remains unacknowledged when Bridge omits delivery_seq", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0; const received: number[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    onLatestStreamTelemetry: observation => { received.push((observation.sample.telemetry as { sequence: number }).sequence); },
+    webSocketFactory: (() => ++connections === 1 ? control : telemetry) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  telemetry.message({ type: "telemetry", telemetry: { sequence: 4 } });
+  await Bun.sleep(1);
+  expect(received).toEqual([4]);
+  expect(telemetry.sent).toEqual([
+    { type: "authenticate", api_key: "key", client_id: "direct-motion-sdk" },
+    { type: "subscribe", topics: ["telemetry"], telemetry_delivery_window: 4 },
+  ]);
+  client.discardLatestUpdates();
+});
+
+test("sequenced telemetry remains legacy until this socket confirms the requested delivery window", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0; const received: number[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    onLatestStreamTelemetry: observation => { received.push((observation.sample.telemetry as { sequence: number }).sequence); },
+    webSocketFactory: (() => ++connections === 1 ? control : telemetry) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  telemetry.message({ type: "subscribed", topics: ["telemetry"], telemetry_delivery_window: 3 });
+  telemetry.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 1 } });
+  await Bun.sleep(1);
+  expect(received).toEqual([1]);
+  expect(telemetry.sent).toHaveLength(2);
+  client.discardLatestUpdates();
+});
+
+test("telemetry delivery negotiation is reset on a replacement socket", async () => {
+  const control = new FakeSocket(); const first = new FakeSocket(); const replacement = new FakeSocket(); let connections = 0;
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    onLatestStreamTelemetry: () => undefined,
+    webSocketFactory: (() => [control, first, replacement][connections++]!) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); first.open(); first.message({ type: "ready" }); await prepared;
+  first.message({ type: "subscribed", topics: ["telemetry"], telemetry_delivery_window: 4 });
+  first.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 1 } });
+  await Bun.sleep(1);
+  expect(first.sent[2]).toEqual({ type: "telemetry_ack", delivery_seq: 1 });
+  first.close();
+  const replacementReady = client.prepareLatestStream(); await Bun.sleep(0); replacement.open(); replacement.message({ type: "ready" }); await replacementReady;
+  replacement.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 2 } });
+  await Bun.sleep(1);
+  // The second socket did not echo the requested window, so it cannot inherit
+  // the first socket's negotiation or ACK its sequenced legacy frame.
+  expect(replacement.sent).toEqual([
+    { type: "authenticate", api_key: "key", client_id: "direct-motion-sdk" },
+    { type: "subscribe", topics: ["telemetry"], telemetry_delivery_window: 4 },
+  ]);
+  client.discardLatestUpdates();
+});
+
+test("sequenced telemetry preserves ACK order when an advisory observer fails", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0; const delivered: number[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    onLatestStreamTelemetry: observation => {
+      const sequence = (observation.sample.telemetry as { sequence: number }).sequence;
+      delivered.push(sequence);
+      if (sequence === 1) throw new Error("observer-only failure");
+    },
+    webSocketFactory: (() => ++connections === 1 ? control : telemetry) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  telemetry.message({ type: "subscribed", topics: ["telemetry"], telemetry_delivery_window: 4 });
+  telemetry.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 1 } });
+  telemetry.message({ type: "telemetry", delivery_seq: 2, telemetry: { sequence: 2 } });
+  await Bun.sleep(3);
+  expect(delivered).toEqual([1, 2]);
+  expect(telemetry.sent.slice(2)).toEqual([
+    { type: "telemetry_ack", delivery_seq: 1 },
+    { type: "telemetry_ack", delivery_seq: 2 },
+  ]);
+  client.discardLatestUpdates();
+});
+
+test("telemetry delivery window is bounded before opening a socket", () => {
+  expect(() => new DirectMotionJobClient({ endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", telemetryDeliveryWindow: 0 })).toThrow("[1, 8]");
+  expect(() => new DirectMotionJobClient({ endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", telemetryDeliveryWindow: 9 })).toThrow("[1, 8]");
 });
 
 test("terminal cleanup rejects a pending prepare immediately and stale socket callbacks cannot revive it", async () => {

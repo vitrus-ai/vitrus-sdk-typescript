@@ -15,7 +15,7 @@ import {
   type MotionJobStartOptions,
   type MotionJobTransport,
 } from "./motion-job.js";
-import { PersistentLatestUpdateStream, type DirectMotionStreamFactory } from "./direct-motion-stream.js";
+import { PersistentLatestUpdateStream, type DirectMotionStreamFactory, type DirectMotionStreamTelemetryTiming } from "./direct-motion-stream.js";
 
 export type DirectMotionOperation =
   | "status"
@@ -54,7 +54,16 @@ export type DirectMotionJobClientOptions = {
   /** Receipt-observation budget; source admission deadline remains 500 ms on wire. */
   latestReceiptTimeoutMs?: number;
   /** Observational telemetry samples delivered on a separate latest-only stream. */
-  onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
+  onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void | Promise<void>;
+  /**
+   * Request Bridge's bounded telemetry acknowledgment protocol for the
+   * dedicated observation socket. The dedicated observation stream defaults
+   * to four; an older Bridge that omits delivery_seq remains unacknowledged.
+   * Values are deliberately limited to Bridge's 1..8 contract.
+   */
+  telemetryDeliveryWindow?: number;
+  /** Injectable only for deterministic local telemetry timing tests. */
+  telemetryMonotonicNow?: () => number;
   /** Injectable only for deterministic WebSocket transport tests. */
   webSocketFactory?: DirectMotionStreamFactory;
   clientId?: string;
@@ -68,6 +77,12 @@ export type LatestStreamTelemetryObservation = {
   sample: Record<string, unknown>;
   /** SDK socket generation; increments only when a new stream is constructed. */
   connectionEpoch: number;
+  /** Local monotonic receipt time. It is not a source or Bridge clock. */
+  receivedAtMonotonicMs: number;
+  /** Local monotonic time immediately before the consumer callback began. */
+  callbackDispatchedAtMonotonicMs: number;
+  /** Local callback queueing latency, never used for control freshness. */
+  callbackDispatchLatencyMs: number;
 };
 
 export type LatestUpdateObservation = {
@@ -144,6 +159,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
   private telemetryStream: PersistentLatestUpdateStream | null = null;
   private latestStreamEpoch = 0;
   private readonly now: () => number;
+  private readonly telemetryDeliveryWindow: number | undefined;
 
   constructor(private readonly options: DirectMotionJobClientOptions) {
     this.endpoint = options.endpoint.replace(/\/+$/, "");
@@ -159,6 +175,10 @@ export class DirectMotionJobClient implements MotionJobTransport {
     this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? (this.latestTransport === "websocket" ? 16 : 1), this.latestTransport === "websocket" ? 16 : 4);
     this.latestStreamReadyTimeoutMs = boundedStreamReadyTimeout(options.latestStreamReadyTimeoutMs ?? 2_000);
     this.latestReceiptTimeoutMs = boundedReceiptTimeout(options.latestReceiptTimeoutMs ?? 2_000);
+    // This applies only to the separately authenticated telemetry socket.
+    // Older Bridges ignore the additive subscribe field and omit delivery_seq,
+    // in which case the stream deliberately sends no ACKs.
+    this.telemetryDeliveryWindow = boundedTelemetryDeliveryWindow(options.telemetryDeliveryWindow ?? 4);
     this.webSocketFactory = options.webSocketFactory ?? (typeof WebSocket === "undefined" ? null : (url) => new WebSocket(url));
     if (this.latestTransport === "websocket" && !this.webSocketFactory) throw new Error("latest websocket transport requires WebSocket support or webSocketFactory");
     this.now = options.now ?? Date.now;
@@ -365,7 +385,9 @@ export class DirectMotionJobClient implements MotionJobTransport {
       url: url.toString(), apiKey: this.apiKey, clientId: this.options.clientId ?? "direct-motion-sdk",
       factory: this.webSocketFactory!, readyTimeoutMs: this.latestStreamReadyTimeoutMs,
       onReady: () => undefined,
-      onTelemetry: (sample) => this.options.onLatestStreamTelemetry?.({ sample, connectionEpoch }),
+      onTelemetry: (sample, timing: DirectMotionStreamTelemetryTiming) => this.options.onLatestStreamTelemetry?.({ sample, connectionEpoch, ...timing }),
+      telemetryDeliveryWindow: this.telemetryDeliveryWindow,
+      monotonicNow: this.options.telemetryMonotonicNow,
       // Observation transport loss never makes a pending control frame look
       // rejected or unknown. Direct receipts retain their own connection.
       onLost: () => { if (this.telemetryStream === stream) this.telemetryStream = null; },
@@ -557,6 +579,10 @@ function boundedStreamReadyTimeout(value: number): number {
 }
 function boundedReceiptTimeout(value: number): number {
   if (!Number.isFinite(value) || value < LATEST_SOURCE_DEADLINE_MS || value > 10_000) throw new RangeError("latestReceiptTimeoutMs must be a finite value in [500, 10000]");
+  return Math.trunc(value);
+}
+function boundedTelemetryDeliveryWindow(value: number): number {
+  if (!Number.isFinite(value) || value < 1 || value > 8) throw new RangeError("telemetryDeliveryWindow must be a finite value in [1, 8]");
   return Math.trunc(value);
 }
 

@@ -586,7 +586,9 @@ export type DroidConnectionOptions = {
   /** Receipt observation budget; this does not extend source target freshness. */
   directLatestReceiptTimeoutMs?: number;
   /** Observational telemetry multiplexed on the prepared direct latest stream. */
-  directOnLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
+  directOnLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void | Promise<void>;
+  /** Bounded ACK window for the separate public direct telemetry socket (1..8). */
+  directTelemetryDeliveryWindow?: number;
   /** @deprecated Use controlPlaneTimeoutMs. */
   timeoutMs?: number;
   clientId?: string;
@@ -1055,6 +1057,7 @@ export class Droid {
         latestStreamReadyTimeoutMs: this.options.directLatestStreamReadyTimeoutMs,
         latestReceiptTimeoutMs: this.options.directLatestReceiptTimeoutMs,
         onLatestStreamTelemetry: this.options.directOnLatestStreamTelemetry,
+        telemetryDeliveryWindow: this.options.directTelemetryDeliveryWindow,
         webSocketFactory: this.options.webSocketFactory,
         clientId: this.clientId,
       }),

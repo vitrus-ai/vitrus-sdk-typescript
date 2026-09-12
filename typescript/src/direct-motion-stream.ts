@@ -1,6 +1,16 @@
 export type DirectMotionStreamSocket = Pick<WebSocket, "send" | "close" | "addEventListener" | "bufferedAmount">;
 export type DirectMotionStreamFactory = (url: string) => DirectMotionStreamSocket;
 
+/** Local timing captured after a public telemetry frame reaches this SDK. */
+export type DirectMotionStreamTelemetryTiming = {
+  /** Monotonic SDK clock when the WebSocket message event was received. */
+  receivedAtMonotonicMs: number;
+  /** Monotonic SDK clock immediately before the observer was invoked. */
+  callbackDispatchedAtMonotonicMs: number;
+  /** Local queueing time only; it is not comparable to a source timestamp. */
+  callbackDispatchLatencyMs: number;
+};
+
 type Pending = { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 /**
@@ -13,17 +23,26 @@ export class PersistentLatestUpdateStream {
   private connecting: Promise<void> | null = null;
   private connectingReject: ((error: Error) => void) | null = null;
   private readonly pending = new Map<string, Pending>();
-  // Telemetry is observational. Keep at most one callback queued so a busy
-  // application observer cannot make receipt dispatch wait behind every motor
-  // snapshot on this same WebSocket.
-  private latestTelemetry: Record<string, unknown> | null = null;
+  // Legacy telemetry has no delivery acknowledgement, so retain only the
+  // latest callback. Negotiated telemetry is bounded by the peer's delivery
+  // window and each frame must be observed before it is acknowledged.
+  private latestTelemetry: { message: Record<string, unknown>; receivedAtMonotonicMs: number } | null = null;
+  private readonly acknowledgedTelemetry: Array<{ message: Record<string, unknown>; deliverySeq: number; receivedAtMonotonicMs: number }> = [];
   private telemetryDispatchTimer: ReturnType<typeof setTimeout> | null = null;
+  private telemetryDispatching = false;
+  // This is set only by this socket's explicit Bridge subscription response.
+  // A request alone is not protocol negotiation: older Bridges may ignore it.
+  private negotiatedTelemetryDeliveryWindow: number | undefined;
   private closed = false;
 
   constructor(private readonly options: {
     url: string; apiKey: string; clientId: string; factory: DirectMotionStreamFactory;
     onReady: () => void; onLost: (error: Error) => void; readyTimeoutMs: number;
-    onTelemetry?: (sample: Record<string, unknown>) => void;
+    onTelemetry?: (sample: Record<string, unknown>, timing: DirectMotionStreamTelemetryTiming) => void | Promise<void>;
+    /** Additive protocol capability. Omit it for a legacy telemetry stream. */
+    telemetryDeliveryWindow?: number;
+    /** Injectable only for deterministic timing tests. */
+    monotonicNow?: () => number;
   }) {}
 
   get ready(): boolean { return this.readyValue; }
@@ -72,13 +91,26 @@ export class PersistentLatestUpdateStream {
             // Telemetry is opt-in and has its own Bridge mailbox. Subscribe once
             // for this authenticated socket before the caller can publish targets.
             if (this.options.onTelemetry) {
-              try { socket.send(JSON.stringify({ type: "subscribe", topics: ["telemetry"] })); }
+              const subscribe: Record<string, unknown> = { type: "subscribe", topics: ["telemetry"] };
+              if (this.options.telemetryDeliveryWindow !== undefined) subscribe.telemetry_delivery_window = this.options.telemetryDeliveryWindow;
+              try { socket.send(JSON.stringify(subscribe)); }
               catch (error) { fail(error instanceof Error ? error : new Error(String(error))); return; }
             }
             resolve(); this.options.onReady(); return;
           }
           if (message.type === "telemetry") {
             this.queueTelemetry(message, socket);
+            return;
+          }
+          if (message.type === "subscribed") {
+            const window = message.telemetry_delivery_window;
+            this.negotiatedTelemetryDeliveryWindow = this.options.onTelemetry
+              && window === this.options.telemetryDeliveryWindow
+              && Number.isSafeInteger(window)
+              && (window as number) >= 1
+              && (window as number) <= 8
+              ? window as number
+              : undefined;
             return;
           }
           if (message.type === "receipt" && typeof message.request_id === "string") {
@@ -151,24 +183,85 @@ export class PersistentLatestUpdateStream {
 
   private queueTelemetry(message: Record<string, unknown>, socket: DirectMotionStreamSocket): void {
     if (!this.options.onTelemetry) return;
-    this.latestTelemetry = message;
+    const receivedAtMonotonicMs = this.monotonicNow();
+    const deliverySeq = message.delivery_seq;
+    if (Number.isSafeInteger(deliverySeq) && (deliverySeq as number) > 0) {
+      const window = this.negotiatedTelemetryDeliveryWindow;
+      // A sequence from a server that did not negotiate a bounded window is
+      // observational legacy data. Do not send an unsolicited acknowledgement.
+      if (window !== undefined) {
+        if (this.acknowledgedTelemetry.length >= window) {
+          this.failTelemetryLane(socket, new Error("telemetry delivery window exceeded before callback acknowledgment"));
+          return;
+        }
+        this.acknowledgedTelemetry.push({ message, deliverySeq: deliverySeq as number, receivedAtMonotonicMs });
+        this.scheduleTelemetryDispatch(socket);
+        return;
+      }
+    }
+    this.latestTelemetry = { message, receivedAtMonotonicMs };
+    this.scheduleTelemetryDispatch(socket);
+  }
+
+  private scheduleTelemetryDispatch(socket: DirectMotionStreamSocket): void {
     if (this.telemetryDispatchTimer !== null) return;
     this.telemetryDispatchTimer = setTimeout(() => {
       this.telemetryDispatchTimer = null;
-      const telemetry = this.latestTelemetry;
-      this.latestTelemetry = null;
-      // A stale browser task must not publish observations after this stream
-      // has failed or been replaced.
-      if (telemetry && this.socket === socket && this.readyValue && !this.closed) {
-        // Telemetry is advisory. A consumer exception must not escape a timer
-        // task and destabilize the direct-control receipt stream.
-        try { this.options.onTelemetry?.(telemetry); } catch { /* advisory observer failure */ }
-      }
+      void this.dispatchTelemetry(socket);
     }, 0);
+  }
+
+  private async dispatchTelemetry(socket: DirectMotionStreamSocket): Promise<void> {
+    if (this.telemetryDispatching || this.socket !== socket || !this.readyValue || this.closed) return;
+    const acknowledged = this.acknowledgedTelemetry[0];
+    const legacy = acknowledged ? null : this.latestTelemetry;
+    if (legacy) this.latestTelemetry = null;
+    const item = acknowledged ?? legacy;
+    if (!item) return;
+    this.telemetryDispatching = true;
+    const callbackDispatchedAtMonotonicMs = this.monotonicNow();
+    const timing: DirectMotionStreamTelemetryTiming = {
+      receivedAtMonotonicMs: item.receivedAtMonotonicMs,
+      callbackDispatchedAtMonotonicMs,
+      callbackDispatchLatencyMs: Math.max(0, callbackDispatchedAtMonotonicMs - item.receivedAtMonotonicMs),
+    };
+    try {
+      // Telemetry observer errors are advisory, but the attempted callback is
+      // complete before ACK so Bridge can safely advance its bounded window.
+      try { await this.options.onTelemetry?.(item.message, timing); } catch { /* advisory observer failure */ }
+      if (acknowledged && this.socket === socket && this.readyValue && !this.closed) {
+        try {
+          socket.send(JSON.stringify({ type: "telemetry_ack", delivery_seq: acknowledged.deliverySeq }));
+          // Keep an in-flight delivery in the window until its callback has
+          // settled and its ACK was actually handed to the socket.
+          this.acknowledgedTelemetry.shift();
+        }
+        catch (error) { this.failTelemetryLane(socket, error instanceof Error ? error : new Error(String(error))); return; }
+      }
+    } finally {
+      this.telemetryDispatching = false;
+      if ((this.acknowledgedTelemetry.length > 0 || this.latestTelemetry !== null) && this.socket === socket && this.readyValue && !this.closed) this.scheduleTelemetryDispatch(socket);
+    }
+  }
+
+  private failTelemetryLane(socket: DirectMotionStreamSocket, error: Error): void {
+    if (this.socket !== socket) return;
+    this.readyValue = false;
+    this.socket = null;
+    this.clearQueuedTelemetry();
+    try { socket.close(1011, "telemetry stream unavailable"); } catch { /* best effort */ }
+    this.options.onLost(error);
+  }
+
+  private monotonicNow(): number {
+    if (this.options.monotonicNow) return this.options.monotonicNow();
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
   }
 
   private clearQueuedTelemetry(): void {
     this.latestTelemetry = null;
+    this.acknowledgedTelemetry.length = 0;
+    this.negotiatedTelemetryDeliveryWindow = undefined;
     if (this.telemetryDispatchTimer !== null) clearTimeout(this.telemetryDispatchTimer);
     this.telemetryDispatchTimer = null;
   }
