@@ -164,21 +164,50 @@ test("Droid.connect forwards explicit latest WebSocket options to direct motion 
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test("stream forwards opt-in read-only telemetry frames without treating them as receipts", async () => {
-  const socket = new FakeSocket(); const samples: Array<{ sample: Record<string, unknown>; connectionEpoch: number }> = [];
+test("stream coalesces opt-in telemetry so a receipt is never synchronously behind observer work", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0; const urls: string[] = []; const samples: Array<{ sample: Record<string, unknown>; connectionEpoch: number }> = [];
   const client = new DirectMotionJobClient({
     endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
-    onLatestStreamTelemetry: (sample) => samples.push(sample), webSocketFactory: (() => socket) as never,
+    onLatestStreamTelemetry: (sample) => samples.push(sample), webSocketFactory: ((url) => { urls.push(url); return ++connections === 1 ? control : telemetry; }) as never,
   });
-  const prepared = client.prepareLatestStream(); socket.open(); socket.message({ type: "ready" }); await prepared;
-  expect(socket.sent).toEqual([
+  // The direct-control stream is authenticated without a telemetry
+  // subscription. The telemetry-only stream authenticates separately.
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0);
+  telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  expect(control.sent).toEqual([
+    { type: "authenticate", api_key: "key", client_id: "direct-motion-sdk" },
+  ]);
+  expect(telemetry.sent).toEqual([
     { type: "authenticate", api_key: "key", client_id: "direct-motion-sdk" },
     { type: "subscribe", topics: ["telemetry"] },
   ]);
-  socket.message({ type: "subscribed", topics: ["telemetry"] });
-  socket.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 7, timestamp: "2026-09-11T00:00:00Z" }, received_at_ms: 9_000 });
-  expect(samples).toEqual([{ connectionEpoch: 1, sample: { type: "telemetry", serial: "R06", telemetry: { sequence: 7, timestamp: "2026-09-11T00:00:00Z" }, received_at_ms: 9_000 } }]);
+  expect(urls).toEqual([
+    "wss://dataplane.example/v1/droids/motion/direct/stream?ref=R06",
+    "wss://dataplane.example/v1/droids/motion/direct/telemetry/stream?ref=R06",
+  ]);
+  telemetry.message({ type: "subscribed", topics: ["telemetry"] });
+  telemetry.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 7, timestamp: "2026-09-11T00:00:00Z" }, received_at_ms: 9_000 });
+  telemetry.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 8, timestamp: "2026-09-11T00:00:01Z" }, received_at_ms: 9_001 });
+  expect(samples).toEqual([]);
+  // Receipt handling remains synchronous and does not wait for a UI observer.
+  control.message({ type: "receipt", request_id: "unrelated", result: { state: "queued" } });
+  expect(samples).toEqual([]);
+  await Bun.sleep(1);
+  expect(samples).toEqual([{ connectionEpoch: 2, sample: { type: "telemetry", serial: "R06", telemetry: { sequence: 8, timestamp: "2026-09-11T00:00:01Z" }, received_at_ms: 9_001 } }]);
   client.discardLatestUpdates();
+});
+
+test("queued telemetry is discarded when the direct stream closes", async () => {
+  const control = new FakeSocket(); const telemetry = new FakeSocket(); let connections = 0; const samples: Record<string, unknown>[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket",
+    onLatestStreamTelemetry: (sample) => samples.push(sample), webSocketFactory: (() => ++connections === 1 ? control : telemetry) as never,
+  });
+  const prepared = client.prepareLatestStream(); control.open(); control.message({ type: "ready" }); await Bun.sleep(0); telemetry.open(); telemetry.message({ type: "ready" }); await prepared;
+  telemetry.message({ type: "telemetry", serial: "R06", telemetry: { sequence: 7 } });
+  client.discardLatestUpdates();
+  await Bun.sleep(1);
+  expect(samples).toEqual([]);
 });
 
 test("terminal cleanup rejects a pending prepare immediately and stale socket callbacks cannot revive it", async () => {

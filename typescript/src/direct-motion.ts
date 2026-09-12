@@ -53,7 +53,7 @@ export type DirectMotionJobClientOptions = {
   latestStreamReadyTimeoutMs?: number;
   /** Receipt-observation budget; source admission deadline remains 500 ms on wire. */
   latestReceiptTimeoutMs?: number;
-  /** Observational telemetry samples multiplexed by the direct-update stream. */
+  /** Observational telemetry samples delivered on a separate latest-only stream. */
   onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
   /** Injectable only for deterministic WebSocket transport tests. */
   webSocketFactory?: DirectMotionStreamFactory;
@@ -141,6 +141,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
   private readonly latestReceiptTimeoutMs: number;
   private readonly webSocketFactory: DirectMotionStreamFactory | null;
   private latestStream: PersistentLatestUpdateStream | null = null;
+  private telemetryStream: PersistentLatestUpdateStream | null = null;
   private latestStreamEpoch = 0;
   private readonly now: () => number;
 
@@ -251,6 +252,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
   async prepareLatestStream(): Promise<void> {
     if (!this.latestOnlyUpdates || this.latestTransport !== "websocket") throw new Error("latest WebSocket transport was not enabled");
     await this.ensureLatestStream().connect();
+    if (this.options.onLatestStreamTelemetry) await this.ensureTelemetryStream().connect();
   }
 
   async drainLatestUpdates(): Promise<void> {
@@ -274,6 +276,8 @@ export class DirectMotionJobClient implements MotionJobTransport {
     this.latestPending = null;
     this.latestStream?.close();
     this.latestStream = null;
+    this.telemetryStream?.close();
+    this.telemetryStream = null;
   }
 
   /** Latest public receipt; it is not a native/physical command acknowledgement. */
@@ -326,9 +330,6 @@ export class DirectMotionJobClient implements MotionJobTransport {
         url: url.toString(), apiKey: this.apiKey, clientId: this.options.clientId ?? "direct-motion-sdk",
         factory: this.webSocketFactory!, readyTimeoutMs: this.latestStreamReadyTimeoutMs,
         onReady: () => this.pumpLatestUpdates(),
-        onTelemetry: this.options.onLatestStreamTelemetry
-          ? (sample) => this.options.onLatestStreamTelemetry?.({ sample, connectionEpoch })
-          : undefined,
         onLost: (error) => {
           if (this.latestStream !== stream) return;
           this.latestStream = null;
@@ -340,6 +341,27 @@ export class DirectMotionJobClient implements MotionJobTransport {
       void stream.connect().catch(() => undefined);
     }
     return this.latestStream;
+  }
+
+  private ensureTelemetryStream(): PersistentLatestUpdateStream {
+    if (this.telemetryStream) return this.telemetryStream;
+    const url = new URL(`${this.endpoint}/v1/droids/motion/direct/telemetry/stream`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("ref", this.ref);
+    const connectionEpoch = ++this.latestStreamEpoch;
+    let stream: PersistentLatestUpdateStream;
+    stream = new PersistentLatestUpdateStream({
+      url: url.toString(), apiKey: this.apiKey, clientId: this.options.clientId ?? "direct-motion-sdk",
+      factory: this.webSocketFactory!, readyTimeoutMs: this.latestStreamReadyTimeoutMs,
+      onReady: () => undefined,
+      onTelemetry: (sample) => this.options.onLatestStreamTelemetry?.({ sample, connectionEpoch }),
+      // Observation transport loss never makes a pending control frame look
+      // rejected or unknown. Direct receipts retain their own connection.
+      onLost: () => { if (this.telemetryStream === stream) this.telemetryStream = null; },
+    });
+    this.telemetryStream = stream;
+    void stream.connect().catch(() => undefined);
+    return stream;
   }
 
   private publishLatestObservation(observation: LatestUpdateObservation): void {

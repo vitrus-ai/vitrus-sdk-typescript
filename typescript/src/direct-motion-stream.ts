@@ -13,6 +13,11 @@ export class PersistentLatestUpdateStream {
   private connecting: Promise<void> | null = null;
   private connectingReject: ((error: Error) => void) | null = null;
   private readonly pending = new Map<string, Pending>();
+  // Telemetry is observational. Keep at most one callback queued so a busy
+  // application observer cannot make receipt dispatch wait behind every motor
+  // snapshot on this same WebSocket.
+  private latestTelemetry: Record<string, unknown> | null = null;
+  private telemetryDispatchTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
 
   constructor(private readonly options: {
@@ -40,6 +45,7 @@ export class PersistentLatestUpdateStream {
         // Clear first because some WebSocket implementations synchronously emit close().
         const socket = this.socket;
         this.socket = null;
+        this.clearQueuedTelemetry();
         try { socket?.close(1011, "latest stream unavailable"); } catch { /* best effort */ }
         rejectConnecting?.(error);
         this.failAll(error);
@@ -72,7 +78,7 @@ export class PersistentLatestUpdateStream {
             resolve(); this.options.onReady(); return;
           }
           if (message.type === "telemetry") {
-            this.options.onTelemetry?.(message);
+            this.queueTelemetry(message, socket);
             return;
           }
           if (message.type === "receipt" && typeof message.request_id === "string") {
@@ -131,6 +137,7 @@ export class PersistentLatestUpdateStream {
     const socket = this.socket;
     // A pending explicit prepare must complete immediately on terminal cleanup.
     this.socket = null; this.connecting = null;
+    this.clearQueuedTelemetry();
     const rejectConnecting = this.connectingReject; this.connectingReject = null;
     rejectConnecting?.(error);
     this.failAll(error);
@@ -140,5 +147,29 @@ export class PersistentLatestUpdateStream {
   private failAll(error: Error): void {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
     this.pending.clear();
+  }
+
+  private queueTelemetry(message: Record<string, unknown>, socket: DirectMotionStreamSocket): void {
+    if (!this.options.onTelemetry) return;
+    this.latestTelemetry = message;
+    if (this.telemetryDispatchTimer !== null) return;
+    this.telemetryDispatchTimer = setTimeout(() => {
+      this.telemetryDispatchTimer = null;
+      const telemetry = this.latestTelemetry;
+      this.latestTelemetry = null;
+      // A stale browser task must not publish observations after this stream
+      // has failed or been replaced.
+      if (telemetry && this.socket === socket && this.readyValue && !this.closed) {
+        // Telemetry is advisory. A consumer exception must not escape a timer
+        // task and destabilize the direct-control receipt stream.
+        try { this.options.onTelemetry?.(telemetry); } catch { /* advisory observer failure */ }
+      }
+    }, 0);
+  }
+
+  private clearQueuedTelemetry(): void {
+    this.latestTelemetry = null;
+    if (this.telemetryDispatchTimer !== null) clearTimeout(this.telemetryDispatchTimer);
+    this.telemetryDispatchTimer = null;
   }
 }
