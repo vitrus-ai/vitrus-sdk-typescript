@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "temporary validate Droid SDK",
+			"type": "shell",
+			"command": "cd typescript && bun run build && bun test",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "temporary package SDK and validate web app",
+			"type": "shell",
+			"command": "npm pack ./typescript --pack-destination /Users/lucas-vitrus/Documents/GitHub/web_app/vendor && cd /Users/lucas-vitrus/Documents/GitHub/web_app && npm_config_cache=\"$TMPDIR/npm-cache-web-app\" npm install ./vendor/vitrus-0.2.8.tgz && npm run build",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}

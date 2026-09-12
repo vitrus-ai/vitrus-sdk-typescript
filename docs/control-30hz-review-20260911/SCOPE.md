@@ -1,0 +1,1 @@
+Engineering analysis and WIP checkpoint. No runtime deployment or physical qualification is implied. Full evidence resides in the Vitrus SDK apps repository docs/control-30hz-review-20260911. Source snapshots and raw historical media have different retention policies; see checkpoint manifest.
