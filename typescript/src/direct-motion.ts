@@ -15,6 +15,7 @@ import {
   type MotionJobStartOptions,
   type MotionJobTransport,
 } from "./motion-job.js";
+import { PersistentLatestUpdateStream, type DirectMotionStreamFactory } from "./direct-motion-stream.js";
 
 export type DirectMotionOperation =
   | "status"
@@ -44,11 +45,27 @@ export type DirectMotionJobClientOptions = {
   onLatestUpdate?: (observation: LatestUpdateObservation) => void;
   /** Maximum local queue age before an unsent frame is discarded. */
   latestPendingMaxAgeMs?: number;
-  /** Maximum concurrent public latest-update requests. Requires Bridge sequence watermarking. */
+  /** Maximum concurrent public latest-update receipts. HTTP defaults to one; WebSocket defaults to sixteen. */
   latestMaxInFlight?: number;
+  /** Use a persistent authenticated WebSocket for optional latest-only frames. */
+  latestTransport?: "http" | "websocket";
+  /** Separate bounded readiness budget for an explicitly prepared WebSocket. */
+  latestStreamReadyTimeoutMs?: number;
+  /** Observational telemetry samples multiplexed by the direct-update stream. */
+  onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
+  /** Injectable only for deterministic WebSocket transport tests. */
+  webSocketFactory?: DirectMotionStreamFactory;
+  clientId?: string;
   /** Injectable only for deterministic transport tests. */
   now?: () => number;
   fetch?: typeof globalThis.fetch;
+};
+
+export type LatestStreamTelemetryObservation = {
+  /** Raw public Bridge telemetry frame; its source timestamps remain unchanged. */
+  sample: Record<string, unknown>;
+  /** SDK socket generation; increments only when a new stream is constructed. */
+  connectionEpoch: number;
 };
 
 export type LatestUpdateObservation = {
@@ -117,6 +134,11 @@ export class DirectMotionJobClient implements MotionJobTransport {
   private latestObservation: LatestUpdateObservation | null = null;
   private readonly latestPendingMaxAgeMs: number;
   private readonly latestMaxInFlight: number;
+  private readonly latestTransport: "http" | "websocket";
+  private readonly latestStreamReadyTimeoutMs: number;
+  private readonly webSocketFactory: DirectMotionStreamFactory | null;
+  private latestStream: PersistentLatestUpdateStream | null = null;
+  private latestStreamEpoch = 0;
   private readonly now: () => number;
 
   constructor(private readonly options: DirectMotionJobClientOptions) {
@@ -128,9 +150,12 @@ export class DirectMotionJobClient implements MotionJobTransport {
     this.latestOnlyUpdates = options.latestOnlyUpdates ?? false;
     this.supportsLatestUpdates = this.latestOnlyUpdates;
     this.latestPendingMaxAgeMs = boundedPendingAge(options.latestPendingMaxAgeMs ?? 500);
-    // One request preserves existing behavior; callers may explicitly select two
-    // after Bridge sequencing is verified. The Bridge rejects lower sequences.
-    this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? 1);
+    this.latestTransport = options.latestTransport ?? "http";
+    // Stream receipts are independent; the mailbox remains one pending merged frame.
+    this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? (this.latestTransport === "websocket" ? 16 : 1), this.latestTransport === "websocket" ? 16 : 4);
+    this.latestStreamReadyTimeoutMs = boundedStreamReadyTimeout(options.latestStreamReadyTimeoutMs ?? 2_000);
+    this.webSocketFactory = options.webSocketFactory ?? (typeof WebSocket === "undefined" ? null : (url) => new WebSocket(url));
+    if (this.latestTransport === "websocket" && !this.webSocketFactory) throw new Error("latest websocket transport requires WebSocket support or webSocketFactory");
     this.now = options.now ?? Date.now;
     if (!this.endpoint) throw new Error("DirectMotionJobClient requires a public dataplane endpoint");
     this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
@@ -218,6 +243,12 @@ export class DirectMotionJobClient implements MotionJobTransport {
     };
   }
 
+  /** Authenticate the optional stream before DRIVE target publication. */
+  async prepareLatestStream(): Promise<void> {
+    if (!this.latestOnlyUpdates || this.latestTransport !== "websocket") throw new Error("latest WebSocket transport was not enabled");
+    await this.ensureLatestStream().connect();
+  }
+
   async drainLatestUpdates(): Promise<void> {
     while (this.latestInFlight.size || this.latestPending) {
       if (this.latestInFlight.size) await Promise.race(this.latestInFlight);
@@ -237,6 +268,8 @@ export class DirectMotionJobClient implements MotionJobTransport {
    */
   discardLatestUpdates(): void {
     this.latestPending = null;
+    this.latestStream?.close();
+    this.latestStream = null;
   }
 
   /** Latest public receipt; it is not a native/physical command acknowledgement. */
@@ -245,6 +278,10 @@ export class DirectMotionJobClient implements MotionJobTransport {
   }
 
   private pumpLatestUpdates(): void {
+    if (this.latestTransport === "websocket" && this.latestPending) {
+      const stream = this.ensureLatestStream();
+      if (!stream.ready) { void stream.connect().catch(() => undefined); return; }
+    }
     while (this.latestInFlight.size < this.latestMaxInFlight && this.latestPending) {
       const next = this.latestPending;
       this.latestPending = null;
@@ -253,31 +290,52 @@ export class DirectMotionJobClient implements MotionJobTransport {
       const jobId = typeof next.payload.job_id === "string" ? next.payload.job_id : null;
       const now = this.now();
       if (payload === null) {
-        this.publishLatestObservation({
-          jobId, inputSequence, state: "failed", sentAtMs: next.createdAtMs, observedAtMs: now,
-          error: `latest direct-motion update expired locally before public delivery`,
-        });
+        this.publishLatestObservation({ jobId, inputSequence, state: "failed", sentAtMs: next.createdAtMs, observedAtMs: now, error: "latest direct-motion update expired locally before public delivery" });
         continue;
       }
       const sentAtMs = now;
       this.publishLatestObservation({ jobId, inputSequence, state: "sending", sentAtMs, observedAtMs: sentAtMs });
+      const timeoutMs = Math.min(next.timeoutMs ?? LATEST_SOURCE_DEADLINE_MS, LATEST_SOURCE_DEADLINE_MS);
       let request!: Promise<void>;
-      // Keep the wire deadline aligned with per-fragment source expiry.  The
-      // app's broad correlated-control timeout must not turn this into a
-      // multi-second latest-only queue after the SDK has already admitted it.
-      request = this.call<Record<string, unknown>>("update", payload, Math.min(next.timeoutMs ?? LATEST_SOURCE_DEADLINE_MS, LATEST_SOURCE_DEADLINE_MS))
-        .then((receipt) => {
-          this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt });
-        }, (error) => {
-          this.latestError = error;
-          this.publishLatestObservation({ jobId, inputSequence, state: "failed", sentAtMs, observedAtMs: this.now(), error: error instanceof Error ? error.message : String(error) });
-        })
-        .finally(() => {
-          this.latestInFlight.delete(request);
-          this.pumpLatestUpdates();
-        });
+      const receipt = this.latestTransport === "websocket"
+        ? this.latestStream!.submit(createRequestId(), payload, timeoutMs)
+        : this.call<Record<string, unknown>>("update", payload, timeoutMs);
+      request = receipt.then((value) => {
+        this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt: value });
+      }, (error) => {
+        this.latestError = error;
+        this.publishLatestObservation({ jobId, inputSequence, state: "failed", sentAtMs, observedAtMs: this.now(), error: error instanceof Error ? error.message : String(error) });
+      }).finally(() => { this.latestInFlight.delete(request); this.pumpLatestUpdates(); });
       this.latestInFlight.add(request);
     }
+  }
+
+  private ensureLatestStream(): PersistentLatestUpdateStream {
+    if (this.latestStream) return this.latestStream;
+    if (!this.latestStream) {
+      const url = new URL(`${this.endpoint}/v1/droids/motion/direct/stream`);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.searchParams.set("ref", this.ref);
+      const connectionEpoch = ++this.latestStreamEpoch;
+      let stream: PersistentLatestUpdateStream;
+      stream = new PersistentLatestUpdateStream({
+        url: url.toString(), apiKey: this.apiKey, clientId: this.options.clientId ?? "direct-motion-sdk",
+        factory: this.webSocketFactory!, readyTimeoutMs: this.latestStreamReadyTimeoutMs,
+        onReady: () => this.pumpLatestUpdates(),
+        onTelemetry: this.options.onLatestStreamTelemetry
+          ? (sample) => this.options.onLatestStreamTelemetry?.({ sample, connectionEpoch })
+          : undefined,
+        onLost: (error) => {
+          if (this.latestStream !== stream) return;
+          this.latestStream = null;
+          const pending = this.latestPending; this.latestPending = null;
+          if (pending) this.publishLatestObservation({ jobId: typeof pending.payload.job_id === "string" ? pending.payload.job_id : null, inputSequence: typeof pending.payload.sequence === "number" ? pending.payload.sequence : null, state: "failed", sentAtMs: pending.createdAtMs, observedAtMs: this.now(), error: error.message });
+        },
+      });
+      this.latestStream = stream;
+      void stream.connect().catch(() => undefined);
+    }
+    return this.latestStream;
   }
 
   private publishLatestObservation(observation: LatestUpdateObservation): void {
@@ -450,10 +508,14 @@ function boundedPendingAge(value: number): number {
   return Math.trunc(value);
 }
 
-function boundedLatestInFlight(value: number): number {
-  if (!Number.isFinite(value) || value < 1 || value > 4) {
-    throw new RangeError("latestMaxInFlight must be a finite value in [1, 4]");
+function boundedLatestInFlight(value: number, maximum: number): number {
+  if (!Number.isFinite(value) || value < 1 || value > maximum) {
+    throw new RangeError(`latestMaxInFlight must be a finite value in [1, ${maximum}]`);
   }
+  return Math.trunc(value);
+}
+function boundedStreamReadyTimeout(value: number): number {
+  if (!Number.isFinite(value) || value < 50 || value > 10_000) throw new RangeError("latestStreamReadyTimeoutMs must be a finite value in [50, 10000]");
   return Math.trunc(value);
 }
 

@@ -14,7 +14,7 @@ import {
   type EffectorInstance,
 } from "./effectors.js";
 import { GoldenEdgeClient } from "./golden-edge.js";
-import { DirectMotionJobClient, type LatestUpdateObservation } from "./direct-motion.js";
+import { DirectMotionJobClient, type LatestStreamTelemetryObservation, type LatestUpdateObservation } from "./direct-motion.js";
 import { observeCameraFrames, type CameraObservationOptions, type LiveCameraFrame } from "./camera-live.js";
 import { DeviceModulesClient, type DeviceModuleCatalog, type ModuleConfigureResult } from "./device-modules.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
@@ -577,8 +577,14 @@ export type DroidConnectionOptions = {
   directLatestOnlyUpdates?: boolean;
   /** Public latest-only target receipt/failure observation. */
   directOnLatestUpdate?: (observation: LatestUpdateObservation) => void;
-  /** Optional bounded public latest requests; defaults to one for compatibility. */
+  /** Optional bounded public latest receipts; WebSocket defaults to sixteen. */
   directLatestMaxInFlight?: number;
+  /** Opt into the public persistent latest-update WebSocket. HTTP remains the default. */
+  directLatestTransport?: "http" | "websocket";
+  /** Readiness budget for an explicitly prepared direct latest stream. */
+  directLatestStreamReadyTimeoutMs?: number;
+  /** Observational telemetry multiplexed on the prepared direct latest stream. */
+  directOnLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
   /** @deprecated Use controlPlaneTimeoutMs. */
   timeoutMs?: number;
   clientId?: string;
@@ -1043,6 +1049,11 @@ export class Droid {
         latestOnlyUpdates: this.options.directLatestOnlyUpdates,
         onLatestUpdate: this.options.directOnLatestUpdate,
         latestMaxInFlight: this.options.directLatestMaxInFlight,
+        latestTransport: this.options.directLatestTransport,
+        latestStreamReadyTimeoutMs: this.options.directLatestStreamReadyTimeoutMs,
+        onLatestStreamTelemetry: this.options.directOnLatestStreamTelemetry,
+        webSocketFactory: this.options.webSocketFactory,
+        clientId: this.clientId,
       }),
     };
     this.safety = {
