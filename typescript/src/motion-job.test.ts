@@ -94,3 +94,23 @@ test("a correlated continuous frame preserves an explicit ingress timestamp for 
   })).rejects.toThrow("clientCreatedAtMs");
   expect(sent).toHaveLength(1);
 });
+
+
+test("confirmed frame delivery keeps full scope and source timestamp on the correlated request", async () => {
+  const job: MotionJob = { job_id: "test", epoch: 1, mode: "device_ik", state: "armed", joint_names: ["A"], configuration_revision: "test", last_sequence: 0 };
+  const requests: Record<string, unknown>[] = [], published: Record<string, unknown>[] = [];
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
+    publishLatestUpdate: (body) => { published.push(body); return { state: "queued" }; },
+    request: async <T>(_path: string, body?: Record<string, unknown>) => { requests.push(body!); return { ok: true, job, result: { accepted: true, input_sequence: body!.sequence } } as T; },
+  }, job);
+  await expect(session.updateDeviceIkFrame({
+    controlledChains: ["NECK"], targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] }] }],
+    clientCreatedAtMs: 1_000, delivery: "confirmed",
+  })).resolves.toMatchObject({ accepted: true, input_sequence: 1 });
+  expect(published).toEqual([]);
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({ sequence: 1, controlled_chains: ["NECK"], client_created_at_ms: 1_000, chain_targets: [{ chain: "NECK" }] });
+  await session.updateDeviceIkFrame({ controlledChains: ["NECK"], targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0] }] }] });
+  expect(published).toHaveLength(1);
+});

@@ -118,6 +118,8 @@ export type DeviceIkFrameOptions = Omit<DeviceIkUpdateOptions, "chain" | "points
    * before it can replace its native pending target. Legacy callers may omit it.
    */
   clientCreatedAtMs?: number;
+  /** Force one full-frame correlated Edge receipt without changing telemetry setup. */
+  delivery?: "confirmed" | "latest";
 };
 
 export type JointParkOptions = {
@@ -330,6 +332,9 @@ export class MotionJobSession {
       }) };
     });
     const auxiliary = input.auxiliaryJointTargets === undefined ? undefined : validateAuxiliaryTargets(input.auxiliaryJointTargets, this.auxiliaryJointNames);
+    if (input.delivery !== undefined && input.delivery !== "confirmed" && input.delivery !== "latest") {
+      throw new Error("frame delivery must be confirmed or latest");
+    }
     const body = {
       job_id: this.id, epoch: this.job.epoch, sequence: ++this.sequence,
       chain_targets: targets, controlled_chains: scope,
@@ -345,7 +350,7 @@ export class MotionJobSession {
       ...(input.clientCreatedAtMs !== undefined
         ? { client_created_at_ms: validClientCreatedAtMs(input.clientCreatedAtMs) } : {}),
     };
-    const result = this.client.supportsLatestUpdates && this.client.publishLatestUpdate
+    const result = this.client.supportsLatestUpdates && this.client.publishLatestUpdate && input.delivery !== "confirmed"
       ? { ok: true, job: this.job, result: this.client.publishLatestUpdate(body) } as UpdateResponse
       : await this.client.request<UpdateResponse>("/api/v2/motion/update", body);
     this.job = result.job;
