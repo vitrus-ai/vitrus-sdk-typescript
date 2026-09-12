@@ -75,10 +75,23 @@ export type DirectMotionStartReceipt = {
 type FetchRequest = (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => Promise<Response>;
 type StartResponse = { ok: true; job: MotionJob; initial_feedback?: Record<string, unknown>; prime_receipt?: Record<string, unknown> } & Record<string, unknown>;
 type StatusResponse = { ok: true; job: MotionJob | null; service?: string; events?: Array<Record<string, unknown>> };
+type LatestFragment<T> = { value: T; createdAtMs: number };
+type LatestPending = {
+  /** The newest compatible envelope supplies job identity and sequence. */
+  payload: Record<string, unknown>;
+  timeoutMs?: number;
+  createdAtMs: number;
+  /** Independent Cartesian chains must not overwrite one another in a one-slot queue. */
+  chainTargets: Map<string, LatestFragment<Record<string, unknown>>>;
+  /** Auxiliary updates always contain their complete immutable auxiliary scope. */
+  auxiliaryTargets: LatestFragment<unknown[]> | null;
+};
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_START_TIMEOUT_MS = 20_000;
 const MAX_TIMEOUT_MS = 25_000;
+/** The public latest route is a source-freshness mailbox, never a long poll. */
+const LATEST_SOURCE_DEADLINE_MS = 500;
 const OPERATIONS: Record<string, DirectMotionOperation> = {
   "/api/v2/motion/status": "status",
   "/api/v2/motion/start": "start",
@@ -98,7 +111,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
   private readonly ref: string;
   private readonly fetchImpl: FetchRequest;
   private readonly latestOnlyUpdates: boolean;
-  private latestPending: { payload: Record<string, unknown>; timeoutMs?: number; createdAtMs: number } | null = null;
+  private latestPending: LatestPending | null = null;
   private readonly latestInFlight = new Set<Promise<void>>();
   private latestError: unknown = null;
   private latestObservation: LatestUpdateObservation | null = null;
@@ -184,10 +197,19 @@ export class DirectMotionJobClient implements MotionJobTransport {
    */
   publishLatestUpdate(payload: Record<string, unknown>, timeoutMs?: number): Record<string, unknown> {
     if (!this.latestOnlyUpdates) throw new Error("latest-only updates were not enabled for this public dataplane client");
-    const createdAtMs = this.now();
+    const now = this.now();
+    const suppliedSourceAtMs = payload.client_created_at_ms;
+    if (suppliedSourceAtMs !== undefined && (typeof suppliedSourceAtMs !== "number" || !Number.isSafeInteger(suppliedSourceAtMs)
+      || suppliedSourceAtMs < 0 || suppliedSourceAtMs > now)) {
+      throw new RangeError("client_created_at_ms must be a non-future non-negative safe integer");
+    }
+    const createdAtMs = suppliedSourceAtMs === undefined ? now : suppliedSourceAtMs;
     // The Bridge strips this fixed transport envelope field before forwarding
     // to native. It bounds source freshness across a delayed HTTP arrival.
-    this.latestPending = { payload: { ...payload, client_created_at_ms: createdAtMs }, timeoutMs, createdAtMs };
+    const next = latestPendingFrame({ ...payload, client_created_at_ms: createdAtMs }, timeoutMs, createdAtMs);
+    this.latestPending = this.latestPending === null
+      ? next
+      : mergeLatestPending(this.latestPending, next);
     this.pumpLatestUpdates();
     return {
       state: "queued",
@@ -226,20 +248,24 @@ export class DirectMotionJobClient implements MotionJobTransport {
     while (this.latestInFlight.size < this.latestMaxInFlight && this.latestPending) {
       const next = this.latestPending;
       this.latestPending = null;
+      const payload = freshLatestPayload(next, this.now(), this.latestPendingMaxAgeMs);
       const inputSequence = typeof next.payload.sequence === "number" ? next.payload.sequence : null;
       const jobId = typeof next.payload.job_id === "string" ? next.payload.job_id : null;
       const now = this.now();
-      if (now - next.createdAtMs > this.latestPendingMaxAgeMs) {
+      if (payload === null) {
         this.publishLatestObservation({
           jobId, inputSequence, state: "failed", sentAtMs: next.createdAtMs, observedAtMs: now,
-          error: `latest direct-motion update expired locally after ${now - next.createdAtMs} ms before public delivery`,
+          error: `latest direct-motion update expired locally before public delivery`,
         });
         continue;
       }
       const sentAtMs = now;
       this.publishLatestObservation({ jobId, inputSequence, state: "sending", sentAtMs, observedAtMs: sentAtMs });
       let request!: Promise<void>;
-      request = this.call<Record<string, unknown>>("update", next.payload, next.timeoutMs)
+      // Keep the wire deadline aligned with per-fragment source expiry.  The
+      // app's broad correlated-control timeout must not turn this into a
+      // multi-second latest-only queue after the SDK has already admitted it.
+      request = this.call<Record<string, unknown>>("update", payload, Math.min(next.timeoutMs ?? LATEST_SOURCE_DEADLINE_MS, LATEST_SOURCE_DEADLINE_MS))
         .then((receipt) => {
           this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt });
         }, (error) => {
@@ -315,6 +341,97 @@ export class DirectMotionJobClient implements MotionJobTransport {
   }
 }
 
+/**
+ * Describe a frame as independent latest-only intents.  The SDK only merges
+ * frames it can prove share one device-IK contract; unknown/update lifecycle
+ * payloads retain the old whole-frame replacement semantics.
+ */
+function latestPendingFrame(payload: Record<string, unknown>, timeoutMs: number | undefined, createdAtMs: number): LatestPending {
+  const chainTargets = new Map<string, LatestFragment<Record<string, unknown>>>();
+  const rawTargets = payload.chain_targets;
+  if (Array.isArray(rawTargets)) {
+    for (const target of rawTargets) {
+      if (!target || typeof target !== "object" || Array.isArray(target)) continue;
+      const item = target as Record<string, unknown>;
+      if (typeof item.chain !== "string" || !item.chain || !Array.isArray(item.points) || !item.points.length) continue;
+      chainTargets.set(item.chain, { value: { ...item }, createdAtMs });
+    }
+  }
+  const rawAuxiliary = payload.auxiliary_joint_targets;
+  const auxiliaryTargets = Array.isArray(rawAuxiliary)
+    ? { value: [...rawAuxiliary], createdAtMs }
+    : null;
+  return { payload, timeoutMs, createdAtMs, chainTargets, auxiliaryTargets };
+}
+
+function latestFrameContract(payload: Record<string, unknown>): string | null {
+  if (payload.operation !== undefined || !Array.isArray(payload.controlled_chains)) return null;
+  if (!payload.controlled_chains.length || !payload.controlled_chains.every(value => typeof value === "string" && value.length > 0)) return null;
+  if (new Set(payload.controlled_chains).size !== payload.controlled_chains.length) return null;
+  if (!Array.isArray(payload.chain_targets)) return null;
+  if (!payload.chain_targets.length && !Array.isArray(payload.auxiliary_joint_targets)) return null;
+  const chains = new Set<string>();
+  for (const target of payload.chain_targets) {
+    if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+    const item = target as Record<string, unknown>;
+    if (typeof item.chain !== "string" || !item.chain || !payload.controlled_chains.includes(item.chain)
+      || !Array.isArray(item.points) || !item.points.length || chains.has(item.chain)) return null;
+    chains.add(item.chain);
+  }
+  const contract = { ...payload };
+  delete contract.sequence;
+  delete contract.chain_targets;
+  delete contract.auxiliary_joint_targets;
+  delete contract.client_created_at_ms;
+  try { return stableJson(contract); }
+  catch { return null; }
+}
+
+function mergeLatestPending(previous: LatestPending, next: LatestPending): LatestPending {
+  const previousContract = latestFrameContract(previous.payload);
+  const nextContract = latestFrameContract(next.payload);
+  if (previousContract === null || nextContract === null || previousContract !== nextContract) return next;
+  const chainTargets = new Map(previous.chainTargets);
+  for (const [chain, fragment] of next.chainTargets) chainTargets.set(chain, fragment);
+  const earliestSourceAtMs = Math.min(previous.createdAtMs, next.createdAtMs);
+  return {
+    ...next,
+    payload: { ...next.payload, client_created_at_ms: earliestSourceAtMs },
+    createdAtMs: earliestSourceAtMs,
+    chainTargets,
+    auxiliaryTargets: next.auxiliaryTargets ?? previous.auxiliaryTargets,
+  };
+}
+
+function freshLatestPayload(pending: LatestPending, now: number, maxAgeMs: number): Record<string, unknown> | null {
+  const contract = latestFrameContract(pending.payload);
+  // Preserve legacy whole-payload handling for inputs outside the narrowly
+  // validated device-IK frame representation.
+  if (contract === null) return now - pending.createdAtMs > maxAgeMs ? null : pending.payload;
+  const freshChains = [...pending.chainTargets.values()]
+    .filter(fragment => now - fragment.createdAtMs <= maxAgeMs)
+    .map(fragment => fragment.value);
+  const freshAuxiliary = pending.auxiliaryTargets !== null && now - pending.auxiliaryTargets.createdAtMs <= maxAgeMs
+    ? pending.auxiliaryTargets.value
+    : null;
+  if (!freshChains.length && freshAuxiliary === null) return null;
+  const sourceAtMs = Math.min(
+    ...[...pending.chainTargets.values()].filter(fragment => now - fragment.createdAtMs <= maxAgeMs).map(fragment => fragment.createdAtMs),
+    ...(freshAuxiliary === null ? [] : [pending.auxiliaryTargets!.createdAtMs]),
+  );
+  const payload: Record<string, unknown> = { ...pending.payload, client_created_at_ms: sourceAtMs, chain_targets: freshChains };
+  delete payload.auxiliary_joint_targets;
+  if (freshAuxiliary !== null) payload.auxiliary_joint_targets = freshAuxiliary;
+  return payload;
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
 /** Only frame-shaped continuous device-IK targets may use the nonblocking mailbox. */
 function isContinuousDeviceIkFrame(payload: Record<string, unknown>): boolean {
   // Lifecycle updates carry an explicit operation (for example `hold` or
@@ -327,8 +444,8 @@ function isContinuousDeviceIkFrame(payload: Record<string, unknown>): boolean {
 }
 
 function boundedPendingAge(value: number): number {
-  if (!Number.isFinite(value) || value < 1 || value > 5_000) {
-    throw new RangeError("latestPendingMaxAgeMs must be a finite value in [1, 5000]");
+  if (!Number.isFinite(value) || value < 1 || value > LATEST_SOURCE_DEADLINE_MS) {
+    throw new RangeError(`latestPendingMaxAgeMs must be a finite value in [1, ${LATEST_SOURCE_DEADLINE_MS}]`);
   }
   return Math.trunc(value);
 }

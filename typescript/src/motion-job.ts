@@ -112,6 +112,8 @@ export type AuxiliaryJointTarget = {
 export type DeviceIkFrameOptions = Omit<DeviceIkUpdateOptions, "chain" | "points" | "taskMode"> & {
   controlledChains: string[];
   targets: Array<{ chain: string; points: DeviceIkPoint[]; taskMode?: "position_only" | "pose" }>;
+  /** Original application ingress time; used only by the latest-only transport. */
+  clientCreatedAtMs?: number;
 };
 
 export type JointParkOptions = {
@@ -332,6 +334,10 @@ export class MotionJobSession {
       ...(input.targetLivenessMs === undefined ? {} : { target_liveness_ms: input.targetLivenessMs }),
       ...(input.alignmentProfile === undefined ? {} : { alignment_profile: input.alignmentProfile }),
       ...(auxiliary === undefined ? {} : { auxiliary_joint_targets: auxiliary }),
+      // The source timestamp is a public latest-mailbox envelope. Correlated
+      // native updates must retain their established payload exactly.
+      ...(this.client.supportsLatestUpdates && input.clientCreatedAtMs !== undefined
+        ? { client_created_at_ms: validClientCreatedAtMs(input.clientCreatedAtMs) } : {}),
     };
     const result = this.client.supportsLatestUpdates && this.client.publishLatestUpdate
       ? { ok: true, job: this.job, result: this.client.publishLatestUpdate(body) } as UpdateResponse
@@ -433,6 +439,11 @@ function requiredText(value: string, label: string): string {
   const text = value.trim();
   if (!text) throw new Error(`${label} is required`);
   return text;
+}
+
+function validClientCreatedAtMs(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("clientCreatedAtMs must be a non-negative safe integer");
+  return value;
 }
 
 function normalizeScope(names: string[]): string[] {
