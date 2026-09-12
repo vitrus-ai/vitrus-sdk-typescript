@@ -583,6 +583,8 @@ export type DroidConnectionOptions = {
   directLatestTransport?: "http" | "websocket";
   /** Readiness budget for an explicitly prepared direct latest stream. */
   directLatestStreamReadyTimeoutMs?: number;
+  /** Receipt observation budget; this does not extend source target freshness. */
+  directLatestReceiptTimeoutMs?: number;
   /** Observational telemetry multiplexed on the prepared direct latest stream. */
   directOnLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
   /** @deprecated Use controlPlaneTimeoutMs. */
@@ -1051,6 +1053,7 @@ export class Droid {
         latestMaxInFlight: this.options.directLatestMaxInFlight,
         latestTransport: this.options.directLatestTransport,
         latestStreamReadyTimeoutMs: this.options.directLatestStreamReadyTimeoutMs,
+        latestReceiptTimeoutMs: this.options.directLatestReceiptTimeoutMs,
         onLatestStreamTelemetry: this.options.directOnLatestStreamTelemetry,
         webSocketFactory: this.options.webSocketFactory,
         clientId: this.clientId,

@@ -101,14 +101,14 @@ export class PersistentLatestUpdateStream {
     return connection;
   }
 
-  submit(requestId: string, payload: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  submit(requestId: string, payload: Record<string, unknown>, timeoutMs: number, receiptTimeoutMs: number): Promise<Record<string, unknown>> {
     const socket = this.socket;
     if (!this.readyValue || !socket) return Promise.reject(new Error("latest-update stream is not authenticated"));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
-        reject(new Error(`latest-update stream receipt timed out after ${timeoutMs} ms`));
-      }, timeoutMs);
+        reject(new Error(`latest-update receipt unconfirmed after ${receiptTimeoutMs} ms; execution unknown`));
+      }, receiptTimeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
       if (socket.bufferedAmount > 64 * 1024) {
         clearTimeout(timer); this.pending.delete(requestId);

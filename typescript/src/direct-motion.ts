@@ -51,6 +51,8 @@ export type DirectMotionJobClientOptions = {
   latestTransport?: "http" | "websocket";
   /** Separate bounded readiness budget for an explicitly prepared WebSocket. */
   latestStreamReadyTimeoutMs?: number;
+  /** Receipt-observation budget; source admission deadline remains 500 ms on wire. */
+  latestReceiptTimeoutMs?: number;
   /** Observational telemetry samples multiplexed by the direct-update stream. */
   onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void;
   /** Injectable only for deterministic WebSocket transport tests. */
@@ -136,6 +138,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
   private readonly latestMaxInFlight: number;
   private readonly latestTransport: "http" | "websocket";
   private readonly latestStreamReadyTimeoutMs: number;
+  private readonly latestReceiptTimeoutMs: number;
   private readonly webSocketFactory: DirectMotionStreamFactory | null;
   private latestStream: PersistentLatestUpdateStream | null = null;
   private latestStreamEpoch = 0;
@@ -154,6 +157,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
     // Stream receipts are independent; the mailbox remains one pending merged frame.
     this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? (this.latestTransport === "websocket" ? 16 : 1), this.latestTransport === "websocket" ? 16 : 4);
     this.latestStreamReadyTimeoutMs = boundedStreamReadyTimeout(options.latestStreamReadyTimeoutMs ?? 2_000);
+    this.latestReceiptTimeoutMs = boundedReceiptTimeout(options.latestReceiptTimeoutMs ?? 2_000);
     this.webSocketFactory = options.webSocketFactory ?? (typeof WebSocket === "undefined" ? null : (url) => new WebSocket(url));
     if (this.latestTransport === "websocket" && !this.webSocketFactory) throw new Error("latest websocket transport requires WebSocket support or webSocketFactory");
     this.now = options.now ?? Date.now;
@@ -298,7 +302,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
       const timeoutMs = Math.min(next.timeoutMs ?? LATEST_SOURCE_DEADLINE_MS, LATEST_SOURCE_DEADLINE_MS);
       let request!: Promise<void>;
       const receipt = this.latestTransport === "websocket"
-        ? this.latestStream!.submit(createRequestId(), payload, timeoutMs)
+        ? this.latestStream!.submit(createRequestId(), payload, timeoutMs, this.latestReceiptTimeoutMs)
         : this.call<Record<string, unknown>>("update", payload, timeoutMs);
       request = receipt.then((value) => {
         this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt: value });
@@ -516,6 +520,10 @@ function boundedLatestInFlight(value: number, maximum: number): number {
 }
 function boundedStreamReadyTimeout(value: number): number {
   if (!Number.isFinite(value) || value < 50 || value > 10_000) throw new RangeError("latestStreamReadyTimeoutMs must be a finite value in [50, 10000]");
+  return Math.trunc(value);
+}
+function boundedReceiptTimeout(value: number): number {
+  if (!Number.isFinite(value) || value < LATEST_SOURCE_DEADLINE_MS || value > 10_000) throw new RangeError("latestReceiptTimeoutMs must be a finite value in [500, 10000]");
   return Math.trunc(value);
 }
 

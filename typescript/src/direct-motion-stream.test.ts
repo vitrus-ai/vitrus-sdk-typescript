@@ -221,3 +221,31 @@ test("ready received before the initial auth frame is an explicit authentication
   await expect(prepared).rejects.toThrow("before authentication");
   expect(socket.closed).toBe(true);
 });
+
+test("a mailbox receipt may arrive after source admission TTL without renewing the wire deadline", async () => {
+  const socket = new FakeSocket();
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket", now: () => 1_000,
+    webSocketFactory: (() => socket) as never,
+  });
+  const prepared = client.prepareLatestStream(); socket.open(); socket.message({ type: "ready" }); await prepared;
+  client.publishLatestUpdate(frame(1, "left_arm"));
+  const sent = socket.sent[1];
+  expect(sent.timeout_ms).toBe(500);
+  await Bun.sleep(600);
+  socket.message({ type: "receipt", request_id: sent.request_id, result: { state: "queued", command_id: 3 } });
+  await client.drainLatestUpdates();
+  expect(client.latestUpdateStatus()).toMatchObject({ state: "queued", receipt: { command_id: 3 } });
+});
+
+test("an absent receipt becomes an explicit unknown-execution observation after the separate receipt budget", async () => {
+  const socket = new FakeSocket(); const observations: string[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket", now: () => 1_000,
+    webSocketFactory: (() => socket) as never, onLatestUpdate: (item) => { if (item.error) observations.push(item.error); },
+  });
+  const prepared = client.prepareLatestStream(); socket.open(); socket.message({ type: "ready" }); await prepared;
+  client.publishLatestUpdate(frame(1, "left_arm"));
+  await client.drainLatestUpdates().catch(() => undefined);
+  expect(observations).toContain("latest-update receipt unconfirmed after 2000 ms; execution unknown");
+});
