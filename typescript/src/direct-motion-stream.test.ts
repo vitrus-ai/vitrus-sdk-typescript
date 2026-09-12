@@ -44,11 +44,11 @@ test("websocket latest transport keeps credentials out of the URL, authenticates
   expect(client.latestUpdateStatus()).toMatchObject({ state: "queued", inputSequence: 2 });
 });
 
-test("stream loss fails outstanding work, replays nothing, and a later explicit update opens a new stream", async () => {
-  const sockets: FakeSocket[] = []; const observations: string[] = [];
+test("stream loss reports execution unknown, replays nothing, and a later explicit update opens a new stream", async () => {
+  const sockets: FakeSocket[] = []; const observations: string[] = []; const errors: string[] = [];
   const client = new DirectMotionJobClient({
     endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket", now: () => 1_000,
-    onLatestUpdate: (event) => observations.push(`${event.inputSequence}:${event.state}`),
+    onLatestUpdate: (event) => { observations.push(`${event.inputSequence}:${event.state}`); if (event.error) errors.push(event.error); },
     webSocketFactory: (() => { const socket = new FakeSocket(); sockets.push(socket); return socket; }) as never,
   });
   client.publishLatestUpdate(frame(1, "left_arm")); sockets[0].open(); sockets[0].message({ type: "ready" });
@@ -56,6 +56,7 @@ test("stream loss fails outstanding work, replays nothing, and a later explicit 
   sockets[0].close();
   await client.drainLatestUpdates().catch(() => undefined);
   expect(observations).toContain("1:failed");
+  expect(errors).toContain("latest-update stream closed before receipt; execution unknown");
   expect(sockets[0].sent).toHaveLength(2);
   client.publishLatestUpdate(frame(2, "right_arm"));
   expect(sockets).toHaveLength(2);

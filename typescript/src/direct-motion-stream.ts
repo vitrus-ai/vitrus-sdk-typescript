@@ -90,8 +90,13 @@ export class PersistentLatestUpdateStream {
             } else fail(new Error(detail));
           }
         });
-        socket.addEventListener("close", () => { if (this.socket === socket) fail(new Error("latest-update stream closed")); });
-        socket.addEventListener("error", () => { if (this.socket === socket) fail(new Error("latest-update stream transport error")); });
+        // The browser cannot know whether a request already reached the
+        // public mailbox when its duplex connection disappears.  Preserve
+        // that uncertainty instead of making a lost receipt look like a
+        // rejected target; callers must observe native evidence and submit a
+        // new current intent after explicitly preparing a replacement stream.
+        socket.addEventListener("close", () => { if (this.socket === socket) fail(new Error("latest-update stream closed before receipt; execution unknown")); });
+        socket.addEventListener("error", () => { if (this.socket === socket) fail(new Error("latest-update stream transport error before receipt; execution unknown")); });
       } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
     });
     const connection = this.connecting;
