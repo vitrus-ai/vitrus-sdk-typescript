@@ -116,3 +116,36 @@ test("confirmed frame delivery keeps full scope and source timestamp on the corr
   await session.updateDeviceIkFrame({ controlledChains: ["NECK"], targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0] }] }] });
   expect(published).toHaveLength(1);
 });
+
+test("an execute-goal frame may carry a bounded source-age envelope only on the confirmed path", async () => {
+  const job: MotionJob = { job_id: "goal", epoch: 1, mode: "device_ik", state: "armed", joint_names: ["NECK_A"], configuration_revision: "test", last_sequence: 0 };
+  const requests: Record<string, unknown>[] = [], published: Record<string, unknown>[] = [];
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
+    publishLatestUpdate: body => { published.push(body); return { state: "queued" }; },
+    requestConfirmed: async <T>(_path: string, body?: Record<string, unknown>) => {
+      requests.push(body!);
+      return { ok: true, job, result: { accepted: true } } as T;
+    },
+    request: async <T>() => ({ ok: true, job, result: { accepted: true } } as T),
+  }, job);
+  const goal = {
+    controlledChains: ["NECK"],
+    targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number] }] }],
+    intentMode: "execute_goal" as const,
+    delivery: "confirmed" as const,
+    clientCreatedAtMs: 1_000,
+    sourceMaxAgeMs: 2_000,
+  };
+  await expect(session.updateDeviceIkFrame(goal)).resolves.toMatchObject({ accepted: true, clientInputSequence: 1 });
+  expect(published).toEqual([]);
+  expect(requests).toEqual([expect.objectContaining({ intent_mode: "execute_goal", source_max_age_ms: 2_000, client_created_at_ms: 1_000 })]);
+  await expect(session.updateDeviceIkFrame({ ...goal, delivery: "latest" })).rejects.toThrow("confirmed frame delivery");
+  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint" })).rejects.toThrow("intentMode execute_goal");
+  await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 500 })).rejects.toThrow("501 through 2000");
+  await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 2_001 })).rejects.toThrow("501 through 2000");
+  await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
+  await expect(session.updateDeviceIkFrame({ ...goal, controlledChains: ["NECK", "LEFT_ARM"] })).rejects.toThrow("exactly one controlled chain");
+  await expect(session.updateDeviceIkFrame({ ...goal, targets: [...goal.targets, { chain: "NECK", points: [{ position_m: [0, 0, 0] }] }] })).rejects.toThrow("unique subset");
+  await expect(session.updateDeviceIkFrame({ ...goal, targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0] }, { position_m: [0, 0, 0] }] }] })).rejects.toThrow("exactly one controlled chain");
+});

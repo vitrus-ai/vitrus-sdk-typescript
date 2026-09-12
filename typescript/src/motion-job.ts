@@ -120,6 +120,11 @@ export type DeviceIkFrameOptions = Omit<DeviceIkUpdateOptions, "chain" | "points
   clientCreatedAtMs?: number;
   /** Force one full-frame correlated Edge receipt without changing telemetry setup. */
   delivery?: "confirmed" | "latest";
+  /**
+   * Explicit source-age envelope for one confirmed, discrete execute-goal
+   * frame. The native default remains 500 ms for all other frame types.
+   */
+  sourceMaxAgeMs?: number;
 };
 
 export type JointParkOptions = {
@@ -337,12 +342,31 @@ export class MotionJobSession {
     if (input.delivery !== undefined && input.delivery !== "confirmed" && input.delivery !== "latest") {
       throw new Error("frame delivery must be confirmed or latest");
     }
+    const sourceMaxAgeMs = input.sourceMaxAgeMs;
+    if (sourceMaxAgeMs !== undefined) {
+      if (input.intentMode !== "execute_goal") {
+        throw new Error("sourceMaxAgeMs requires intentMode execute_goal");
+      }
+      if (input.delivery !== "confirmed") {
+        throw new Error("sourceMaxAgeMs requires confirmed frame delivery");
+      }
+      if (input.clientCreatedAtMs === undefined) {
+        throw new Error("sourceMaxAgeMs requires clientCreatedAtMs");
+      }
+      if (!Number.isSafeInteger(sourceMaxAgeMs) || sourceMaxAgeMs <= 500 || sourceMaxAgeMs > 2_000) {
+        throw new Error("sourceMaxAgeMs must be an integer from 501 through 2000");
+      }
+      if (scope.length !== 1 || targets.length !== 1 || targets[0].chain !== scope[0] || targets[0].points.length !== 1) {
+        throw new Error("sourceMaxAgeMs requires exactly one controlled chain and one target point");
+      }
+    }
     const body = {
       job_id: this.id, epoch: this.job.epoch, sequence: ++this.sequence,
       chain_targets: targets, controlled_chains: scope,
       ...(input.ttlMs === undefined ? {} : { ttl_ms: input.ttlMs }),
       ...(input.intentMode === undefined ? {} : { intent_mode: input.intentMode }),
       ...(input.targetLivenessMs === undefined ? {} : { target_liveness_ms: input.targetLivenessMs }),
+      ...(sourceMaxAgeMs === undefined ? {} : { source_max_age_ms: sourceMaxAgeMs }),
       ...(input.alignmentProfile === undefined ? {} : { alignment_profile: input.alignmentProfile }),
       ...(auxiliary === undefined ? {} : { auxiliary_joint_targets: auxiliary }),
       // This is authenticated public transport metadata, not a native IK
