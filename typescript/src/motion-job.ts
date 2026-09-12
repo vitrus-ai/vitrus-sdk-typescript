@@ -108,11 +108,15 @@ export type AuxiliaryJointTarget = {
   velocity_deg_s?: number;
 };
 
-/** One latest-only snapshot: no arm is lost by alternating single-chain edits. */
+/** One device-IK frame: no arm is lost by alternating single-chain edits. */
 export type DeviceIkFrameOptions = Omit<DeviceIkUpdateOptions, "chain" | "points" | "taskMode"> & {
   controlledChains: string[];
   targets: Array<{ chain: string; points: DeviceIkPoint[]; taskMode?: "position_only" | "pose" }>;
-  /** Original application ingress time; used only by the latest-only transport. */
+  /**
+   * Original application ingress time for a continuous Cartesian frame.
+   * When supplied, the authenticated Edge uses it to reject a delayed frame
+   * before it can replace its native pending target. Legacy callers may omit it.
+   */
   clientCreatedAtMs?: number;
 };
 
@@ -334,9 +338,11 @@ export class MotionJobSession {
       ...(input.targetLivenessMs === undefined ? {} : { target_liveness_ms: input.targetLivenessMs }),
       ...(input.alignmentProfile === undefined ? {} : { alignment_profile: input.alignmentProfile }),
       ...(auxiliary === undefined ? {} : { auxiliary_joint_targets: auxiliary }),
-      // The source timestamp is a public latest-mailbox envelope. Correlated
-      // native updates must retain their established payload exactly.
-      ...(this.client.supportsLatestUpdates && input.clientCreatedAtMs !== undefined
+      // This is authenticated public transport metadata, not a native IK
+      // coordinate. Edge validates a supplied timestamp before accepting a
+      // continuous frame into its pending mailbox. Omission preserves legacy
+      // correlated update compatibility.
+      ...(input.clientCreatedAtMs !== undefined
         ? { client_created_at_ms: validClientCreatedAtMs(input.clientCreatedAtMs) } : {}),
     };
     const result = this.client.supportsLatestUpdates && this.client.publishLatestUpdate

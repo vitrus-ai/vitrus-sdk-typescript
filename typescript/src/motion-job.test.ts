@@ -68,3 +68,29 @@ test("complete TCP frames retain all eight fingers at 20/30 deg/s and reject uns
   for (const speed of [31,0,NaN]) await expect(session.updateDeviceIkFrame(frame(speed))).rejects.toThrow("velocity_deg_s <= 30");
   expect(sent).toHaveLength(2);
 });
+
+test("a correlated continuous frame preserves an explicit ingress timestamp for Edge expiry", async () => {
+  const job: MotionJob = { job_id: "test", epoch: 1, mode: "device_ik", state: "armed", joint_names: ["A"], configuration_revision: "test", last_sequence: 0 };
+  const sent: Record<string, unknown>[] = [];
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job }),
+    request: async <T>(_path: string, body?: Record<string, unknown>) => {
+      sent.push(body!);
+      return { ok: true, job, result: { accepted: true } } as T;
+    },
+    // No latest-only publisher: this exercises the correlated path.
+  }, job);
+  await session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM"],
+    targets: [{ chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0] }] }],
+    clientCreatedAtMs: 1_000,
+  });
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({ client_created_at_ms: 1_000, sequence: 1 });
+  await expect(session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM"],
+    targets: [{ chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0] }] }],
+    clientCreatedAtMs: -1,
+  })).rejects.toThrow("clientCreatedAtMs");
+  expect(sent).toHaveLength(1);
+});

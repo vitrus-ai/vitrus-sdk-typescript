@@ -98,7 +98,7 @@ test("Droid.connect exposes native direct motion only through the public datapla
     const updatePayload = requests.find(({ url }) => url.pathname.endsWith("/update"))!.body.payload as Record<string, unknown>;
     expect(updatePayload).toMatchObject({ job_id: "direct-job-1", epoch: 1, sequence: 1, controlled_chains: ["left_arm"] });
     expect(updatePayload.chain_targets).toEqual([{ chain: "left_arm", points: [{ position_m: [0.1, 0.2, 0.3], orientation_xyzw: [0, 0, 0, 1], time_from_start_ms: 20 }] }]);
-    expect(updatePayload).not.toHaveProperty("client_created_at_ms");
+    expect(updatePayload.client_created_at_ms).toBe(1);
   } finally {
     globalThis.fetch = originalFetch;
   }
