@@ -118,7 +118,22 @@ test("confirmed frame delivery keeps full scope and source timestamp on the corr
 });
 
 test("an execute-goal frame may carry a bounded source-age envelope only on the confirmed path", async () => {
-  const job: MotionJob = { job_id: "goal", epoch: 1, mode: "device_ik", state: "armed", joint_names: ["NECK_A"], configuration_revision: "test", last_sequence: 0 };
+  const left11NeckAux = [
+    "LEFT_GRIPPER_LEFT_FINGER_A", "LEFT_GRIPPER_LEFT_FINGER_B",
+    "LEFT_GRIPPER_RIGHT_FINGER_A", "LEFT_GRIPPER_RIGHT_FINGER_B",
+  ];
+  const job: MotionJob = {
+    job_id: "goal", epoch: 1, mode: "device_ik", state: "armed",
+    // Full shared handling scope: seven LEFT_ARM axes, four NECK axes, and
+    // the four declared gripper auxiliaries carried by the same lease.
+    joint_names: [
+      "LEFT_SHOULDER_A", "LEFT_SHOULDER_B", "LEFT_SHOULDER_C", "LEFT_ELBOW_A",
+      "LEFT_ELBOW_B", "LEFT_WRIST_A", "LEFT_WRIST_B", "NECK_A", "NECK_B", "NECK_C", "NECK_D",
+      ...left11NeckAux,
+    ],
+    auxiliary_joint_names: left11NeckAux,
+    configuration_revision: "test", last_sequence: 0,
+  };
   const requests: Record<string, unknown>[] = [], published: Record<string, unknown>[] = [];
   const session = new MotionJobSession({
     status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
@@ -145,7 +160,48 @@ test("an execute-goal frame may carry a bounded source-age envelope only on the 
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 500 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 2_001 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
-  await expect(session.updateDeviceIkFrame({ ...goal, controlledChains: ["NECK", "LEFT_ARM"] })).rejects.toThrow("exactly one controlled chain");
-  await expect(session.updateDeviceIkFrame({ ...goal, targets: [...goal.targets, { chain: "NECK", points: [{ position_m: [0, 0, 0] }] }] })).rejects.toThrow("unique subset");
-  await expect(session.updateDeviceIkFrame({ ...goal, targets: [{ chain: "NECK", points: [{ position_m: [0, 0, 0] }, { position_m: [0, 0, 0] }] }] })).rejects.toThrow("exactly one controlled chain");
+  const left11NeckGoal = {
+    controlledChains: ["LEFT_ARM", "NECK"],
+    targets: [
+      { chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number] }] },
+      { chain: "NECK", points: [{ position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number] }] },
+    ],
+    auxiliaryJointTargets: [
+      "LEFT_GRIPPER_LEFT_FINGER_A", "LEFT_GRIPPER_LEFT_FINGER_B",
+      "LEFT_GRIPPER_RIGHT_FINGER_A", "LEFT_GRIPPER_RIGHT_FINGER_B",
+    ].map(joint_name => ({ joint_name, position_deg: 0, velocity_deg_s: 5, max_torque_nm: 0.05 })),
+    intentMode: "execute_goal" as const,
+    delivery: "confirmed" as const,
+    clientCreatedAtMs: 1_000,
+    sourceMaxAgeMs: 2_000,
+  };
+  // The SDK does not need the native config to prove serialization: this is
+  // the exact complete LEFT_ARM + NECK Cartesian frame plus four static
+  // declared auxiliary targets carried over the confirmed public path.
+  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ accepted: true, clientInputSequence: 2 });
+  expect(requests.at(-1)).toMatchObject({
+    sequence: 2, intent_mode: "execute_goal", source_max_age_ms: 2_000,
+    controlled_chains: ["LEFT_ARM", "NECK"],
+    chain_targets: [{ chain: "LEFT_ARM" }, { chain: "NECK" }],
+    auxiliary_joint_targets: left11NeckGoal.auxiliaryJointTargets,
+  });
+  const requestsBeforeInvalid = requests.length;
+  await expect(session.updateDeviceIkFrame({ ...left11NeckGoal, targets: left11NeckGoal.targets.slice(0, 1) })).rejects.toThrow("every controlled chain");
+  await expect(session.updateDeviceIkFrame({ ...left11NeckGoal, targets: [left11NeckGoal.targets[0]!, left11NeckGoal.targets[0]!] })).rejects.toThrow("unique subset");
+  await expect(session.updateDeviceIkFrame({ ...left11NeckGoal, targets: [
+    { ...left11NeckGoal.targets[0], points: [...left11NeckGoal.targets[0]!.points, left11NeckGoal.targets[0]!.points[0]!] },
+    left11NeckGoal.targets[1]!,
+  ] })).rejects.toThrow("every controlled chain");
+  await expect(session.updateDeviceIkFrame({ ...left11NeckGoal, targets: [
+    left11NeckGoal.targets[0]!, { ...left11NeckGoal.targets[1]!, chain: "RIGHT_ARM" },
+  ] })).rejects.toThrow("unique subset");
+  expect(requests).toHaveLength(requestsBeforeInvalid);
+  // Reusing the valid frame proves rejected client-side shapes did not spend
+  // a serialized input sequence (the preceding valid composite was seq=2).
+  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ clientInputSequence: 3 });
+  await expect(session.updateDeviceIkFrame({ ...goal, delivery: "latest" })).rejects.toThrow("confirmed frame delivery");
+  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint" })).rejects.toThrow("intentMode execute_goal");
+  await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 500 })).rejects.toThrow("501 through 2000");
+  await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 2_001 })).rejects.toThrow("501 through 2000");
+  await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
 });

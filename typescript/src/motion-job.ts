@@ -356,8 +356,16 @@ export class MotionJobSession {
       if (!Number.isSafeInteger(sourceMaxAgeMs) || sourceMaxAgeMs <= 500 || sourceMaxAgeMs > 2_000) {
         throw new Error("sourceMaxAgeMs must be an integer from 501 through 2000");
       }
-      if (scope.length !== 1 || targets.length !== 1 || targets[0].chain !== scope[0] || targets[0].points.length !== 1) {
-        throw new Error("sourceMaxAgeMs requires exactly one controlled chain and one target point");
+      // A discrete multi-chain goal is safe only when every declared chain
+      // carries one explicit pose. Never infer a held pose for an omitted
+      // chain while granting the longer correlated source-age envelope.
+      if (
+        targets.length !== scope.length
+        || targets.some(target => target.points.length !== 1)
+        || new Set(targets.map(target => target.chain)).size !== targets.length
+        || !scope.every(chain => targets.some(target => target.chain === chain))
+      ) {
+        throw new Error("sourceMaxAgeMs requires exactly one target point for every controlled chain");
       }
     }
     const body = {
