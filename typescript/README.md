@@ -190,9 +190,14 @@ The default `"realtime"` profile retains a 500 ms command source-age budget.
 `"variable"` allows 1,500 ms; `{ sourceMaxAgeMs: 1200 }` selects an explicit
 integer budget from 501 through 2,000 ms. This is a maximum transport age, not
 an added buffering delay or a relaxation of motor feedback freshness. The
-extended budget requires a complete single-point frame for its declared chains,
-explicit continuous intent, and the original client timestamp. Deploy matching
-VitrusOS and Bridge support before opting in; older servers reject the extension.
+extended budget requires the original client timestamp and exactly one point per
+supplied chain. A `continuous_setpoint` frame may update a unique nonempty subset
+of its immutable `controlledChains`; omitted chains retain their native target and
+are never synthesized by the SDK. An `execute_goal` frame remains a complete,
+single-point frame for every controlled chain. An auxiliary-only continuous frame
+is allowed only when `auxiliaryJointTargets` covers its declared auxiliary scope
+exactly once. Deploy matching VitrusOS and Bridge support before opting in; older
+servers reject the extension.
 
 `updateDeviceIkFrame` returns after local queue admission. Unsent compatible
 updates coalesce in the SDK, Bridge, and Edge; independent chain intents retain

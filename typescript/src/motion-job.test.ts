@@ -206,7 +206,7 @@ test("an execute-goal frame may carry a bounded source-age envelope only on the 
   await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
 });
 
-test("bounded continuous network tolerance preserves source identity and requires a complete frame", async () => {
+test("bounded continuous network tolerance preserves source identity for partial continuous frames", async () => {
   const job: MotionJob = {
     job_id: "continuous", epoch: 1, mode: "device_ik", state: "active",
     joint_names: ["LEFT_SHOULDER_A", "RIGHT_SHOULDER_A"], configuration_revision: "test",
@@ -229,8 +229,54 @@ test("bounded continuous network tolerance preserves source identity and require
   };
   await expect(session.updateDeviceIkFrame(complete)).resolves.toMatchObject({ state: "queued", clientInputSequence: 1 });
   expect(published).toEqual([expect.objectContaining({ sequence: 1, client_created_at_ms: 10_000, source_max_age_ms: 1_200 })]);
-  await expect(session.updateDeviceIkFrame({ ...complete, targets: complete.targets.slice(0, 1), clientCreatedAtMs: 10_001 })).rejects.toThrow("every controlled chain");
+  // A continuous target may update only the chain that changed. The immutable
+  // scope still goes over the wire, but no target is fabricated for RIGHT_ARM.
+  await expect(session.updateDeviceIkFrame({
+    ...complete, targets: complete.targets.slice(0, 1), clientCreatedAtMs: 10_001,
+  })).resolves.toMatchObject({ state: "queued", clientInputSequence: 2 });
+  expect(published.at(-1)).toMatchObject({
+    sequence: 2, controlled_chains: ["LEFT_ARM", "RIGHT_ARM"],
+    chain_targets: [{ chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0] }] }],
+    client_created_at_ms: 10_001, source_max_age_ms: 1_200,
+  });
+  await expect(session.updateDeviceIkFrame({
+    ...complete,
+    targets: [{ ...complete.targets[0]!, points: [complete.targets[0]!.points[0]!, complete.targets[0]!.points[0]!] }],
+    clientCreatedAtMs: 10_002,
+  })).rejects.toThrow("every supplied chain");
   await expect(session.updateDeviceIkFrame({ ...complete, sourceMaxAgeMs: 501, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
+  expect(published).toHaveLength(2);
+});
+
+test("a bounded continuous auxiliary-only frame retains Cartesian targets and requires the full declared auxiliary scope", async () => {
+  const job: MotionJob = {
+    job_id: "auxiliary", epoch: 1, mode: "device_ik", state: "active",
+    joint_names: ["LEFT_SHOULDER_A", "LEFT_GRIPPER_A", "LEFT_GRIPPER_B"],
+    auxiliary_joint_names: ["LEFT_GRIPPER_A", "LEFT_GRIPPER_B"],
+    configuration_revision: "test", last_sequence: 0, intent_mode: "continuous_setpoint",
+  };
+  const published: Record<string, unknown>[] = [];
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
+    continuousNetworkTolerance: { sourceMaxAgeMs: 1_500 },
+    publishLatestUpdate: body => { published.push(body); return { state: "queued" }; },
+    request: async <T>() => ({ ok: true, job, result: { accepted: true } } as T),
+  }, job);
+  const auxiliaryJointTargets = ["LEFT_GRIPPER_A", "LEFT_GRIPPER_B"].map(joint_name => ({
+    joint_name, position_deg: 1, velocity_deg_s: 5, max_torque_nm: .2,
+  }));
+  await expect(session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM", "RIGHT_ARM", "NECK"], targets: [], auxiliaryJointTargets,
+    clientCreatedAtMs: 10_000,
+  })).resolves.toMatchObject({ state: "queued", clientInputSequence: 1 });
+  expect(published[0]).toMatchObject({
+    controlled_chains: ["LEFT_ARM", "RIGHT_ARM", "NECK"], chain_targets: [],
+    auxiliary_joint_targets: auxiliaryJointTargets, source_max_age_ms: 1_500,
+  });
+  await expect(session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM", "RIGHT_ARM", "NECK"], targets: [],
+    auxiliaryJointTargets: auxiliaryJointTargets.slice(0, 1), clientCreatedAtMs: 10_001,
+  })).rejects.toThrow("cover the declared scope exactly once");
   expect(published).toHaveLength(1);
 });
 

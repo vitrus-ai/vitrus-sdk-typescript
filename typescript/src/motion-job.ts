@@ -14,7 +14,8 @@ export type MotionIntentMode = "continuous_setpoint" | "execute_goal";
 /**
  * SDK-only public-path policy. `realtime` preserves the native 500 ms source
  * deadline. The object form is an explicit, bounded opt-in for one complete
- * continuous frame; it never changes native target liveness or replay rules.
+ * continuous frame or a complete execute-goal frame; it never changes native
+ * target liveness or replay rules.
  */
 export type ContinuousNetworkToleranceProfile = "realtime" | "variable" | { sourceMaxAgeMs: number };
 /** `active` and `hold` are native direct-session states; older Edge jobs use running/holding. */
@@ -373,15 +374,17 @@ export class MotionJobSession {
       if (!Number.isSafeInteger(sourceMaxAgeMs) || sourceMaxAgeMs <= 500 || sourceMaxAgeMs > 2_000) {
         throw new Error("sourceMaxAgeMs must be an integer from 501 through 2000");
       }
-      // A longer source envelope is safe only for a complete single-pose
-      // frame. Never infer a held pose for an omitted chain while granting it.
-      if (
-        targets.length !== scope.length
-        || targets.some(target => target.points.length !== 1)
-        || new Set(targets.map(target => target.chain)).size !== targets.length
-        || !scope.every(chain => targets.some(target => target.chain === chain))
-      ) {
-        throw new Error("sourceMaxAgeMs requires exactly one target point for every controlled chain");
+      // One delayed Cartesian point is safe to retain per supplied chain. A
+      // continuous update intentionally omits unchanged chains: native keeps
+      // their existing target; the SDK never fabricates a held pose for them.
+      // Execute-goal is different: it must describe the whole immutable scope.
+      const exactlyOnePointPerSuppliedChain = targets.every(target => target.points.length === 1);
+      const completeControlledScope = targets.length === scope.length
+        && scope.every(chain => targets.some(target => target.chain === chain));
+      if (!exactlyOnePointPerSuppliedChain || (effectiveIntent === "execute_goal" && !completeControlledScope)) {
+        throw new Error(effectiveIntent === "execute_goal"
+          ? "sourceMaxAgeMs requires exactly one target point for every controlled chain"
+          : "sourceMaxAgeMs requires exactly one target point for every supplied chain");
       }
     }
     const body = {
