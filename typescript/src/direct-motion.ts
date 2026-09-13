@@ -10,6 +10,7 @@ import {
   MotionControlError,
   MotionJobSession,
   type MotionErrorPayload,
+  type ContinuousNetworkToleranceProfile,
   type MotionIntentMode,
   type MotionJob,
   type MotionJobStartOptions,
@@ -53,6 +54,12 @@ export type DirectMotionJobClientOptions = {
   latestStreamReadyTimeoutMs?: number;
   /** Receipt-observation budget; source admission deadline remains 500 ms on wire. */
   latestReceiptTimeoutMs?: number;
+  /**
+   * SDK-only continuous-frame source-age policy. `realtime` retains 500 ms;
+   * `variable` selects 1500 ms, and an explicit object permits 501..2000 ms,
+   * only for complete continuous frames carrying their original timestamp.
+   */
+  continuousNetworkTolerance?: ContinuousNetworkToleranceProfile;
   /** Observational telemetry samples delivered on a separate latest-only stream. */
   onLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void | Promise<void>;
   /**
@@ -140,6 +147,7 @@ const OPERATIONS: Record<string, DirectMotionOperation> = {
 /** Full MotionJobClient-compatible surface, routed only through the public API. */
 export class DirectMotionJobClient implements MotionJobTransport {
   readonly supportsLatestUpdates: boolean;
+  readonly continuousNetworkTolerance: ContinuousNetworkToleranceProfile;
   private readonly endpoint: string;
   private readonly apiKey: string;
   private readonly ref: string;
@@ -169,7 +177,11 @@ export class DirectMotionJobClient implements MotionJobTransport {
     // endpoint.  Falling back after a mutation would make delivery ambiguous.
     this.latestOnlyUpdates = options.latestOnlyUpdates ?? false;
     this.supportsLatestUpdates = this.latestOnlyUpdates;
-    this.latestPendingMaxAgeMs = boundedPendingAge(options.latestPendingMaxAgeMs ?? 500);
+    this.continuousNetworkTolerance = normalizeContinuousNetworkTolerance(options.continuousNetworkTolerance);
+    const profilePendingAge = typeof this.continuousNetworkTolerance === "object"
+      ? this.continuousNetworkTolerance.sourceMaxAgeMs
+      : LATEST_SOURCE_DEADLINE_MS;
+    this.latestPendingMaxAgeMs = boundedPendingAge(options.latestPendingMaxAgeMs ?? profilePendingAge, profilePendingAge);
     this.latestTransport = options.latestTransport ?? "http";
     // Stream receipts are independent; the mailbox remains one pending merged frame.
     this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? (this.latestTransport === "websocket" ? 16 : 1), this.latestTransport === "websocket" ? 16 : 4);
@@ -334,7 +346,10 @@ export class DirectMotionJobClient implements MotionJobTransport {
       }
       const sentAtMs = now;
       this.publishLatestObservation({ jobId, inputSequence, state: "sending", sentAtMs, observedAtMs: sentAtMs });
-      const timeoutMs = Math.min(next.timeoutMs ?? LATEST_SOURCE_DEADLINE_MS, LATEST_SOURCE_DEADLINE_MS);
+      const sourceDeadlineMs = sourceDeadlineForPayload(payload);
+      // The Bridge envelope deadline equals the unmodified source-age budget.
+      // It cannot be renewed by a retry or by a merged later frame.
+      const timeoutMs = Math.min(next.timeoutMs ?? sourceDeadlineMs, sourceDeadlineMs);
       let request!: Promise<void>;
       const receipt = this.latestTransport === "websocket"
         ? this.latestStream!.submit(createRequestId(), payload, timeoutMs, this.latestReceiptTimeoutMs)
@@ -560,11 +575,28 @@ function isContinuousDeviceIkFrame(payload: Record<string, unknown>): boolean {
     && Number.isFinite(payload.client_created_at_ms);
 }
 
-function boundedPendingAge(value: number): number {
-  if (!Number.isFinite(value) || value < 1 || value > LATEST_SOURCE_DEADLINE_MS) {
-    throw new RangeError(`latestPendingMaxAgeMs must be a finite value in [1, ${LATEST_SOURCE_DEADLINE_MS}]`);
+function boundedPendingAge(value: number, maximum: number): number {
+  if (!Number.isFinite(value) || value < 1 || value > maximum) {
+    throw new RangeError(`latestPendingMaxAgeMs must be a finite value in [1, ${maximum}]`);
   }
   return Math.trunc(value);
+}
+function normalizeContinuousNetworkTolerance(value: ContinuousNetworkToleranceProfile | undefined): ContinuousNetworkToleranceProfile {
+  if (value === undefined || value === "realtime") return "realtime";
+  if (value === "variable") return { sourceMaxAgeMs: 1_500 };
+  if (!value || typeof value !== "object" || !Number.isSafeInteger(value.sourceMaxAgeMs)
+    || value.sourceMaxAgeMs <= LATEST_SOURCE_DEADLINE_MS || value.sourceMaxAgeMs > 2_000) {
+    throw new RangeError("continuousNetworkTolerance.sourceMaxAgeMs must be an integer from 501 through 2000");
+  }
+  return { sourceMaxAgeMs: value.sourceMaxAgeMs };
+}
+function sourceDeadlineForPayload(payload: Record<string, unknown>): number {
+  const value = payload.source_max_age_ms;
+  if (value === undefined) return LATEST_SOURCE_DEADLINE_MS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= LATEST_SOURCE_DEADLINE_MS || value > 2_000) {
+    throw new RangeError("continuous source_max_age_ms must be an integer from 501 through 2000");
+  }
+  return value;
 }
 
 function boundedLatestInFlight(value: number, maximum: number): number {

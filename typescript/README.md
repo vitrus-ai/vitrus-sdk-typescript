@@ -174,23 +174,41 @@ requires written permission from Vitrus. See [LICENSE](LICENSE).
 
 ### Continuous TCP targets over the public dataplane
 
-For an enrolled device whose Bridge supports `/v1/droids/motion/direct/latest`,
-opt in with `Droid.connect(ref, { apiKey, directLatestOnlyUpdates: true,
-directOnLatestUpdate: observation => { /* store receipt or delivery error */ } })`.
-The TCP control app enables this with `VITRUS_DIRECT_LATEST_ONLY=1`.
+For an enrolled device with the paired latest-target Bridge and VitrusOS release:
 
-`updateDeviceIkFrame` then returns after local mailbox admission. The SDK keeps
-one request in flight and replaces the unsent pending frame with the newest
-frame. A public HTTP 202 receipt is queue admission, not native application.
-Correlate the SDK input sequence and native command ID with execution and fresh
-encoder feedback before asserting motion. Observe asynchronous errors through
-`directOnLatestUpdate` or `droid.motion.direct.latestUpdateStatus()`.
+```ts
+const droid = await Droid.connect(ref, {
+  apiKey,
+  directLatestOnlyUpdates: true,
+  directLatestTransport: "websocket",
+  directContinuousNetworkTolerance: "variable",
+  directOnLatestUpdate: observation => { /* record delivery receipt/error */ },
+});
+```
 
-The SDK stamps creation time; the Bridge rejects targets older than 500 ms or
-more than 100 ms in the future, and expires queued updates by the same source
-deadline. Keep the client clock synchronized. Native sequence checks reject
-reordering; Hold/Stop discard unsent local targets and retain priority in the
-public queue. This mode does not retry a motion through another route.
+The default `"realtime"` profile retains a 500 ms command source-age budget.
+`"variable"` allows 1,500 ms; `{ sourceMaxAgeMs: 1200 }` selects an explicit
+integer budget from 501 through 2,000 ms. This is a maximum transport age, not
+an added buffering delay or a relaxation of motor feedback freshness. The
+extended budget requires a complete single-point frame for its declared chains,
+explicit continuous intent, and the original client timestamp. Deploy matching
+VitrusOS and Bridge support before opting in; older servers reject the extension.
+
+`updateDeviceIkFrame` returns after local queue admission. Unsent compatible
+updates coalesce in the SDK, Bridge, and Edge; independent chain intents retain
+their own bounded slots. Already executing requests are never cancelled or
+replayed. A public queue receipt is not evidence of motor application. Correlate
+input sequence, native command ID, and measured feedback before asserting motion.
+Observe delivery errors through `directOnLatestUpdate` or
+`droid.motion.direct.latestUpdateStatus()`.
+
+The original timestamp and deadline survive transport; merging or reconnecting
+cannot renew an expired intent. Keep clocks synchronized. Native sequence checks
+reject reordered input. Hold/Stop discard unsent targets and retain a separate
+priority lane. After packet loss, publish a fresh current desired pose; do not
+replay an ambiguous command or automatically start a new DRIVE session.
+An HTTP-success heartbeat containing a terminal native job now throws
+`MOTION_SESSION_TERMINAL`; the session still permits `stop()` to confirm release.
 
 On updated r05-edge, successive single-point TCP targets are interpolated from
 the current Cartesian reference with smoothstep translation and shortest-arc

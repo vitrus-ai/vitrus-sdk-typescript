@@ -154,11 +154,13 @@ test("Droid.connect forwards explicit latest WebSocket options to direct motion 
     const droid = await Droid.connect("VTRS-R06", {
       apiKey: "key", endpoint: "https://dataplane.example", clientId: "droid-sdk", directLatestOnlyUpdates: true,
       directLatestTransport: "websocket", directLatestMaxInFlight: 16, directLatestStreamReadyTimeoutMs: 100,
+      directContinuousNetworkTolerance: { sourceMaxAgeMs: 1_200 },
       webSocketFactory: (() => socket) as never,
     });
     const prepared = droid.motion.direct.prepareLatestStream();
     socket.open(); socket.message({ type: "ready", serial: "VTRS-R06" });
     await prepared;
+    expect(droid.motion.direct.continuousNetworkTolerance).toEqual({ sourceMaxAgeMs: 1_200 });
     expect(socket.sent).toEqual([{ type: "authenticate", api_key: "key", client_id: "droid-sdk" }]);
     droid.motion.direct.discardLatestUpdates();
   } finally { globalThis.fetch = originalFetch; }

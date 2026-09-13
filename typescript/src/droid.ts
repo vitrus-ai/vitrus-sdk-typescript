@@ -15,6 +15,7 @@ import {
 } from "./effectors.js";
 import { GoldenEdgeClient } from "./golden-edge.js";
 import { DirectMotionJobClient, type LatestStreamTelemetryObservation, type LatestUpdateObservation } from "./direct-motion.js";
+import type { ContinuousNetworkToleranceProfile } from "./motion-job.js";
 import { observeCameraFrames, type CameraObservationOptions, type LiveCameraFrame } from "./camera-live.js";
 import { DeviceModulesClient, type DeviceModuleCatalog, type ModuleConfigureResult } from "./device-modules.js";
 import type { ZenohEdgePublishResult, ZenohEdgeSession } from "./zenoh-edge.js";
@@ -585,6 +586,8 @@ export type DroidConnectionOptions = {
   directLatestStreamReadyTimeoutMs?: number;
   /** Receipt observation budget; this does not extend source target freshness. */
   directLatestReceiptTimeoutMs?: number;
+  /** SDK-only bounded source-age policy for complete continuous direct frames; `variable` is 1500 ms. */
+  directContinuousNetworkTolerance?: ContinuousNetworkToleranceProfile;
   /** Observational telemetry multiplexed on the prepared direct latest stream. */
   directOnLatestStreamTelemetry?: (observation: LatestStreamTelemetryObservation) => void | Promise<void>;
   /** Bounded ACK window for the separate public direct telemetry socket (1..8). */
@@ -1056,6 +1059,7 @@ export class Droid {
         latestTransport: this.options.directLatestTransport,
         latestStreamReadyTimeoutMs: this.options.directLatestStreamReadyTimeoutMs,
         latestReceiptTimeoutMs: this.options.directLatestReceiptTimeoutMs,
+        continuousNetworkTolerance: this.options.directContinuousNetworkTolerance,
         onLatestStreamTelemetry: this.options.directOnLatestStreamTelemetry,
         telemetryDeliveryWindow: this.options.directTelemetryDeliveryWindow,
         webSocketFactory: this.options.webSocketFactory,

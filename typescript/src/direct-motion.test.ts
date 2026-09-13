@@ -301,6 +301,55 @@ test("a successful heartbeat intentionally resolves void", async () => {
   await expect(session.heartbeat()).resolves.toBeUndefined();
 });
 
+test("variable continuous tolerance keeps the original source timestamp, bounds the Bridge deadline, and drops expired jitter", async () => {
+  let now = 10_000;
+  const envelopes: Array<{ timeout_ms: number; payload: Record<string, unknown> }> = [];
+  const updates: Array<{ inputSequence: number | null; state: string; error?: string }> = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06",
+    latestOnlyUpdates: true, continuousNetworkTolerance: { sourceMaxAgeMs: 1_200 }, now: () => now,
+    onLatestUpdate: observation => updates.push(observation),
+    fetch: (async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/start")) return response({ ok: true, job: { ...job(), intent_mode: "continuous_setpoint" } });
+      if (path.endsWith("/latest")) {
+        envelopes.push(JSON.parse(String(init?.body)) as { timeout_ms: number; payload: Record<string, unknown> });
+        return response({ ok: true, result: { state: "queued" } });
+      }
+      throw new Error(`unexpected ${path}`);
+    }) as typeof fetch,
+  });
+  const session = await client.startJob({ mode: "device_ik", owner: "test", jointNames: ["LEFT_SHOULDER_A"], intentMode: "continuous_setpoint" });
+  await session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM"], targets: [{ chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0] }] }], clientCreatedAtMs: 10_000,
+  });
+  await client.drainLatestUpdates();
+  expect(envelopes).toEqual([expect.objectContaining({ timeout_ms: 1_200, payload: expect.objectContaining({ sequence: 1, client_created_at_ms: 10_000, source_max_age_ms: 1_200 }) })]);
+
+  // A delayed input keeps its old timestamp and is observed as failed locally;
+  // it is never transmitted as a reconnected/retried setpoint.
+  now = 11_201;
+  await session.updateDeviceIkFrame({
+    controlledChains: ["LEFT_ARM"], targets: [{ chain: "LEFT_ARM", points: [{ position_m: [0.1, 0, 0] }] }], clientCreatedAtMs: 10_000,
+  });
+  await client.drainLatestUpdates();
+  expect(envelopes).toHaveLength(1);
+  expect(updates.at(-1)).toMatchObject({ inputSequence: 2, state: "failed", error: expect.stringContaining("expired locally") });
+});
+
+test("realtime tolerance cannot quietly extend a latest frame's local queue age", () => {
+  expect(() => new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06",
+    latestOnlyUpdates: true, latestPendingMaxAgeMs: 501,
+  })).toThrow("[1, 500]");
+  expect(() => new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06",
+    continuousNetworkTolerance: { sourceMaxAgeMs: 2_001 },
+  })).toThrow("501 through 2000");
+  const variable = new DirectMotionJobClient({ endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", continuousNetworkTolerance: "variable" });
+  expect(variable.continuousNetworkTolerance).toEqual({ sourceMaxAgeMs: 1_500 });
+});
+
 test("latest-only routing is limited to continuous device-IK frames; Hold remains correlated", async () => {
   const paths: string[] = [];
   const client = new DirectMotionJobClient({

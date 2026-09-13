@@ -11,6 +11,12 @@ import type { ControlJointTarget } from "./contracts.js";
 
 export type MotionMode = "device_ik" | "joint_trajectory" | "direct_joint";
 export type MotionIntentMode = "continuous_setpoint" | "execute_goal";
+/**
+ * SDK-only public-path policy. `realtime` preserves the native 500 ms source
+ * deadline. The object form is an explicit, bounded opt-in for one complete
+ * continuous frame; it never changes native target liveness or replay rules.
+ */
+export type ContinuousNetworkToleranceProfile = "realtime" | "variable" | { sourceMaxAgeMs: number };
 /** `active` and `hold` are native direct-session states; older Edge jobs use running/holding. */
 export type MotionJobState = "stopped" | "preflight" | "primed" | "armed" | "running" | "holding" | "active" | "hold" | "stopping" | "fault_latched";
 
@@ -167,6 +173,8 @@ export type MotionJobTransport = {
   drainLatestUpdates?(): Promise<void>;
   /** Drop a locally unsent latest frame before a terminal lifecycle command. */
   discardLatestUpdates?(): void;
+  /** Optional public-path policy resolved at serialization, never sent as a profile field. */
+  continuousNetworkTolerance?: ContinuousNetworkToleranceProfile;
 };
 
 type FetchRequest = (
@@ -256,7 +264,10 @@ export class MotionJobClient {
 
 export class MotionJobSession {
   private sequence: number;
+  /** Release is confirmed only by stop(), never by an observed terminal heartbeat. */
   private stopped = false;
+  /** Blocks new targets after native terminal evidence while preserving stop(). */
+  private terminalObserved = false;
 
   constructor(private readonly client: MotionJobTransport, private job: MotionJob) {
     this.sequence = job.last_sequence;
@@ -342,13 +353,19 @@ export class MotionJobSession {
     if (input.delivery !== undefined && input.delivery !== "confirmed" && input.delivery !== "latest") {
       throw new Error("frame delivery must be confirmed or latest");
     }
-    const sourceMaxAgeMs = input.sourceMaxAgeMs;
+    const effectiveIntent = input.intentMode ?? this.job.intent_mode;
+    const profileSourceMaxAgeMs = effectiveIntent === "continuous_setpoint"
+      && typeof this.client.continuousNetworkTolerance === "object"
+      ? this.client.continuousNetworkTolerance.sourceMaxAgeMs
+      : undefined;
+    // An explicit frame policy takes precedence over the session default.
+    const sourceMaxAgeMs = input.sourceMaxAgeMs ?? profileSourceMaxAgeMs;
     if (sourceMaxAgeMs !== undefined) {
-      if (input.intentMode !== "execute_goal") {
-        throw new Error("sourceMaxAgeMs requires intentMode execute_goal");
+      if (effectiveIntent !== "execute_goal" && effectiveIntent !== "continuous_setpoint") {
+        throw new Error("sourceMaxAgeMs requires intentMode execute_goal or continuous_setpoint");
       }
-      if (input.delivery !== "confirmed") {
-        throw new Error("sourceMaxAgeMs requires confirmed frame delivery");
+      if (effectiveIntent === "execute_goal" && input.delivery !== "confirmed") {
+        throw new Error("sourceMaxAgeMs requires confirmed frame delivery for execute_goal");
       }
       if (input.clientCreatedAtMs === undefined) {
         throw new Error("sourceMaxAgeMs requires clientCreatedAtMs");
@@ -356,9 +373,8 @@ export class MotionJobSession {
       if (!Number.isSafeInteger(sourceMaxAgeMs) || sourceMaxAgeMs <= 500 || sourceMaxAgeMs > 2_000) {
         throw new Error("sourceMaxAgeMs must be an integer from 501 through 2000");
       }
-      // A discrete multi-chain goal is safe only when every declared chain
-      // carries one explicit pose. Never infer a held pose for an omitted
-      // chain while granting the longer correlated source-age envelope.
+      // A longer source envelope is safe only for a complete single-pose
+      // frame. Never infer a held pose for an omitted chain while granting it.
       if (
         targets.length !== scope.length
         || targets.some(target => target.points.length !== 1)
@@ -438,6 +454,19 @@ export class MotionJobSession {
       timeoutMs,
     );
     this.job = result.job;
+    // HTTP success only confirms that the public route replied. A terminal
+    // native job is a failed liveness renewal, never permission to continue
+    // publishing targets or to automatically re-arm this session.
+    if (result.job.state === "stopped" || result.job.state === "fault_latched") {
+      this.terminalObserved = true;
+      throw new MotionControlError({
+        ok: false,
+        error: `motion heartbeat observed terminal job state ${result.job.state}${result.job.terminal_reason ? `: ${result.job.terminal_reason}` : ""}`,
+        code: "MOTION_SESSION_TERMINAL",
+        domain: "motion",
+        retryable: false,
+      }, 409);
+    }
   }
 
   /**
@@ -482,6 +511,7 @@ export class MotionJobSession {
 
   private requireActive(): void {
     if (this.stopped) throw new Error("motion job session is already stopped");
+    if (this.terminalObserved) throw new Error("motion job session observed a terminal state; call stop() to confirm release");
   }
 }
 

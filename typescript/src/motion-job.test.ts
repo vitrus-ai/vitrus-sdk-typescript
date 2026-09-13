@@ -156,7 +156,7 @@ test("an execute-goal frame may carry a bounded source-age envelope only on the 
   expect(published).toEqual([]);
   expect(requests).toEqual([expect.objectContaining({ intent_mode: "execute_goal", source_max_age_ms: 2_000, client_created_at_ms: 1_000 })]);
   await expect(session.updateDeviceIkFrame({ ...goal, delivery: "latest" })).rejects.toThrow("confirmed frame delivery");
-  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint" })).rejects.toThrow("intentMode execute_goal");
+  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint", delivery: "latest" })).resolves.toMatchObject({ clientInputSequence: 2 });
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 500 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 2_001 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
@@ -178,9 +178,9 @@ test("an execute-goal frame may carry a bounded source-age envelope only on the 
   // The SDK does not need the native config to prove serialization: this is
   // the exact complete LEFT_ARM + NECK Cartesian frame plus four static
   // declared auxiliary targets carried over the confirmed public path.
-  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ accepted: true, clientInputSequence: 2 });
+  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ accepted: true, clientInputSequence: 3 });
   expect(requests.at(-1)).toMatchObject({
-    sequence: 2, intent_mode: "execute_goal", source_max_age_ms: 2_000,
+    sequence: 3, intent_mode: "execute_goal", source_max_age_ms: 2_000,
     controlled_chains: ["LEFT_ARM", "NECK"],
     chain_targets: [{ chain: "LEFT_ARM" }, { chain: "NECK" }],
     auxiliary_joint_targets: left11NeckGoal.auxiliaryJointTargets,
@@ -197,11 +197,64 @@ test("an execute-goal frame may carry a bounded source-age envelope only on the 
   ] })).rejects.toThrow("unique subset");
   expect(requests).toHaveLength(requestsBeforeInvalid);
   // Reusing the valid frame proves rejected client-side shapes did not spend
-  // a serialized input sequence (the preceding valid composite was seq=2).
-  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ clientInputSequence: 3 });
+  // a serialized input sequence (the preceding valid composite was seq=3).
+  await expect(session.updateDeviceIkFrame(left11NeckGoal)).resolves.toMatchObject({ clientInputSequence: 4 });
   await expect(session.updateDeviceIkFrame({ ...goal, delivery: "latest" })).rejects.toThrow("confirmed frame delivery");
-  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint" })).rejects.toThrow("intentMode execute_goal");
+  await expect(session.updateDeviceIkFrame({ ...goal, intentMode: "continuous_setpoint", delivery: "latest" })).resolves.toMatchObject({ clientInputSequence: 5 });
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 500 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, sourceMaxAgeMs: 2_001 })).rejects.toThrow("501 through 2000");
   await expect(session.updateDeviceIkFrame({ ...goal, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
+});
+
+test("bounded continuous network tolerance preserves source identity and requires a complete frame", async () => {
+  const job: MotionJob = {
+    job_id: "continuous", epoch: 1, mode: "device_ik", state: "active",
+    joint_names: ["LEFT_SHOULDER_A", "RIGHT_SHOULDER_A"], configuration_revision: "test",
+    last_sequence: 0, intent_mode: "continuous_setpoint",
+  };
+  const published: Record<string, unknown>[] = [];
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job }), supportsLatestUpdates: true,
+    continuousNetworkTolerance: { sourceMaxAgeMs: 1_200 },
+    publishLatestUpdate: body => { published.push(body); return { state: "queued" }; },
+    request: async <T>() => ({ ok: true, job, result: { accepted: true } } as T),
+  }, job);
+  const complete = {
+    controlledChains: ["LEFT_ARM", "RIGHT_ARM"],
+    targets: [
+      { chain: "LEFT_ARM", points: [{ position_m: [0, 0, 0] as [number, number, number] }] },
+      { chain: "RIGHT_ARM", points: [{ position_m: [0, 0, 0] as [number, number, number] }] },
+    ],
+    clientCreatedAtMs: 10_000,
+  };
+  await expect(session.updateDeviceIkFrame(complete)).resolves.toMatchObject({ state: "queued", clientInputSequence: 1 });
+  expect(published).toEqual([expect.objectContaining({ sequence: 1, client_created_at_ms: 10_000, source_max_age_ms: 1_200 })]);
+  await expect(session.updateDeviceIkFrame({ ...complete, targets: complete.targets.slice(0, 1), clientCreatedAtMs: 10_001 })).rejects.toThrow("every controlled chain");
+  await expect(session.updateDeviceIkFrame({ ...complete, sourceMaxAgeMs: 501, clientCreatedAtMs: undefined })).rejects.toThrow("clientCreatedAtMs");
+  expect(published).toHaveLength(1);
+});
+
+test("an HTTP 200 heartbeat reporting a terminal job fails closed but preserves stop confirmation", async () => {
+  const active: MotionJob = { job_id: "terminal", epoch: 2, mode: "device_ik", state: "active", joint_names: ["A"], configuration_revision: "test", last_sequence: 0 };
+  let updates = 0, stops = 0;
+  const session = new MotionJobSession({
+    status: async () => ({ ok: true, job: active }),
+    request: async <T>(path: string) => {
+      if (path.endsWith("heartbeat")) return { ok: true, job: { ...active, state: "stopped" as const, terminal_reason: "native_liveness_expired" } } as T;
+      if (path.endsWith("stop")) {
+        stops += 1;
+        return { ok: true, stopped: true, job: { ...active, state: "stopped" as const } } as T;
+      }
+      updates += 1;
+      return { ok: true, job: active, result: { accepted: true } } as T;
+    },
+  }, active);
+  await session.heartbeat().then(
+    () => { throw new Error("expected terminal heartbeat"); },
+    (error: unknown) => expect(error).toMatchObject({ payload: { code: "MOTION_SESSION_TERMINAL", retryable: false } }),
+  );
+  await expect(session.updateJointTargets([{ joint_name: "A", position_deg: 1 }])).rejects.toThrow("terminal state");
+  expect(updates).toBe(0);
+  await expect(session.stop("terminal_heartbeat_release")).resolves.toBeUndefined();
+  expect(stops).toBe(1);
 });
