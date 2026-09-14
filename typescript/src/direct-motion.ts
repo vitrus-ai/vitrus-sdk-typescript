@@ -98,6 +98,18 @@ export type LatestUpdateObservation = {
   inputSequence: number | null;
   /** `receipt_unknown` means this SDK cannot determine public admission; it never means the lease was released. */
   state: "sending" | "queued" | "receipt_unknown" | "failed";
+  /**
+   * The normalized desired-state admission stage, when the public mailbox
+   * acknowledged this update. It is deliberately distinct from native
+   * application and encoder measurement.
+   */
+  delivery?: "desired_state_accepted";
+  /** Legacy public-mailbox wording retained for callers that need wire provenance. */
+  legacyDelivery?: string;
+  /** Stable replaceable-state identity for correlating desired, applied, and measured evidence. */
+  desiredStateKey?: string;
+  /** Bridge request correlation when the receipt includes one. */
+  traceId?: string;
   /** Time the SDK actually began the public request, never a native ACK. */
   sentAtMs: number;
   /** Time the public mailbox receipt or failure was observed. */
@@ -363,7 +375,10 @@ export class DirectMotionJobClient implements MotionJobTransport {
         ? this.latestStream!.submit(createRequestId(), payload, timeoutMs, this.latestReceiptTimeoutMs)
         : this.call<Record<string, unknown>>("update", payload, timeoutMs);
       request = receipt.then((value) => {
-        this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt: value });
+        this.publishLatestObservation({
+          jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt: value,
+          ...normalizedDesiredReceipt(value, next.payload),
+        });
       }, (error) => {
         const message = error instanceof Error ? error.message : String(error);
         // A lost public receipt cannot prove rejection or authority loss. The
@@ -602,6 +617,23 @@ function desiredStateKey(payload: Record<string, unknown>): string | undefined {
     ? [...payload.controlled_chains as string[]].sort().join(",")
     : "";
   return jobId ? `device_ik:${jobId}:${chains || "auxiliary"}` : undefined;
+}
+
+/**
+ * Older Bridges return `latest_only_public_mailbox` inside their raw async
+ * receipt. Present the current contract on every SDK observation without
+ * rewriting that raw wire receipt or implying native application.
+ */
+function normalizedDesiredReceipt(receipt: Record<string, unknown>, payload: Record<string, unknown>): Pick<LatestUpdateObservation, "delivery" | "legacyDelivery" | "desiredStateKey" | "traceId"> {
+  const result = record(receipt.result) ?? receipt;
+  const legacyDelivery = text(result.delivery) ?? text(receipt.delivery);
+  const traceId = text(receipt.trace_id) ?? text(receipt.traceId) ?? text(result.request_id) ?? text(result.trace_id);
+  return {
+    delivery: "desired_state_accepted",
+    ...(legacyDelivery && legacyDelivery !== "desired_state_accepted" ? { legacyDelivery } : {}),
+    ...(desiredStateKey(payload) ? { desiredStateKey: desiredStateKey(payload) } : {}),
+    ...(traceId ? { traceId } : {}),
+  };
 }
 
 function stableJson(value: unknown): string {

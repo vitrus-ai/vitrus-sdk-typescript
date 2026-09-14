@@ -165,6 +165,23 @@ test("latest desired-state admission exposes the normalized receipt name and ret
   client.discardLatestUpdates();
 });
 
+test("an older Bridge receipt is normalized as desired-state admission without rewriting its raw provenance", async () => {
+  const client = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", latestOnlyUpdates: true,
+    fetch: (async () => response({
+      ok: true, trace_id: "bridge-trace-7",
+      result: { state: "queued", request_id: "bridge-request-7", delivery: "latest_only_public_mailbox" },
+    }, 202)) as typeof fetch,
+  });
+  client.publishLatestUpdate({ job_id: "job", epoch: 1, sequence: 7, controlled_chains: ["left_arm"], chain_targets: [{ chain: "left_arm", points: [{ position_m: [0, 0, 0] }] }] });
+  await client.drainLatestUpdates();
+  expect(client.latestUpdateStatus()).toMatchObject({
+    state: "queued", inputSequence: 7, delivery: "desired_state_accepted",
+    legacyDelivery: "latest_only_public_mailbox", desiredStateKey: "device_ik:job:left_arm", traceId: "bridge-trace-7",
+    receipt: { result: { delivery: "latest_only_public_mailbox" } },
+  });
+});
+
 test("an ambiguous latest receipt remains observable without making drain fail", async () => {
   const client = new DirectMotionJobClient({ endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", latestOnlyUpdates: true,
     fetch: (async () => { throw new TypeError("network interrupted after send"); }) as typeof fetch,
