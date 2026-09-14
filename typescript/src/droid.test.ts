@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Droid } from "./droid-live.js";
+import { Droid, correlateControlState, normalizeControlState } from "./droid-live.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -197,10 +197,11 @@ describe("Droid realtime and control sessions", () => {
       robot_id: "droid-1",
       lease_id: "lease-1",
       sequence: 1,
-      ttl_ms: 400,
       safety: { requires_calibration: true, respect_limits: true },
       targets: [{ joint_name: "LEFT_ELBOW", position_deg: 12, velocity_deg_s: 30 }],
     });
+    expect(command).not.toHaveProperty("ttl_ms");
+    expect(command).not.toHaveProperty("deadline_ms");
   });
 
   test("sends motion through the explicit local Golden Edge transport", async () => {
@@ -244,6 +245,62 @@ describe("Droid realtime and control sessions", () => {
     expect(result).toMatchObject({ status: "acknowledged", route: "local", requestId: "1" });
     expect(second.requestId).toBe("2");
     expect(requestedPaths).toEqual(["/v1/droids/resolve", "/api/dora/joint-targets", "/api/dora/joint-targets"]);
+  });
+
+  test("keeps a healthy lease independent of deprecated command timeout and reports desired, applied, and measured state separately", async () => {
+    let command: Record<string, unknown> | undefined;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X" });
+      if (url.pathname === "/api/dora/joint-targets") {
+        command = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({
+          ok: true,
+          transport: "broker-direct",
+          stream: "joint_targets",
+          sequence: command.sequence,
+          lease_id: "lease-1",
+          delivery: "latest_only_public_mailbox",
+          broker: { command_id: "native-7", input_sequence: command.sequence, applied_at_ms: 1_123 },
+        });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", {
+      apiKey: "test-key",
+      endpoint: "https://relay.test",
+      edgeEndpoint: "http://r05-edge:8782",
+      motionTransport: "edge",
+    });
+    const receipt = await droid.motion.sendTargets(
+      [{ jointName: "NECK_HEAD", displayDeg: 5 }],
+      { leaseId: "lease-1", timeoutMs: 1, desiredStateKey: "neck" },
+    );
+
+    expect(command).not.toHaveProperty("ttl_ms");
+    expect(command).not.toHaveProperty("deadline_ms");
+    expect(receipt.control).toMatchObject({
+      leaseId: "lease-1",
+      desired: { stage: "desired_state_accepted", sequence: 1, key: "neck", legacyDelivery: "latest_only_public_mailbox" },
+      applied: { stage: "applied", sequence: 1, commandId: "native-7", appliedAtMs: 1_123 },
+    });
+
+    const control = correlateControlState(receipt, {
+      schema: "vitrus.telemetry.state.v1",
+      timestamp: "2026-09-13T00:00:02.000Z",
+      raw: {
+        lease_id: "lease-1",
+        measured: { input_sequence: 1, measured_at_ms: 2_000, age_ms: 12 },
+      },
+    });
+    expect(control).toMatchObject({
+      desired: { stage: "desired_state_accepted", sequence: 1 },
+      applied: { stage: "applied", commandId: "native-7" },
+      measured: { stage: "measured", sequence: 1, measuredAtMs: 2_000, ageMs: 12 },
+    });
+    expect(normalizeControlState({ lease_id: "lease-1", sequence: 2, desired_state_key: "right_gripper" })).toMatchObject({
+      desired: { stage: "desired_state_accepted", sequence: 2, key: "right_gripper" },
+    });
   });
 
   test("owns authority and a bounded motion operation entirely on the Edge path", async () => {

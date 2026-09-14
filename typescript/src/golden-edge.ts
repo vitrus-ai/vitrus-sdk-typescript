@@ -15,6 +15,10 @@ export type GoldenEdgePublishResult = {
   transport: "dora" | "broker-direct";
   stream: "joint_targets";
   sequence?: number;
+  /** Public SDK wording: newest desired state was accepted by the edge. */
+  delivery?: "desired_state_accepted";
+  /** Wire wording from older edge gateways, retained for diagnostics. */
+  legacy_delivery?: string;
   dropped?: string;
   error?: string;
 };
@@ -97,7 +101,12 @@ export class GoldenEdgeClient {
 
   async sendJointTargets(
     targets: ControlJointTarget[],
-    options: { ttlMs?: number; sentAtMs?: number } = {},
+    options: {
+      /** @deprecated A command lifetime is not a control lease lifetime. */
+      ttlMs?: number;
+      sentAtMs?: number;
+      desiredStateKey?: string;
+    } = {},
   ): Promise<GoldenEdgePublishResult> {
     if (!this.leaseId) throw new Error("Golden Edge joint targets require an acquired lease");
     const command = createJointTargetsMessage({
@@ -105,8 +114,8 @@ export class GoldenEdgeClient {
       leaseId: this.leaseId,
       sequence: ++this.sequence,
       source: this.options.source,
-      ttlMs: options.ttlMs,
       sentAtMs: options.sentAtMs,
+      desiredStateKey: options.desiredStateKey,
       targets,
     });
     return this.publish(command);
@@ -121,7 +130,14 @@ export class GoldenEdgeClient {
     if (!result.ok || result.dropped) {
       throw new Error(result.error || result.dropped || "Golden Edge rejected joint targets");
     }
-    return result;
+    const legacyDelivery = typeof (result as Record<string, unknown>).delivery === "string"
+      ? String((result as Record<string, unknown>).delivery)
+      : undefined;
+    return {
+      ...result,
+      delivery: "desired_state_accepted",
+      ...(legacyDelivery && legacyDelivery !== "desired_state_accepted" ? { legacy_delivery: legacyDelivery } : {}),
+    };
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {

@@ -11,7 +11,7 @@ npm install vitrus
 ## Connect to a droid
 
 ```ts
-import Vitrus from "vitrus";
+import Vitrus, { correlateControlState } from "vitrus";
 
 const droid = await Vitrus.Droid.connect("VTRS-<MODEL>-<YYMM>-<UNIQUE_ID>", {
   apiKey: process.env.VITRUS_API_KEY!,
@@ -38,11 +38,40 @@ const lease = await droid.control.acquire({ durationMs: 5_000 });
 
 await droid.motion.sendTargets(
   [{ jointName: "ARM_JOINT", displayDeg: 5 }],
-  { leaseId: lease.id },
+  { leaseId: lease.id, desiredStateKey: "right_arm" },
 );
 ```
 
 Control requires an authorized API key and a lease. The Vitrus service validates commands before the robot receives them.
+
+`sendTargets` publishes the newest **desired state** for one control key. Repeated
+updates for `right_arm`, `neck`, `left_gripper`, or `right_gripper` replace a
+pending older desired state at the Edge; a slow network does not turn a valid
+lease into a command timeout. A lease ends only when it is released, expires,
+or is explicitly stopped/faulted.
+
+The returned `control` field distinguishes three facts a UI must not conflate:
+
+```ts
+const receipt = await droid.motion.sendTargets(
+  [{ jointName: "NECK_A", displayDeg: 12 }],
+  { leaseId: lease.id, desiredStateKey: "neck" },
+);
+
+// `desired_state_accepted`: Edge has stored the newest pose for `neck`.
+receipt.control?.desired;
+// `applied`: VitrusOS has a correlated native broker result, if available.
+receipt.control?.applied;
+
+const telemetry = await droid.telemetry.snapshot();
+// `measured`: encoder feedback, with its input sequence and age when supplied.
+correlateControlState(receipt, telemetry).measured;
+```
+
+`timeoutMs` remains accepted in TypeScript source for compatibility, but no
+longer becomes a physical command deadline. Do not use the legacy raw receipt
+label `latest_only_public_mailbox`: the SDK normalizes it to
+`desired_state_accepted` and retains the old label as `legacyDelivery` for logs.
 
 The default Web/JS control path is the authenticated Bridge. The Bridge and the VitrusOS relay use Zenoh behind the API boundary, so browser clients never need robot IPs or Zenoh endpoints.
 

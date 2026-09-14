@@ -106,6 +106,8 @@ export type DroidTelemetry = {
   joints?: Record<string, unknown>;
   cameras?: Array<Record<string, unknown>>;
   motorBridge?: Record<string, unknown>;
+  /** Last known desired/applied/measured correlation from VitrusOS. */
+  control?: DroidControlState;
   raw: Record<string, unknown>;
 };
 
@@ -139,10 +141,52 @@ export type JointTarget = {
 
 export type JointTargetCommand = ControlJointTargetsMessage;
 
+export type ControlStage = "desired_state_accepted" | "applied" | "measured" | "rejected" | "unknown";
+
+/** A desired state is the newest target for one control key, never a promise
+ * that every browser drag event will be physically executed. */
+export type DesiredControlState = {
+  stage: "desired_state_accepted";
+  sequence: number;
+  leaseId: string;
+  key: string;
+  acceptedAtMs?: number;
+  /** Old edge wording, retained so logs and existing integrations stay legible. */
+  legacyDelivery?: string;
+};
+
+export type AppliedControlState = {
+  stage: "applied" | "rejected" | "unknown";
+  sequence?: number;
+  commandId?: string;
+  appliedAtMs?: number;
+  error?: string;
+};
+
+export type MeasuredControlState = {
+  stage: "measured" | "unknown";
+  sequence?: number;
+  measuredAtMs?: number;
+  ageMs?: number;
+};
+
+/**
+ * One correlation object for UI loops. Desired is local/edge admission,
+ * applied is native broker execution, and measured comes from telemetry.
+ */
+export type DroidControlState = {
+  leaseId?: string;
+  desired?: DesiredControlState;
+  applied?: AppliedControlState;
+  measured?: MeasuredControlState;
+};
+
 export type DroidCommandResult = {
   requestId: string;
+  /** Legacy transport-level status. Use `control.desired/applied/measured` for execution truth. */
   status: "queued" | "sent" | "acknowledged" | "timeout" | "failed" | "not_reachable";
   route: "relay" | "local";
+  control?: DroidControlState;
   result?: Record<string, unknown>;
   error?: string;
 };
@@ -164,7 +208,14 @@ export type MotionOperation = {
 
 export type MotionTargetOptions = {
   leaseId: string;
+  /**
+   * @deprecated No longer defines command lifetime. Authority ends only when
+   * the lease is released, expires, or an explicit stop/fault occurs. Retained
+   * as a source-compatible option for callers that still pass it.
+   */
   timeoutMs?: number;
+  /** A stable newest-state lane, for example `neck`, `left_arm`, or `right_gripper`. */
+  desiredStateKey?: string;
 };
 
 export type MotionSubmitOptions = MotionTargetOptions & {
@@ -237,6 +288,80 @@ function firstRecord(...values: unknown[]): Record<string, unknown> {
   return values.map(parseJsonRecord).find((value) => Object.keys(value).length > 0) ?? {};
 }
 
+function stringValue(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+}
+
+function numberValue(...values: unknown[]): number | undefined {
+  return values.map(finiteNumber).find((value): value is number => value !== undefined);
+}
+
+/** Normalize both old `latest_only_public_mailbox` receipts and the compact
+ * desired-state receipt returned by the current edge. */
+export function normalizeControlState(
+  value: unknown,
+  fallback: { leaseId?: string; sequence?: number; desiredStateKey?: string; acceptedAtMs?: number } = {},
+): DroidControlState {
+  const raw = parseJsonRecord(value);
+  const nested = firstRecord(raw.control, raw.control_state, raw.execution, raw.receipt);
+  const desiredRaw = firstRecord(nested.desired, raw.desired, raw.desired_state);
+  const appliedRaw = firstRecord(nested.applied, raw.applied, raw.broker, raw.native);
+  const measuredRaw = firstRecord(nested.measured, raw.measured, raw.feedback);
+  const delivery = stringValue(raw.delivery, nested.delivery, desiredRaw.delivery);
+  const legacyDelivery = stringValue(raw.legacy_delivery, nested.legacy_delivery, desiredRaw.legacy_delivery);
+  const leaseId = stringValue(raw.lease_id, raw.leaseId, nested.lease_id, nested.leaseId, fallback.leaseId);
+  const sequence = numberValue(raw.sequence, raw.input_sequence, nested.sequence, nested.input_sequence, desiredRaw.sequence, fallback.sequence);
+  const key = stringValue(raw.desired_state_key, raw.coalesce_key, nested.key, desiredRaw.key, fallback.desiredStateKey);
+  const acceptedAtMs = numberValue(raw.accepted_at_ms, raw.received_at_ms, nested.accepted_at_ms, desiredRaw.accepted_at_ms, fallback.acceptedAtMs);
+  const commandId = stringValue(appliedRaw.command_id, appliedRaw.commandId, raw.command_id, raw.commandId);
+  const appliedSequence = numberValue(appliedRaw.sequence, appliedRaw.input_sequence, raw.applied_sequence, raw.broker_sequence);
+  const appliedError = stringValue(appliedRaw.error, raw.error);
+  const appliedAtMs = numberValue(appliedRaw.applied_at_ms, appliedRaw.accepted_at_ms, raw.applied_at_ms);
+  const measuredAtMs = numberValue(measuredRaw.measured_at_ms, measuredRaw.timestamp_ms, raw.measured_at_ms);
+  const measuredSequence = numberValue(measuredRaw.sequence, measuredRaw.input_sequence, raw.measured_sequence);
+  const measuredAgeMs = numberValue(measuredRaw.age_ms, raw.measurement_age_ms);
+  const desired = sequence != null && leaseId && key ? {
+    stage: "desired_state_accepted" as const,
+    sequence,
+    leaseId,
+    key,
+    ...(acceptedAtMs == null ? {} : { acceptedAtMs }),
+    ...(legacyDelivery ? { legacyDelivery } : delivery && delivery !== "desired_state_accepted" ? { legacyDelivery: delivery } : {}),
+  } : undefined;
+  const applied = commandId || appliedSequence != null || appliedError ? {
+    stage: appliedError ? "rejected" as const : commandId || appliedSequence != null ? "applied" as const : "unknown" as const,
+    ...(appliedSequence == null ? {} : { sequence: appliedSequence }),
+    ...(commandId == null ? {} : { commandId }),
+    ...(appliedAtMs == null ? {} : { appliedAtMs }),
+    ...(appliedError == null ? {} : { error: appliedError }),
+  } : undefined;
+  const measured = measuredAtMs != null || measuredSequence != null || measuredAgeMs != null ? {
+    stage: measuredAtMs != null || measuredSequence != null ? "measured" as const : "unknown" as const,
+    ...(measuredSequence == null ? {} : { sequence: measuredSequence }),
+    ...(measuredAtMs == null ? {} : { measuredAtMs }),
+    ...(measuredAgeMs == null ? {} : { ageMs: measuredAgeMs }),
+  } : undefined;
+  return {
+    ...(leaseId == null ? {} : { leaseId }),
+    ...(desired == null ? {} : { desired }),
+    ...(applied == null ? {} : { applied }),
+    ...(measured == null ? {} : { measured }),
+  };
+}
+
+/** Correlate the acknowledged desired state with the newest telemetry state.
+ * A UI can call this on every telemetry update without inventing execution. */
+export function correlateControlState(command: DroidCommandResult, telemetry: DroidTelemetry): DroidControlState {
+  const commandState = command.control ?? {};
+  const telemetryState = telemetry.control ?? normalizeControlState(telemetry.raw);
+  return {
+    leaseId: telemetryState.leaseId ?? commandState.leaseId,
+    desired: commandState.desired,
+    applied: telemetryState.applied ?? commandState.applied,
+    measured: telemetryState.measured ?? commandState.measured,
+  };
+}
+
 export class Droid {
   static async connect(ref: DroidRef, options: DroidConnectionOptions): Promise<Droid> {
     const droid = new Droid(ref, options);
@@ -296,7 +421,18 @@ export class Droid {
       closeSession: async (sessionId) => { await this.delete(`/v1/droids/cameras/sessions/${encodeURIComponent(sessionId)}`); },
     };
     this.telemetry = {
-      snapshot: () => this.get<DroidTelemetry>("/v1/droids/telemetry"),
+      snapshot: async () => {
+        const raw = await this.get<Record<string, unknown>>("/v1/droids/telemetry");
+        return {
+          schema: typeof raw.schema === "string" ? raw.schema : "vitrus.telemetry.state.v1",
+          timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString(),
+          joints: parseJsonRecord(raw.joints),
+          cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
+          motorBridge: parseJsonRecord(raw.motor_bridge ?? raw.motorBridge),
+          control: normalizeControlState(raw),
+          raw,
+        };
+      },
       subscribe: (listener, request) => this.subscribeEvents((event) => {
         if (event.type !== "droid.telemetry") return;
         const raw = event.telemetry;
@@ -306,6 +442,7 @@ export class Droid {
           joints: parseJsonRecord(raw.joints),
           cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
           motorBridge: parseJsonRecord(raw.motor_bridge ?? raw.motorBridge),
+          control: normalizeControlState(raw),
           raw,
         });
       }, request),
@@ -535,7 +672,11 @@ export class Droid {
       robotId: identity.id,
       leaseId: request.leaseId,
       sequence: ++this.sequence,
-      ttlMs: request.timeoutMs,
+      // `timeoutMs` used to become a physical source-age deadline. A slow
+      // network then killed valid desired state while its lease was healthy.
+      // Keep the option in the public type for old callers, but do not put it
+      // on the wire as a command-expiry gate.
+      desiredStateKey: request.desiredStateKey,
       edgeKeepaliveMs: request.holdMs,
       operationId: request.operationId,
       targets: targets.map((target) => ({
@@ -558,6 +699,12 @@ export class Droid {
         requestId: String(result.sequence ?? command.sequence),
         status: "acknowledged",
         route: "local",
+        control: normalizeControlState(result, {
+          leaseId: request.leaseId,
+          sequence: command.sequence,
+          desiredStateKey: command.delivery.key,
+          acceptedAtMs: Date.now(),
+        }),
         result: result as unknown as Record<string, unknown>,
       };
     }
@@ -580,9 +727,29 @@ export class Droid {
         this.zenohLeaseId = request.leaseId;
       }
       const result = await this.zenohClient.publish(command);
-      return { requestId: String(result.sequence), status: "acknowledged", route: "local", result };
+      return {
+        requestId: String(result.sequence),
+        status: "acknowledged",
+        route: "local",
+        control: normalizeControlState(result, {
+          leaseId: request.leaseId,
+          sequence: command.sequence,
+          desiredStateKey: command.delivery.key,
+          acceptedAtMs: Date.now(),
+        }),
+        result,
+      };
     }
-    return this.post<DroidCommandResult>("/v1/droids/control/joint-targets", command);
+    const result = await this.post<DroidCommandResult>("/v1/droids/control/joint-targets", command);
+    return {
+      ...result,
+      control: normalizeControlState(result.result ?? result, {
+        leaseId: request.leaseId,
+        sequence: command.sequence,
+        desiredStateKey: command.delivery.key,
+        acceptedAtMs: Date.now(),
+      }),
+    };
   }
 
   private async get<T>(path: string, params: Record<string, string> = {}): Promise<T> {

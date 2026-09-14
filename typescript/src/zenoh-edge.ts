@@ -17,6 +17,7 @@ export type ZenohEdgePublishResult = {
   stream: "joint_targets";
   sequence: number;
   published: number;
+  delivery: "desired_state_accepted";
 };
 
 const DEFAULT_TOPIC = "vitrus/servo/targets";
@@ -49,12 +50,20 @@ export class ZenohEdgeClient {
         lease_id: this.leaseId,
         seq: command.sequence,
         issued_at_ms: command.sent_at_ms,
-        deadline_ms: command.deadline_ms,
+        ...(command.deadline_ms == null ? {} : { deadline_ms: command.deadline_ms }),
+        delivery: command.delivery,
         target: targetToEdgeTarget(target),
       });
       await session.put(topic, payload, { express: true });
     }
-    return { ok: true, transport: "zenoh", stream: "joint_targets", sequence: command.sequence, published: command.targets.length };
+    return {
+      ok: true,
+      transport: "zenoh",
+      stream: "joint_targets",
+      sequence: command.sequence,
+      published: command.targets.length,
+      delivery: "desired_state_accepted",
+    };
   }
 
   async close(): Promise<void> {
