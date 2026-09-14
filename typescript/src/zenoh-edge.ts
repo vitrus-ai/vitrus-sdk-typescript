@@ -16,7 +16,11 @@ export type ZenohEdgePublishResult = {
   transport: "zenoh";
   stream: "joint_targets";
   sequence: number;
+  client_sequence: number;
+  trace_id: string;
+  desired_state_key: string;
   published: number;
+  delivery: "desired_state_accepted";
 };
 
 // Keep the native edge path on the same atomic command topic consumed by
@@ -51,7 +55,12 @@ export class ZenohEdgeClient {
       targets: command.targets.map(targetToEdgeTarget),
     });
     await session.put(topic, payload, { express: true });
-    return { ok: true, transport: "zenoh", stream: "joint_targets", sequence: command.sequence, published: command.targets.length };
+    return {
+      ok: true, transport: "zenoh", stream: "joint_targets", sequence: command.sequence,
+      client_sequence: command.client_sequence, trace_id: command.trace_id,
+      desired_state_key: command.delivery.key, published: command.targets.length,
+      delivery: "desired_state_accepted",
+    };
   }
 
   async close(): Promise<void> {

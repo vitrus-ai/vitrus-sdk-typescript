@@ -321,7 +321,9 @@ describe("Droid realtime and control sessions", () => {
       robot_id: "droid-1",
       lease_id: "lease-1",
       sequence: 1,
-      ttl_ms: 400,
+      client_sequence: 1,
+      trace_id: "vitrus-sdk:lease-1:1",
+      delivery: { kind: "desired_state", key: "LEFT_ELBOW", replace_pending: true },
       edge_keepalive_ms: 1_500,
       safety: { requires_calibration: true, respect_limits: true },
       targets: [{
@@ -333,11 +335,39 @@ describe("Droid realtime and control sessions", () => {
         max_torque_nm: 0.25,
       }],
     });
+    expect(command).not.toHaveProperty("ttl_ms");
+    expect(command).not.toHaveProperty("deadline_ms");
 
     await expect(droid.motion.sendTargets(
       [{ jointName: "LEFT_ELBOW", displayDeg: 12 }],
       { leaseId: "lease-1", ttlMs: 400, edgeKeepaliveMs: 15_001 },
     )).rejects.toThrow("edgeKeepaliveMs must be an integer between 1 and 15000 ms");
+  });
+
+  test("keeps a valid lease after an unobserved atomic-pair receipt and accepts a newer desired state", async () => {
+    let writes = 0;
+    const paths: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input)); paths.push(url.pathname);
+      if (url.pathname === "/v1/droids/resolve") return jsonResponse({ id: "droid-1", serialNumber: "VTRS-R06-2607-R2D2X", model: "R06", displayName: null, organizationId: "org", status: "online", enrollmentState: "enrolled" });
+      if (url.pathname === "/api/dora/joint-targets") {
+        writes += 1;
+        if (writes === 1) throw new Error("motor relay timed out awaiting receipt");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({ ok: true, transport: "dora", stream: "joint_targets", sequence: body.sequence });
+      }
+      return jsonResponse({ detail: "not found" }, 404);
+    };
+    const droid = await Droid.connect("VTRS-R06-2607-R2D2X", { apiKey: "test-key", endpoint: "https://relay.test", edgeEndpoint: "http://r05-edge:8782", motionTransport: "edge" });
+    const first = await droid.motion.sendAuxiliaryPairTargets([
+      { jointName: "LEFT_GRIPPER_LEFT_FINGER_A", displayDeg: 4 }, { jointName: "LEFT_GRIPPER_RIGHT_FINGER_A", displayDeg: -4 },
+    ], { leaseId: "lease-1", desiredStateKey: "left_gripper:base", traceId: "screen-1" });
+    const second = await droid.motion.sendAuxiliaryPairTargets([
+      { jointName: "LEFT_GRIPPER_LEFT_FINGER_A", displayDeg: 6 }, { jointName: "LEFT_GRIPPER_RIGHT_FINGER_A", displayDeg: -6 },
+    ], { leaseId: "lease-1", desiredStateKey: "left_gripper:base", traceId: "screen-2" });
+    expect(first).toMatchObject({ status: "timeout", control: { receipt: { stage: "receipt_unknown", leaseId: "lease-1", clientSequence: 1, traceId: "screen-1" } } });
+    expect(second).toMatchObject({ status: "acknowledged", control: { desired: { key: "left_gripper:base", clientSequence: 2, traceId: "screen-2" } } });
+    expect(paths).not.toContain("/api/dora/release");
   });
 
   test("sends a discovered semantic effector through the direct SDK API", async () => {

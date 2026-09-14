@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { GoldenEdgeClient, GoldenEdgeRequestTimeoutError } from "./golden-edge.js";
+import { createAuxiliaryPairDesiredStateMessage } from "./contracts.js";
 
 describe("GoldenEdgeClient", () => {
   test("keeps the Window receiver when using the ambient browser fetch", async () => {
@@ -46,9 +47,13 @@ describe("GoldenEdgeClient", () => {
       lease_id: "lease-1",
       sequence: 1,
       sent_at_ms: 1_000,
-      deadline_ms: 1_300,
+      client_sequence: 1,
+      trace_id: "vitrus-sdk:lease-1:1",
+      delivery: { kind: "desired_state", key: "NECK_YAW", replace_pending: true },
       targets: [{ joint_name: "NECK_YAW", position_deg: 5 }],
     });
+    expect(body).not.toHaveProperty("ttl_ms");
+    expect(body).not.toHaveProperty("deadline_ms");
   });
 
   test("fails closed when the gateway drops a command", async () => {
@@ -66,6 +71,33 @@ describe("GoldenEdgeClient", () => {
 
     expect(client.sendJointTargets([{ joint_name: "NECK_YAW", position_deg: 5 }]))
       .rejects.toThrow("out_of_order_before_dora");
+  });
+
+  test("sends an opposed gripper pair as one atomic replaceable desired state", async () => {
+    let body: Record<string, unknown> = {};
+    const client = new GoldenEdgeClient({
+      endpoint: "http://r-05-edge:8782", robotId: "R06.cannon", leaseId: "lease-1",
+      fetch: (async (_input, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({ ok: true, transport: "dora", stream: "joint_targets" }));
+      }) as typeof fetch,
+    });
+    const receipt = await client.sendAuxiliaryPairTargets([
+      { joint_name: "LEFT_GRIPPER_LEFT_FINGER_A", position_deg: 10 },
+      { joint_name: "LEFT_GRIPPER_RIGHT_FINGER_A", position_deg: -10 },
+    ], { desiredStateKey: "left_gripper:base", traceId: "screen-42" });
+    expect(body).toMatchObject({ client_sequence: 1, trace_id: "screen-42", delivery: {
+      kind: "desired_state", key: "left_gripper:base", replace_pending: true,
+      partial: { kind: "auxiliary_pair", atomic: true, joint_names: ["LEFT_GRIPPER_LEFT_FINGER_A", "LEFT_GRIPPER_RIGHT_FINGER_A"] },
+    } });
+    expect(body.targets).toHaveLength(2);
+    expect(receipt).toMatchObject({ delivery: "desired_state_accepted", client_sequence: 1, trace_id: "screen-42" });
+  });
+
+  test("rejects a malformed auxiliary pair before transport", () => {
+    expect(() => createAuxiliaryPairDesiredStateMessage({ robotId: "R06.cannon", leaseId: "lease-1", sequence: 1, desiredStateKey: "left_gripper:base", targets: [
+      { joint_name: "LEFT_GRIPPER_LEFT_FINGER_A", position_deg: 10 }, { joint_name: "LEFT_GRIPPER_LEFT_FINGER_A", position_deg: 10 },
+    ] })).toThrow("two distinct");
   });
 
   test("rejects a false HTTP acknowledgement when the broker deadman is active", async () => {

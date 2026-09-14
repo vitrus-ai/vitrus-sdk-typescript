@@ -18,8 +18,12 @@ test("serializes a complete model binding with a control command", () => {
     configuration_revision: "a".repeat(64),
     effective_urdf_sha256: "b".repeat(64),
     model_epoch: 3,
-    deadline_ms: 350,
+    client_sequence: 1,
+    trace_id: "vitrus-sdk:lease-1:1",
+    delivery: { kind: "desired_state", key: "RIGHT_WRIST_B", replace_pending: true },
   });
+  expect(command).not.toHaveProperty("ttl_ms");
+  expect(command).not.toHaveProperty("deadline_ms");
 });
 
 test("rejects invalid model bindings before transport", () => {

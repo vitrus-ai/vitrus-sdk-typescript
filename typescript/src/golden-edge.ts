@@ -1,4 +1,5 @@
 import {
+  createAuxiliaryPairDesiredStateMessage,
   createJointTargetsMessage,
   type ControlJointTarget,
   type ControlJointTargetsMessage,
@@ -16,6 +17,11 @@ export type GoldenEdgePublishResult = {
   transport: "dora";
   stream: "joint_targets";
   sequence?: number;
+  client_sequence?: number;
+  trace_id?: string;
+  desired_state_key?: string;
+  delivery?: "desired_state_accepted";
+  legacy_delivery?: string;
   dropped?: string;
   error?: string;
   broker?: Record<string, unknown>;
@@ -145,7 +151,7 @@ export class GoldenEdgeClient {
 
   async sendJointTargets(
     targets: ControlJointTarget[],
-    options: { ttlMs?: number; sentAtMs?: number; edgeKeepaliveMs?: number; modelBinding?: ControlModelBinding } = {},
+    options: { ttlMs?: number; sentAtMs?: number; edgeKeepaliveMs?: number; modelBinding?: ControlModelBinding; desiredStateKey?: string; traceId?: string } = {},
   ): Promise<GoldenEdgePublishResult> {
     const command = createJointTargetsMessage({
       robotId: this.options.robotId,
@@ -153,12 +159,26 @@ export class GoldenEdgeClient {
       sequence: ++this.sequence,
       source: this.options.source,
       ttlMs: options.ttlMs,
+      desiredStateKey: options.desiredStateKey,
+      traceId: options.traceId,
       sentAtMs: options.sentAtMs,
       edgeKeepaliveMs: options.edgeKeepaliveMs,
       modelBinding: options.modelBinding ?? this.options.modelBinding,
       targets,
     });
     return this.publish(command);
+  }
+
+  async sendAuxiliaryPairTargets(
+    targets: readonly [ControlJointTarget, ControlJointTarget],
+    options: { desiredStateKey: string; sentAtMs?: number; traceId?: string; modelBinding?: ControlModelBinding },
+  ): Promise<GoldenEdgePublishResult> {
+    return this.publish(createAuxiliaryPairDesiredStateMessage({
+      robotId: this.options.robotId, leaseId: this.leaseId, sequence: ++this.sequence,
+      source: this.options.source, sentAtMs: options.sentAtMs,
+      desiredStateKey: options.desiredStateKey, traceId: options.traceId,
+      modelBinding: options.modelBinding ?? this.options.modelBinding, targets,
+    }));
   }
 
   async renew(leaseId: string, durationMs = 30_000): Promise<GoldenEdgeRenewResult> {
@@ -209,7 +229,17 @@ export class GoldenEdgeClient {
         throw new Error(`Golden Edge broker admission failed: access_mode=${broker.access_mode}`);
       }
     }
-    return result;
+    const legacyDelivery = typeof (result as Record<string, unknown>).delivery === "string"
+      ? String((result as Record<string, unknown>).delivery) : undefined;
+    return {
+      ...result,
+      sequence: result.sequence ?? command.sequence,
+      client_sequence: command.client_sequence,
+      trace_id: command.trace_id,
+      desired_state_key: command.delivery.key,
+      delivery: "desired_state_accepted",
+      ...(legacyDelivery && legacyDelivery !== "desired_state_accepted" ? { legacy_delivery: legacyDelivery } : {}),
+    };
   }
 
   async release(leaseId: string): Promise<GoldenEdgeReleaseResult> {

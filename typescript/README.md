@@ -132,10 +132,26 @@ only requires matching SDK preview and VitrusOS resolver adapters.
 
 Control requires an authorized API key and a lease. The Vitrus service validates commands before the robot receives them.
 
-`ttlMs` is the WAN admission deadline. `edgeKeepaliveMs` is a separate,
-explicitly bounded window (maximum 1500 ms) in which a compatible VitrusOS
-edge may refresh an admitted positional target locally. Release, E-stop, lease
-expiry, or keepalive expiry still cuts the edge to `read_only`.
+`sendTargets` publishes a replaceable desired state for a stable
+`desiredStateKey`; a valid lease is not terminated because one command receipt
+is delayed. `ttlMs` remains accepted only for source compatibility and is not
+sent as a desired-state expiry. Use explicit lease release, lease expiry, or
+E-stop to terminate authority.
+
+For an opposed two-servo gripper axis, use one atomic pair envelope instead of
+reconstructing the complete auxiliary tail:
+
+```ts
+await device.motion.sendAuxiliaryPairTargets([
+  { jointName: "LEFT_GRIPPER_LEFT_FINGER_A", displayDeg: 14 },
+  { jointName: "LEFT_GRIPPER_RIGHT_FINGER_A", displayDeg: -14 },
+], { leaseId: session.lease.id, desiredStateKey: "left_gripper:base", traceId: "screen-drag-428" });
+```
+
+The SDK puts `client_sequence` and `trace_id` on the command. The same values
+identify desired acceptance, native application, and measured feedback. A
+missing transport receipt returns `control.receipt.stage === "receipt_unknown"`;
+the SDK does not replay it or release the lease.
 
 The default Web/JS control path is the authenticated Bridge. The Bridge and the VitrusOS relay use Zenoh behind the API boundary, so browser clients never need robot IPs or Zenoh endpoints.
 

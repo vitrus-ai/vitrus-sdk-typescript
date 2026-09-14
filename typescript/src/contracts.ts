@@ -33,15 +33,33 @@ export type ControlJointTarget = {
   kd?: number;
 };
 
+/** One atomic partial auxiliary group, currently an opposed two-servo pair. */
+export type AuxiliaryPairDesiredState = {
+  kind: "auxiliary_pair";
+  atomic: true;
+  joint_names: readonly [string, string];
+};
+
+/** Edge retains one replaceable desired state for each `(lease_id, key)`. */
+export type DesiredStateDelivery = {
+  kind: "desired_state";
+  key: string;
+  replace_pending: true;
+  partial?: AuxiliaryPairDesiredState;
+};
+
 export type ControlJointTargetsMessage = {
   schema: typeof CONTROL_JOINT_TARGETS_SCHEMA;
   schema_version: typeof VITRUS_CONTRACT_VERSION;
   source: string;
   mode: "read_write";
   sequence: number;
+  client_sequence: number;
+  trace_id: string;
   sent_at_ms: number;
-  ttl_ms: number;
-  deadline_ms: number;
+  /** Deprecated legacy expiry fields; omitted for desired-state control. */
+  ttl_ms?: number;
+  deadline_ms?: number;
   /**
    * Bounded Edge-local positional-target keepalive after WAN admission.
    * This never extends the original WAN admission deadline.
@@ -52,6 +70,7 @@ export type ControlJointTargetsMessage = {
   configuration_revision?: string;
   effective_urdf_sha256?: string;
   model_epoch?: number;
+  delivery: DesiredStateDelivery;
   /** VitrusOS owns the only physical velocity/acceleration/jerk trajectory. */
   trajectory_owner: "edge";
   flush: true;
@@ -80,7 +99,12 @@ export function createJointTargetsMessage(options: {
   leaseId: string;
   sequence: number;
   source?: string;
+  /** @deprecated A desired-state lease has no per-command expiry. */
   ttlMs?: number;
+  /** Stable independently replaceable lane, e.g. `left_gripper:base`. */
+  desiredStateKey?: string;
+  /** End-to-end trace token; defaults to a stable lease/sequence token. */
+  traceId?: string;
   edgeKeepaliveMs?: number;
   semanticEffectors?: EffectorCommandEnvelope;
   modelBinding?: ControlModelBinding;
@@ -124,22 +148,28 @@ export function createJointTargetsMessage(options: {
   }
 
   const sentAtMs = Math.trunc(options.sentAtMs ?? Date.now());
-  const ttlMs = Math.max(1, Math.trunc(options.ttlMs ?? DEFAULT_CONTROL_TTL_MS));
+  const desiredStateKey = options.desiredStateKey?.trim()
+    || options.targets.map((target) => target.joint_name).sort().join(",");
+  if (!desiredStateKey || desiredStateKey.length > 256) throw new Error("desiredStateKey must be a non-empty string up to 256 characters");
+  const traceId = options.traceId?.trim() || `vitrus-sdk:${options.leaseId}:${options.sequence}`;
+  if (!traceId || traceId.length > 256) throw new Error("traceId must be a non-empty string up to 256 characters");
+  void options.ttlMs;
   return {
     schema: CONTROL_JOINT_TARGETS_SCHEMA,
     schema_version: VITRUS_CONTRACT_VERSION,
     source: options.source?.trim() || "vitrus-sdk",
     mode: "read_write",
     sequence: options.sequence,
+    client_sequence: options.sequence,
+    trace_id: traceId,
     sent_at_ms: sentAtMs,
-    ttl_ms: ttlMs,
-    deadline_ms: sentAtMs + ttlMs,
     ...(options.edgeKeepaliveMs == null ? {} : {
       edge_keepalive_ms: options.edgeKeepaliveMs,
     }),
     lease_id: options.leaseId,
     robot_id: options.robotId,
     ...(options.modelBinding ? options.modelBinding : {}),
+    delivery: { kind: "desired_state", key: desiredStateKey, replace_pending: true },
     trajectory_owner: "edge",
     flush: true,
     safety: {
@@ -166,4 +196,17 @@ export function createJointTargetsMessage(options: {
     } : {}),
     targets: options.targets,
   };
+}
+
+/** Build one atomic desired-state update for exactly two auxiliary motors. */
+export function createAuxiliaryPairDesiredStateMessage(options: Omit<Parameters<typeof createJointTargetsMessage>[0], "targets"> & {
+  desiredStateKey: string;
+  targets: readonly [ControlJointTarget, ControlJointTarget];
+}): ControlJointTargetsMessage {
+  const [first, second] = options.targets;
+  if (!first?.joint_name?.trim() || !second?.joint_name?.trim() || first.joint_name === second.joint_name) {
+    throw new Error("an auxiliary pair requires two distinct non-empty joint names");
+  }
+  const message = createJointTargetsMessage({ ...options, targets: [...options.targets] });
+  return { ...message, delivery: { ...message.delivery, partial: { kind: "auxiliary_pair", atomic: true, joint_names: [first.joint_name, second.joint_name] } } };
 }

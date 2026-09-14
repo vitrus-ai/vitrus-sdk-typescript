@@ -1,4 +1,5 @@
 import {
+  createAuxiliaryPairDesiredStateMessage,
   createJointTargetsMessage,
   type ControlJointTarget,
   type ControlJointTargetsMessage,
@@ -448,6 +449,7 @@ export type DroidTelemetry = {
   motorBridge?: Record<string, unknown>;
   /** Model revision carried by Edge telemetry when canonical binding is enabled. */
   deviceModel?: ControlModelBinding;
+  control?: DroidControlState;
   raw: Record<string, unknown>;
 };
 
@@ -473,6 +475,7 @@ export type DroidControlSession = {
   readonly lease: ControlLease;
   readonly closed: boolean;
   sendTargets(targets: JointTarget[], options?: Omit<DroidTargetOptions, "leaseId">): Promise<DroidCommandResult>;
+  sendAuxiliaryPairTargets(targets: readonly [JointTarget, JointTarget], options: Omit<DroidTargetOptions, "leaseId"> & { desiredStateKey: string }): Promise<DroidCommandResult>;
   primeAndWaitReady(targets: JointTarget[], options?: Omit<DroidPrimeAndWaitReadyOptions, "leaseId">): Promise<DroidMotionReady>;
   release(): Promise<void>;
 };
@@ -507,8 +510,12 @@ export type DroidTargetOptions = {
   leaseId: string;
   /** Exact device model used to derive the target. Required when Edge enables binding enforcement. */
   modelBinding?: ControlModelBinding;
-  /** End-to-end command lifetime; this is not the HTTP request timeout. */
+  /** @deprecated Desired state is bounded by lease lifecycle, not command TTL. */
   ttlMs?: number;
+  /** A stable replaceable desired-state lane. */
+  desiredStateKey?: string;
+  /** Correlation token propagated to Edge/native/telemetry evidence. */
+  traceId?: string;
   /**
    * Maximum time the Edge may locally refresh an admitted positional target.
    * The Edge still validates ttlMs before starting and cuts to read_only when
@@ -550,9 +557,16 @@ export type DroidCommandResult = {
   requestId: string;
   status: "queued" | "sent" | "acknowledged" | "timeout" | "failed" | "not_reachable";
   route: "relay" | "local";
+  control?: DroidControlState;
   result?: Record<string, unknown>;
   error?: string;
 };
+
+export type DesiredControlState = { stage: "desired_state_accepted"; sequence: number; leaseId: string; key: string; clientSequence: number; traceId: string; acceptedAtMs?: number; legacyDelivery?: string };
+export type AppliedControlState = { stage: "applied" | "rejected" | "unknown"; sequence?: number; commandId?: string; appliedAtMs?: number; error?: string; clientSequence?: number; traceId?: string };
+export type MeasuredControlState = { stage: "measured" | "unknown"; sequence?: number; measuredAtMs?: number; ageMs?: number; clientSequence?: number; traceId?: string };
+export type ReceiptUncertainControlState = { stage: "receipt_unknown"; sequence: number; leaseId: string; key: string; clientSequence: number; traceId: string; observedAtMs: number; error: string };
+export type DroidControlState = { leaseId?: string; desired?: DesiredControlState; receipt?: ReceiptUncertainControlState; applied?: AppliedControlState; measured?: MeasuredControlState };
 
 export type DroidConnectionOptions = {
   apiKey: string;
@@ -747,6 +761,52 @@ function firstRecord(...values: unknown[]): Record<string, unknown> {
   return values.map(parseJsonRecord).find((value) => Object.keys(value).length > 0) ?? {};
 }
 
+function stringValue(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+}
+
+function numberValue(...values: unknown[]): number | undefined {
+  return values.map(finiteNumber).find((value): value is number => value !== undefined);
+}
+
+/** Normalizes legacy mailbox and desired-state applied/measured evidence. */
+export function normalizeControlState(value: unknown, fallback: { leaseId?: string; sequence?: number; desiredStateKey?: string; clientSequence?: number; traceId?: string } = {}): DroidControlState {
+  const raw = parseJsonRecord(value), nested = firstRecord(raw.control, raw.control_state, raw.execution, raw.receipt);
+  const desiredRaw = firstRecord(nested.desired, raw.desired, raw.desired_state);
+  const appliedRaw = firstRecord(nested.applied, raw.applied, raw.broker, raw.native);
+  const measuredRaw = firstRecord(nested.measured, raw.measured, raw.feedback);
+  const leaseId = stringValue(raw.lease_id, raw.leaseId, nested.lease_id, fallback.leaseId);
+  const sequence = numberValue(raw.sequence, raw.input_sequence, nested.sequence, desiredRaw.sequence, fallback.sequence);
+  const clientSequence = numberValue(raw.client_sequence, raw.clientSequence, nested.client_sequence, fallback.clientSequence, sequence);
+  const traceId = stringValue(raw.trace_id, raw.traceId, nested.trace_id, desiredRaw.trace_id, fallback.traceId);
+  const key = stringValue(raw.desired_state_key, raw.coalesce_key, nested.key, desiredRaw.key, fallback.desiredStateKey);
+  const delivery = stringValue(raw.delivery, nested.delivery, desiredRaw.delivery);
+  const desired = leaseId && key && sequence != null && clientSequence != null && traceId ? {
+    stage: "desired_state_accepted" as const, leaseId, key, sequence, clientSequence, traceId,
+    ...(delivery && delivery !== "desired_state_accepted" ? { legacyDelivery: delivery } : {}),
+  } : undefined;
+  const appliedSequence = numberValue(appliedRaw.sequence, appliedRaw.input_sequence, raw.applied_sequence, raw.broker_sequence);
+  const commandId = stringValue(appliedRaw.command_id, appliedRaw.commandId, raw.command_id, raw.commandId);
+  const appliedError = stringValue(appliedRaw.error, raw.error);
+  const applied = commandId || appliedSequence != null || appliedError ? {
+    stage: appliedError ? "rejected" as const : "applied" as const,
+    ...(appliedSequence == null ? {} : { sequence: appliedSequence }), ...(commandId ? { commandId } : {}),
+    ...(appliedError ? { error: appliedError } : {}), ...(clientSequence == null ? {} : { clientSequence }), ...(traceId ? { traceId } : {}),
+  } : undefined;
+  const measuredAtMs = numberValue(measuredRaw.measured_at_ms, measuredRaw.timestamp_ms, raw.measured_at_ms);
+  const measuredSequence = numberValue(measuredRaw.sequence, measuredRaw.input_sequence, raw.measured_sequence);
+  const measured = measuredAtMs != null || measuredSequence != null ? {
+    stage: "measured" as const, ...(measuredSequence == null ? {} : { sequence: measuredSequence }),
+    ...(measuredAtMs == null ? {} : { measuredAtMs }), ...(clientSequence == null ? {} : { clientSequence }), ...(traceId ? { traceId } : {}),
+  } : undefined;
+  return { ...(leaseId ? { leaseId } : {}), ...(desired ? { desired } : {}), ...(applied ? { applied } : {}), ...(measured ? { measured } : {}) };
+}
+
+export function correlateControlState(command: DroidCommandResult, telemetry: DroidTelemetry): DroidControlState {
+  const observed = telemetry.control ?? normalizeControlState(telemetry.raw);
+  return { leaseId: observed.leaseId ?? command.control?.leaseId, desired: command.control?.desired, receipt: command.control?.receipt, applied: observed.applied ?? command.control?.applied, measured: observed.measured ?? command.control?.measured };
+}
+
 function looksLikeMotorBridge(value: Record<string, unknown>): boolean {
   return typeof value.access_mode === "string" && typeof value.control_phase === "string";
 }
@@ -781,6 +841,7 @@ export function normalizeDroidTelemetry(value: unknown): DroidTelemetry {
     cameras: Array.isArray(raw.cameras) ? raw.cameras.map(parseJsonRecord) : undefined,
     motorBridge,
     ...(raw.device_model && typeof raw.device_model === "object" ? { deviceModel: raw.device_model as ControlModelBinding } : {}),
+    control: normalizeControlState(raw),
     raw,
   };
 }
@@ -857,6 +918,7 @@ export class Droid {
   };
   readonly motion: {
     sendTargets: (targets: JointTarget[], options: DroidTargetOptions) => Promise<DroidCommandResult>;
+    sendAuxiliaryPairTargets: (targets: readonly [JointTarget, JointTarget], options: DroidTargetOptions & { desiredStateKey: string }) => Promise<DroidCommandResult>;
     primeAndWaitReady: (targets: JointTarget[], options: DroidPrimeAndWaitReadyOptions) => Promise<DroidMotionReady>;
     /** Native device-IK lifecycle through the authenticated public dataplane. */
     direct: DirectMotionJobClient;
@@ -1047,6 +1109,7 @@ export class Droid {
     };
     this.motion = {
       sendTargets: (targets, request) => this.sendTargets(targets, request),
+      sendAuxiliaryPairTargets: (targets, request) => this.sendTargets(targets, request, "auxiliary_pair"),
       primeAndWaitReady: (targets, request) => this.primeAndWaitReady(targets, request),
       direct: new DirectMotionJobClient({
         endpoint: this.baseUrl(),
@@ -1096,6 +1159,10 @@ export class Droid {
       sendTargets: async (targets, request = {}) => {
         await ensureFresh();
         return this.motion.sendTargets(targets, { ...request, modelBinding: request.modelBinding ?? options.modelBinding, leaseId: lease.id });
+      },
+      sendAuxiliaryPairTargets: async (targets, request) => {
+        await ensureFresh();
+        return this.motion.sendAuxiliaryPairTargets(targets, { ...request, modelBinding: request.modelBinding ?? options.modelBinding, leaseId: lease.id });
       },
       primeAndWaitReady: async (targets, request = {}) => {
         await ensureFresh();
@@ -1207,7 +1274,7 @@ export class Droid {
     return subscription;
   }
 
-  private async sendTargets(targets: JointTarget[], request: DroidTargetOptions): Promise<DroidCommandResult> {
+  private async sendTargets(targets: readonly JointTarget[], request: DroidTargetOptions, kind: "joint_targets" | "auxiliary_pair" = "joint_targets"): Promise<DroidCommandResult> {
     const identity = await this.identity.get();
     let semanticEffectors: EffectorCommandEnvelope | undefined;
     const controlTargets: ControlJointTarget[] = targets.map((target) => ({
@@ -1259,16 +1326,21 @@ export class Droid {
         commands: request.effectorCommands,
       };
     }
-    const command = createJointTargetsMessage({
+    const commandOptions = {
       robotId: identity.id,
       leaseId: request.leaseId,
       sequence: ++this.sequence,
-      ttlMs: request.ttlMs ?? request.timeoutMs,
+      // Retain legacy fields in the public type but do not turn source delay
+      // into a lease-ending command expiry.
+      desiredStateKey: request.desiredStateKey,
+      traceId: request.traceId,
       edgeKeepaliveMs: request.edgeKeepaliveMs,
       modelBinding: request.modelBinding,
       semanticEffectors,
-      targets: controlTargets,
-    });
+    };
+    const command = kind === "auxiliary_pair"
+      ? createAuxiliaryPairDesiredStateMessage({ ...commandOptions, desiredStateKey: request.desiredStateKey ?? "", targets: this.requireAuxiliaryPair(controlTargets) })
+      : createJointTargetsMessage({ ...commandOptions, targets: controlTargets });
     const motionTransport = this.options.motionTransport ?? "bridge";
     if (motionTransport === "edge") {
       if (!this.options.edgeEndpoint) {
@@ -1287,11 +1359,14 @@ export class Droid {
         this.edgeClient.setLease(request.leaseId);
         this.edgeLeaseId = request.leaseId;
       }
-      const result = await this.edgeClient.publish(command);
+      let result;
+      try { result = await this.edgeClient.publish(command); }
+      catch (error) { if (this.isReceiptUncertain(error)) return this.uncertainReceipt(command, error, "local"); throw error; }
       return {
         requestId: String(result.sequence ?? command.sequence),
         status: "acknowledged",
         route: "local",
+        control: normalizeControlState(result, { leaseId: request.leaseId, sequence: command.sequence, desiredStateKey: command.delivery.key, clientSequence: command.client_sequence, traceId: command.trace_id }),
         result: result as unknown as Record<string, unknown>,
       };
     }
@@ -1317,17 +1392,35 @@ export class Droid {
         this.zenohClient.setLease(request.leaseId);
         this.zenohLeaseId = request.leaseId;
       }
-      const result = await this.zenohClient!.publish(command);
-      return { requestId: String(result.sequence), status: "acknowledged", route: "local", result };
+      let result;
+      try { result = await this.zenohClient!.publish(command); }
+      catch (error) { if (this.isReceiptUncertain(error)) return this.uncertainReceipt(command, error, "local"); throw error; }
+      return { requestId: String(result.sequence), status: "acknowledged", route: "local", control: normalizeControlState(result, { leaseId: request.leaseId, sequence: command.sequence, desiredStateKey: command.delivery.key, clientSequence: command.client_sequence, traceId: command.trace_id }), result };
     }
-    const admission = await this.post<DroidCommandResult>(
-      "/v1/droids/control/joint-targets",
-      command,
-    );
+    let admission;
+    try { admission = await this.post<DroidCommandResult>("/v1/droids/control/joint-targets", command); }
+    catch (error) { if (this.isReceiptUncertain(error)) return this.uncertainReceipt(command, error, "relay"); throw error; }
     return {
       ...admission,
+      control: normalizeControlState(admission.result ?? admission, { leaseId: request.leaseId, sequence: command.sequence, desiredStateKey: command.delivery.key, clientSequence: command.client_sequence, traceId: command.trace_id }),
       result: { ...(admission.result ?? {}), sdkSequence: command.sequence },
     };
+  }
+
+  private requireAuxiliaryPair(targets: ControlJointTarget[]): [ControlJointTarget, ControlJointTarget] {
+    if (targets.length !== 2 || targets[0].joint_name === targets[1].joint_name) throw new Error("sendAuxiliaryPairTargets requires exactly two distinct joint targets");
+    return [targets[0], targets[1]];
+  }
+
+  private isReceiptUncertain(cause: unknown): boolean {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    return !(/\b(?:4\d\d)\b/.test(detail) || /\bdropped\b|\brejected\b|out_of_order/i.test(detail));
+  }
+
+  private uncertainReceipt(command: ControlJointTargetsMessage, cause: unknown, route: "relay" | "local"): DroidCommandResult {
+    const error = cause instanceof Error ? cause.message : String(cause);
+    return { requestId: command.trace_id, status: /timeout|timed out|abort/i.test(error) ? "timeout" : "failed", route, error,
+      control: { leaseId: command.lease_id, receipt: { stage: "receipt_unknown", sequence: command.sequence, leaseId: command.lease_id, key: command.delivery.key, clientSequence: command.client_sequence, traceId: command.trace_id, observedAtMs: Date.now(), error } } };
   }
 
   private async primeAndWaitReady(
