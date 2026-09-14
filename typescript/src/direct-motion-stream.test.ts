@@ -34,7 +34,7 @@ test("websocket latest transport keeps credentials out of the URL, authenticates
   sockets[0].message({ type: "ready" });
   expect(sockets[0].sent).toHaveLength(2);
   const sent = sockets[0].sent[1];
-  expect(sent).toMatchObject({ type: "latest_update", timeout_ms: 500, payload: { sequence: 2, client_created_at_ms: 1_000 } });
+  expect(sent).toMatchObject({ type: "latest_update", timeout_ms: 500, payload: { sequence: 2, client_created_at_ms: 1_010 } });
   expect((sent.payload as Record<string, unknown>).chain_targets).toEqual([
     { chain: "left_arm", points: [{ position_m: [1, 0, 0] }] },
     { chain: "right_arm", points: [{ position_m: [2, 0, 0] }] },
@@ -55,7 +55,7 @@ test("stream loss reports execution unknown, replays nothing, and a later explic
   expect(sockets[0].sent).toHaveLength(2);
   sockets[0].close();
   await client.drainLatestUpdates().catch(() => undefined);
-  expect(observations).toContain("1:failed");
+  expect(observations).toContain("1:receipt_unknown");
   expect(errors).toContain("latest-update stream closed before receipt; execution unknown");
   expect(sockets[0].sent).toHaveLength(2);
   client.publishLatestUpdate(frame(2, "right_arm"));
@@ -130,18 +130,39 @@ test("stream drops a latest frame when its outbound socket buffer exceeds 64 KiB
   client.publishLatestUpdate(frame(1, "left_arm"));
   await client.drainLatestUpdates().catch(() => undefined);
   expect(socket.sent).toHaveLength(1);
-  expect(observations).toContain("failed");
+  expect(observations).toContain("receipt_unknown");
 });
 
-test("websocket receipt tracking permits sixteen in-flight admissions while pending intent remains merged", async () => {
+test("websocket latest mode defaults to one receipt-bound request and keeps only the newest pending target", async () => {
   const socket = new FakeSocket();
   const client = new DirectMotionJobClient({
     endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket", now: () => 1_000,
     webSocketFactory: (() => socket) as never,
   });
   const ready = client.prepareLatestStream(); socket.open(); socket.message({ type: "ready" }); await ready;
+  for (let sequence = 1; sequence <= 4; sequence += 1) client.publishLatestUpdate(frame(sequence, "left_arm"));
+  // Authentication plus the one receipt-bound current frame. Sequences 2 and 3
+  // were replaced locally; sequence 4 remains pending until the receipt.
+  expect(socket.sent).toHaveLength(2);
+  const first = socket.sent[1]!;
+  socket.message({ type: "receipt", request_id: first.request_id, result: { state: "queued" } });
+  await Bun.sleep(0);
+  expect(socket.sent).toHaveLength(3);
+  expect(socket.sent[2]).toMatchObject({ type: "latest_update", payload: { sequence: 4 } });
+  const second = socket.sent[2]!;
+  socket.message({ type: "receipt", request_id: second.request_id, result: { state: "queued" } });
+  await client.drainLatestUpdates();
+});
+
+test("websocket receipt tracking permits sixteen in-flight admissions while pending intent remains merged", async () => {
+  const socket = new FakeSocket();
+  const client = new DirectMotionJobClient({
+    endpoint: "https://dataplane.example", apiKey: "key", ref: "R06", latestOnlyUpdates: true, latestTransport: "websocket", latestMaxInFlight: 16, now: () => 1_000,
+    webSocketFactory: (() => socket) as never,
+  });
+  const ready = client.prepareLatestStream(); socket.open(); socket.message({ type: "ready" }); await ready;
   for (let sequence = 1; sequence <= 17; sequence += 1) client.publishLatestUpdate(frame(sequence, sequence % 2 ? "left_arm" : "right_arm"));
-  // Auth plus sixteen receipt-bound messages. The seventeenth is the sole pending merged frame.
+  // Explicit diagnostic fanout: auth plus sixteen receipt-bound messages. The seventeenth is pending.
   expect(socket.sent).toHaveLength(17);
   client.discardLatestUpdates();
 });
@@ -318,7 +339,7 @@ test("sequenced telemetry preserves ACK order when an advisory observer fails", 
   telemetry.message({ type: "subscribed", topics: ["telemetry"], telemetry_delivery_window: 4 });
   telemetry.message({ type: "telemetry", delivery_seq: 1, telemetry: { sequence: 1 } });
   telemetry.message({ type: "telemetry", delivery_seq: 2, telemetry: { sequence: 2 } });
-  await Bun.sleep(3);
+  await Bun.sleep(25);
   expect(delivered).toEqual([1, 2]);
   expect(telemetry.sent.slice(2)).toEqual([
     { type: "telemetry_ack", delivery_seq: 1 },

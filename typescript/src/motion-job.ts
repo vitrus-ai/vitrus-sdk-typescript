@@ -27,7 +27,7 @@ export type MotionJob = {
   mode: MotionMode;
   state: MotionJobState;
   joint_names: string[];
-  /** Immutable servo-only subset controlled alongside native Cartesian IK. */
+  /** Declared servo-only subset controlled alongside native Cartesian IK. */
   auxiliary_joint_names?: string[];
   configuration_revision: string;
   effective_urdf_sha256?: string | null;
@@ -101,7 +101,10 @@ export type DeviceIkUpdateOptions = {
   controlledChains?: string[];
   /** Explicit Edge alignment profile selector, when provisioned. */
   alignmentProfile?: string;
-  /** Complete declared auxiliary scope; omission retains its latest hold. */
+  /**
+   * One or more auxiliary targets within the declared scope; omission retains
+   * their existing desired hold. A pair supplied in one frame remains atomic.
+   */
   auxiliaryJointTargets?: AuxiliaryJointTarget[];
 };
 
@@ -111,7 +114,7 @@ export type AuxiliaryJointTarget = {
   position_deg: number;
   /** Positive estimate-based load cap, at most 0.35 Nm; defaults to 0.35. */
   max_torque_nm?: number;
-  /** Positive speed limit, at most 5 degrees/s; defaults to 5. */
+  /** Positive speed limit, at most 30 degrees/s; defaults to 5. */
   velocity_deg_s?: number;
 };
 
@@ -546,7 +549,7 @@ function validateFullScope(targets: ControlJointTarget[], scope: readonly string
 
 function validateAuxiliaryTargets(targets: AuxiliaryJointTarget[], scope: readonly string[]): AuxiliaryJointTarget[] {
   if (!scope.length) throw new Error("this job did not declare auxiliaryJointNames");
-  if (!Array.isArray(targets) || !targets.length) throw new Error("auxiliaryJointTargets must cover the declared scope");
+  if (!Array.isArray(targets) || !targets.length) throw new Error("auxiliaryJointTargets must contain at least one declared auxiliary target");
   const allowed = new Set(["joint_name", "position_deg", "max_torque_nm", "velocity_deg_s"]);
   const normalized = targets.map(target => {
     if (target === null || typeof target !== "object" || Object.keys(target).some(key => !allowed.has(key))) {
@@ -562,8 +565,8 @@ function validateAuxiliaryTargets(targets: AuxiliaryJointTarget[], scope: readon
     return { joint_name: name, position_deg: target.position_deg, max_torque_nm: torque, velocity_deg_s: velocity };
   });
   const names = normalized.map(target => target.joint_name);
-  if (names.length !== scope.length || new Set(names).size !== names.length || names.some(name => !scope.includes(name))) {
-    throw new Error("auxiliaryJointTargets must cover the declared scope exactly once");
+  if (new Set(names).size !== names.length || names.some(name => !scope.includes(name))) {
+    throw new Error("auxiliaryJointTargets must contain unique targets from the declared auxiliary scope");
   }
   return normalized;
 }

@@ -210,26 +210,28 @@ extended budget requires the original client timestamp and exactly one point per
 supplied chain. A `continuous_setpoint` frame may update a unique nonempty subset
 of its immutable `controlledChains`; omitted chains retain their native target and
 are never synthesized by the SDK. An `execute_goal` frame remains a complete,
-single-point frame for every controlled chain. An auxiliary-only continuous frame
-is allowed only when `auxiliaryJointTargets` covers its declared auxiliary scope
-exactly once. Deploy matching VitrusOS and Bridge support before opting in; older
-servers reject the extension.
+single-point frame for every controlled chain. An auxiliary-only continuous frame may address one or more unique members of
+its declared auxiliary scope. Keep opposed gripper pair targets in the same
+frame so they remain atomic. Deploy matching VitrusOS and Bridge support before
+opting in; older servers reject the extension.
 
-`updateDeviceIkFrame` returns after local queue admission. Unsent compatible
-updates coalesce in the SDK, Bridge, and Edge; independent chain intents retain
-their own bounded slots. Already executing requests are never cancelled or
-replayed. A public queue receipt is not evidence of motor application. Correlate
-input sequence, native command ID, and measured feedback before asserting motion.
-Observe delivery errors through `directOnLatestUpdate` or
-`droid.motion.direct.latestUpdateStatus()`.
+`updateDeviceIkFrame` returns after local desired-state admission. The SDK keeps
+one public receipt-bound request and one replaceable pending snapshot by default,
+including on WebSocket. Set `directLatestMaxInFlight` only for explicit
+throughput diagnostics; increasing it permits a backlog. Compatible chain and
+auxiliary-pair intents coalesce independently, and each fragment keeps its own
+bounded source age. The outgoing snapshot uses its newest current intent while
+locally expired fragments are omitted. Already executing requests are never
+cancelled or replayed. A public receipt is not evidence of motor application:
+`delivery: "desired_state_accepted"` denotes local admission and retains
+`legacy_delivery: "latest_only_sdk_mailbox"` for older UI code. A missing
+receipt becomes `receipt_unknown`, which does not release the valid session;
+observe native execution and measured feedback before deciding to republish.
 
-The original timestamp and deadline survive transport; merging or reconnecting
-cannot renew an expired intent. Keep clocks synchronized. Native sequence checks
-reject reordered input. Hold/Stop discard unsent targets and retain a separate
-priority lane. After packet loss, publish a fresh current desired pose; do not
-replay an ambiguous command or automatically start a new DRIVE session.
-An HTTP-success heartbeat containing a terminal native job now throws
-`MOTION_SESSION_TERMINAL`; the session still permits `stop()` to confirm release.
+Keep clocks synchronized. Native sequence checks reject reordered input.
+Hold/Stop discard unsent targets and retain a separate priority lane. After
+packet loss, publish a fresh current desired pose; do not replay an ambiguous
+command or automatically start a new DRIVE session.
 
 On updated r05-edge, successive single-point TCP targets are interpolated from
 the current Cartesian reference with smoothstep translation and shortest-arc

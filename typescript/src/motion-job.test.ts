@@ -248,7 +248,7 @@ test("bounded continuous network tolerance preserves source identity for partial
   expect(published).toHaveLength(2);
 });
 
-test("a bounded continuous auxiliary-only frame retains Cartesian targets and requires the full declared auxiliary scope", async () => {
+test("a bounded continuous auxiliary-only frame accepts a declared auxiliary pair", async () => {
   const job: MotionJob = {
     job_id: "auxiliary", epoch: 1, mode: "device_ik", state: "active",
     joint_names: ["LEFT_SHOULDER_A", "LEFT_GRIPPER_A", "LEFT_GRIPPER_B"],
@@ -273,11 +273,13 @@ test("a bounded continuous auxiliary-only frame retains Cartesian targets and re
     controlled_chains: ["LEFT_ARM", "RIGHT_ARM", "NECK"], chain_targets: [],
     auxiliary_joint_targets: auxiliaryJointTargets, source_max_age_ms: 1_500,
   });
+  const pair = auxiliaryJointTargets.slice(0, 1);
   await expect(session.updateDeviceIkFrame({
     controlledChains: ["LEFT_ARM", "RIGHT_ARM", "NECK"], targets: [],
-    auxiliaryJointTargets: auxiliaryJointTargets.slice(0, 1), clientCreatedAtMs: 10_001,
-  })).rejects.toThrow("cover the declared scope exactly once");
-  expect(published).toHaveLength(1);
+    auxiliaryJointTargets: pair, clientCreatedAtMs: 10_001,
+  })).resolves.toMatchObject({ state: "queued", clientInputSequence: 2 });
+  expect(published).toHaveLength(2);
+  expect(published[1]).toMatchObject({ auxiliary_joint_targets: pair });
 });
 
 test("an HTTP 200 heartbeat reporting a terminal job fails closed but preserves stop confirmation", async () => {

@@ -156,6 +156,24 @@ test("opt-in latest-only frames coalesce locally and preserve monotonic public s
   expect(client.latestUpdateStatus()).toMatchObject({ state: "queued", inputSequence: 2 });
 });
 
+test("latest desired-state admission exposes the normalized receipt name and retains a legacy alias", () => {
+  const client = new DirectMotionJobClient({ endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", latestOnlyUpdates: true,
+    fetch: (async () => response({ ok: true })) as typeof fetch,
+  });
+  const admission = client.publishLatestUpdate({ job_id: "job", epoch: 1, sequence: 7, controlled_chains: ["left_arm"], chain_targets: [{ chain: "left_arm", points: [{ position_m: [0, 0, 0] }] }] });
+  expect(admission).toEqual({ state: "queued", input_sequence: 7, delivery: "desired_state_accepted", legacy_delivery: "latest_only_sdk_mailbox", desired_state_key: "device_ik:job:left_arm" });
+  client.discardLatestUpdates();
+});
+
+test("an ambiguous latest receipt remains observable without making drain fail", async () => {
+  const client = new DirectMotionJobClient({ endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06", latestOnlyUpdates: true,
+    fetch: (async () => { throw new TypeError("network interrupted after send"); }) as typeof fetch,
+  });
+  client.publishLatestUpdate({ job_id: "job", epoch: 1, sequence: 7, controlled_chains: ["left_arm"], chain_targets: [{ chain: "left_arm", points: [{ position_m: [0, 0, 0] }] }] });
+  await client.drainLatestUpdates();
+  expect(client.latestUpdateStatus()).toMatchObject({ state: "receipt_unknown", inputSequence: 7, error: expect.stringContaining("network interrupted") });
+});
+
 test("safety stop drops an unsent latest frame before its public lifecycle request", async () => {
   const paths: string[] = [];
   let resolveLatest!: (response: Response) => void;

@@ -46,7 +46,7 @@ export type DirectMotionJobClientOptions = {
   onLatestUpdate?: (observation: LatestUpdateObservation) => void;
   /** Maximum local queue age before an unsent frame is discarded. */
   latestPendingMaxAgeMs?: number;
-  /** Maximum concurrent public latest-update receipts. HTTP defaults to one; WebSocket defaults to sixteen. */
+  /** Maximum concurrent public desired-state receipts. Defaults to one for every transport. */
   latestMaxInFlight?: number;
   /** Use a persistent authenticated WebSocket for optional latest-only frames. */
   latestTransport?: "http" | "websocket";
@@ -96,7 +96,8 @@ export type LatestUpdateObservation = {
   /** Job identity scopes the observation sequence watermark across restarts. */
   jobId: string | null;
   inputSequence: number | null;
-  state: "sending" | "queued" | "failed";
+  /** `receipt_unknown` means this SDK cannot determine public admission; it never means the lease was released. */
+  state: "sending" | "queued" | "receipt_unknown" | "failed";
   /** Time the SDK actually began the public request, never a native ACK. */
   sentAtMs: number;
   /** Time the public mailbox receipt or failure was observed. */
@@ -124,8 +125,8 @@ type LatestPending = {
   createdAtMs: number;
   /** Independent Cartesian chains must not overwrite one another in a one-slot queue. */
   chainTargets: Map<string, LatestFragment<Record<string, unknown>>>;
-  /** Auxiliary updates always contain their complete immutable auxiliary scope. */
-  auxiliaryTargets: LatestFragment<unknown[]> | null;
+  /** Each independently-addressed auxiliary set is atomically replaced by its latest pair/group. */
+  auxiliaryTargets: Map<string, LatestFragment<unknown[]>>;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -183,8 +184,11 @@ export class DirectMotionJobClient implements MotionJobTransport {
       : LATEST_SOURCE_DEADLINE_MS;
     this.latestPendingMaxAgeMs = boundedPendingAge(options.latestPendingMaxAgeMs ?? profilePendingAge, profilePendingAge);
     this.latestTransport = options.latestTransport ?? "http";
-    // Stream receipts are independent; the mailbox remains one pending merged frame.
-    this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? (this.latestTransport === "websocket" ? 16 : 1), this.latestTransport === "websocket" ? 16 : 4);
+    // A continuous controller needs the newest target, never a backlog of
+    // receipt-bound samples. Keep one request in flight and one replaceable
+    // pending state by default on HTTP and WebSocket alike. Larger values are
+    // explicit diagnostic/throughput opt-ins and remain bounded.
+    this.latestMaxInFlight = boundedLatestInFlight(options.latestMaxInFlight ?? 1, this.latestTransport === "websocket" ? 16 : 4);
     this.latestStreamReadyTimeoutMs = boundedStreamReadyTimeout(options.latestStreamReadyTimeoutMs ?? 2_000);
     this.latestReceiptTimeoutMs = boundedReceiptTimeout(options.latestReceiptTimeoutMs ?? 2_000);
     // This applies only to the separately authenticated telemetry socket.
@@ -287,7 +291,11 @@ export class DirectMotionJobClient implements MotionJobTransport {
     return {
       state: "queued",
       input_sequence: payload.sequence,
-      delivery: "latest_only_sdk_mailbox",
+      // `desired_state_accepted` is SDK mailbox admission only. Keep the old
+      // name for applications that have not yet migrated their UI copy.
+      delivery: "desired_state_accepted",
+      legacy_delivery: "latest_only_sdk_mailbox",
+      desired_state_key: desiredStateKey(payload),
     };
   }
 
@@ -357,8 +365,17 @@ export class DirectMotionJobClient implements MotionJobTransport {
       request = receipt.then((value) => {
         this.publishLatestObservation({ jobId, inputSequence, state: "queued", sentAtMs, observedAtMs: this.now(), receipt: value });
       }, (error) => {
-        this.latestError = error;
-        this.publishLatestObservation({ jobId, inputSequence, state: "failed", sentAtMs, observedAtMs: this.now(), error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        // A lost public receipt cannot prove rejection or authority loss. The
+        // current desired state remains replaceable and a subsequent input
+        // sends a new current frame; do not turn receipt uncertainty into a
+        // session-level local failure.
+        if (isReceiptUncertain(error)) {
+          this.publishLatestObservation({ jobId, inputSequence, state: "receipt_unknown", sentAtMs, observedAtMs: this.now(), error: message });
+        } else {
+          this.latestError = error;
+          this.publishLatestObservation({ jobId, inputSequence, state: "failed", sentAtMs, observedAtMs: this.now(), error: message });
+        }
       }).finally(() => { this.latestInFlight.delete(request); this.pumpLatestUpdates(); });
       this.latestInFlight.add(request);
     }
@@ -489,10 +506,11 @@ function latestPendingFrame(payload: Record<string, unknown>, timeoutMs: number 
       chainTargets.set(item.chain, { value: { ...item }, createdAtMs });
     }
   }
+  const auxiliaryTargets = new Map<string, LatestFragment<unknown[]>>();
   const rawAuxiliary = payload.auxiliary_joint_targets;
-  const auxiliaryTargets = Array.isArray(rawAuxiliary)
-    ? { value: [...rawAuxiliary], createdAtMs }
-    : null;
+  if (Array.isArray(rawAuxiliary)) {
+    auxiliaryTargets.set(auxiliaryFragmentKey(rawAuxiliary), { value: [...rawAuxiliary], createdAtMs });
+  }
   return { payload, timeoutMs, createdAtMs, chainTargets, auxiliaryTargets };
 }
 
@@ -525,13 +543,16 @@ function mergeLatestPending(previous: LatestPending, next: LatestPending): Lates
   if (previousContract === null || nextContract === null || previousContract !== nextContract) return next;
   const chainTargets = new Map(previous.chainTargets);
   for (const [chain, fragment] of next.chainTargets) chainTargets.set(chain, fragment);
-  const earliestSourceAtMs = Math.min(previous.createdAtMs, next.createdAtMs);
+  const auxiliaryTargets = new Map(previous.auxiliaryTargets);
+  for (const [key, fragment] of next.auxiliaryTargets) auxiliaryTargets.set(key, fragment);
+  // This is a replaceable desired-state snapshot, not a trajectory. The
+  // envelope timestamp must identify its newest user intent. Individual stale
+  // fragments are removed below before they can reach the public mailbox.
   return {
     ...next,
-    payload: { ...next.payload, client_created_at_ms: earliestSourceAtMs },
-    createdAtMs: earliestSourceAtMs,
+    payload: { ...next.payload, client_created_at_ms: next.createdAtMs },
     chainTargets,
-    auxiliaryTargets: next.auxiliaryTargets ?? previous.auxiliaryTargets,
+    auxiliaryTargets,
   };
 }
 
@@ -543,18 +564,44 @@ function freshLatestPayload(pending: LatestPending, now: number, maxAgeMs: numbe
   const freshChains = [...pending.chainTargets.values()]
     .filter(fragment => now - fragment.createdAtMs <= maxAgeMs)
     .map(fragment => fragment.value);
-  const freshAuxiliary = pending.auxiliaryTargets !== null && now - pending.auxiliaryTargets.createdAtMs <= maxAgeMs
-    ? pending.auxiliaryTargets.value
-    : null;
-  if (!freshChains.length && freshAuxiliary === null) return null;
-  const sourceAtMs = Math.min(
+  const freshAuxiliary = [...pending.auxiliaryTargets.values()]
+    .filter(fragment => now - fragment.createdAtMs <= maxAgeMs);
+  if (!freshChains.length && !freshAuxiliary.length) return null;
+  const sourceAtMs = Math.max(
     ...[...pending.chainTargets.values()].filter(fragment => now - fragment.createdAtMs <= maxAgeMs).map(fragment => fragment.createdAtMs),
-    ...(freshAuxiliary === null ? [] : [pending.auxiliaryTargets!.createdAtMs]),
+    ...freshAuxiliary.map(fragment => fragment.createdAtMs),
   );
   const payload: Record<string, unknown> = { ...pending.payload, client_created_at_ms: sourceAtMs, chain_targets: freshChains };
   delete payload.auxiliary_joint_targets;
-  if (freshAuxiliary !== null) payload.auxiliary_joint_targets = freshAuxiliary;
+  if (freshAuxiliary.length) payload.auxiliary_joint_targets = freshAuxiliary.flatMap(fragment => fragment.value);
   return payload;
+}
+
+/** Stable group identity lets two gripper pairs coalesce independently. */
+function auxiliaryFragmentKey(targets: readonly unknown[]): string {
+  const names = targets.map(target => target && typeof target === "object" && !Array.isArray(target)
+    ? (target as Record<string, unknown>).joint_name
+    : undefined);
+  return names.every(name => typeof name === "string" && name.length > 0)
+    ? `auxiliary:${[...names as string[]].sort().join(",")}`
+    : `auxiliary:${stableJson(targets)}`;
+}
+
+/** A transport/mutation ambiguity is evidence to observe, not a rejected desired state. */
+function isReceiptUncertain(error: unknown): boolean {
+  if (!(error instanceof MotionControlError)) return true;
+  return error.payload.code === "MOTION_APPLICATION_UNKNOWN"
+    || error.payload.code === "MOTION_REQUEST_TIMEOUT"
+    || error.payload.code === "MOTION_TRANSPORT_ERROR";
+}
+
+/** A UI-visible state key for a bounded direct desired-state mailbox. */
+function desiredStateKey(payload: Record<string, unknown>): string | undefined {
+  const jobId = typeof payload.job_id === "string" ? payload.job_id : undefined;
+  const chains = Array.isArray(payload.controlled_chains) && payload.controlled_chains.every(chain => typeof chain === "string")
+    ? [...payload.controlled_chains as string[]].sort().join(",")
+    : "";
+  return jobId ? `device_ik:${jobId}:${chains || "auxiliary"}` : undefined;
 }
 
 function stableJson(value: unknown): string {

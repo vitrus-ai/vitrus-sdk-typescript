@@ -103,11 +103,11 @@ test("a late old failure is observable but cannot replace newer public receipt s
   await new Promise((resolve) => setTimeout(resolve, 0));
   pending[0].reject(new Error("old request failed late"));
   await client.drainLatestUpdates().catch(() => undefined);
-  expect(seen).toContainEqual(expect.objectContaining({ inputSequence: 1, state: "failed" }));
+  expect(seen).toContainEqual(expect.objectContaining({ inputSequence: 1, state: "receipt_unknown" }));
   expect(client.latestUpdateStatus()).toMatchObject({ jobId: "job", inputSequence: 2, state: "queued" });
 });
 
-test("compatible pending chain fragments are combined without retaining an expired sibling", async () => {
+test("compatible pending chain and auxiliary fragments coalesce as current desired state without retaining an expired sibling", async () => {
   let now = 1_000;
   const bodies: Array<Record<string, unknown>> = [];
   const pending: Array<(response: Response) => void> = [];
@@ -139,6 +139,39 @@ test("compatible pending chain fragments are combined without retaining an expir
   ]);
   pending[1](response({ ok: true }));
   await client.drainLatestUpdates();
+
+  // Two pairs addressed independently while the mailbox is busy remain two
+  // atomic groups in the next desired-state snapshot.
+  const auxiliaryBodies: Array<Record<string, unknown>> = [];
+  const auxiliaryPending: Array<(response: Response) => void> = [];
+  const auxiliaryClient = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.example", apiKey: "test-api-key", ref: "R06",
+    latestOnlyUpdates: true, latestPendingMaxAgeMs: 500, now: () => now,
+    fetch: ((_input, init) => new Promise<Response>((resolve) => {
+      auxiliaryBodies.push((JSON.parse(String(init?.body)) as { payload: Record<string, unknown> }).payload);
+      auxiliaryPending.push(resolve);
+    })) as typeof fetch,
+  });
+  const auxiliaryFrame = (sequence: number, targets: unknown[]) => ({
+    job_id: "job", epoch: 1, sequence, controlled_chains: ["left_arm", "right_arm"], chain_targets: [],
+    auxiliary_joint_targets: targets,
+  });
+  // The first request occupies the single receipt slot. The next two UI
+  // events merge locally, preserving both independently keyed pairs.
+  auxiliaryClient.publishLatestUpdate(auxiliaryFrame(1, [{ joint_name: "PROBE", position_deg: 0 }]));
+  now += 10;
+  auxiliaryClient.publishLatestUpdate(auxiliaryFrame(2, [{ joint_name: "LEFT_BASE", position_deg: 1 }, { joint_name: "RIGHT_BASE", position_deg: -1 }]));
+  now += 10;
+  auxiliaryClient.publishLatestUpdate(auxiliaryFrame(3, [{ joint_name: "LEFT_DISTAL", position_deg: 2 }, { joint_name: "RIGHT_DISTAL", position_deg: -2 }]));
+  auxiliaryPending[0](response({ ok: true }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(auxiliaryBodies[1]).toMatchObject({ sequence: 3, client_created_at_ms: now });
+  expect(auxiliaryBodies[1].auxiliary_joint_targets).toEqual([
+    { joint_name: "LEFT_BASE", position_deg: 1 }, { joint_name: "RIGHT_BASE", position_deg: -1 },
+    { joint_name: "LEFT_DISTAL", position_deg: 2 }, { joint_name: "RIGHT_DISTAL", position_deg: -2 },
+  ]);
+  auxiliaryPending[1](response({ ok: true }));
+  await auxiliaryClient.drainLatestUpdates();
 
   // A retained intent retains its own source age.  A newer sibling must not
   // renew it merely by sharing the outgoing latest mailbox envelope.
