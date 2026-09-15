@@ -52,7 +52,7 @@ describe("MotionJobClient", () => {
   });
 });
 
-test("complete TCP frames retain all eight fingers at 20/30 deg/s and reject unsupported speeds", async () => {
+test("complete TCP frames retain all eight fingers through 60 deg/s and reject unsupported speeds", async () => {
   const fingers = ["LEFT", "RIGHT"].flatMap(side => ["LEFT", "RIGHT"].flatMap(finger => ["A", "B"].map(axis => `${side}_GRIPPER_${finger}_FINGER_${axis}`)));
   const job: MotionJob = { job_id: "test", epoch: 1, mode: "device_ik", state: "armed", joint_names: [...Array.from({length:18}, (_,i)=>`JOINT_${i}`), ...fingers], auxiliary_joint_names: fingers, configuration_revision: "test", last_sequence: 0 };
   const sent: Record<string, unknown>[] = [];
@@ -61,12 +61,12 @@ test("complete TCP frames retain all eight fingers at 20/30 deg/s and reject uns
     request: async <T>(_path: string, body?: Record<string, unknown>) => { sent.push(body!); return {ok:true, job, result:{accepted:true}} as T; },
   }, job);
   const frame = (speed: number) => ({controlledChains:["LEFT_ARM", "RIGHT_ARM", "NECK"], targets:["LEFT_ARM", "RIGHT_ARM", "NECK"].map(chain=>({chain,points:[{position_m:[0,0,0] as [number,number,number]}]})), auxiliaryJointTargets:fingers.map(joint_name=>({joint_name,position_deg:0,max_torque_nm:.3,velocity_deg_s:speed}))});
-  for (const speed of [20,30]) {
+  for (const speed of [20,30,60]) {
     await expect(session.updateDeviceIkFrame(frame(speed))).resolves.toMatchObject({accepted:true,clientInputSequence:expect.any(Number)});
     expect(sent.at(-1)?.auxiliary_joint_targets).toEqual(frame(speed).auxiliaryJointTargets);
   }
-  for (const speed of [31,0,NaN]) await expect(session.updateDeviceIkFrame(frame(speed))).rejects.toThrow("velocity_deg_s <= 30");
-  expect(sent).toHaveLength(2);
+  for (const speed of [61,0,NaN]) await expect(session.updateDeviceIkFrame(frame(speed))).rejects.toThrow("velocity_deg_s <= 60");
+  expect(sent).toHaveLength(3);
 });
 
 test("a correlated continuous frame preserves an explicit ingress timestamp for Edge expiry", async () => {
