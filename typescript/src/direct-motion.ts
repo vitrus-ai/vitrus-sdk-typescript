@@ -144,6 +144,11 @@ type LatestPending = {
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_START_TIMEOUT_MS = 20_000;
 const MAX_TIMEOUT_MS = 25_000;
+// A start may have reached Edge even when its correlated HTTP response misses
+// the first deadline. The dataplane retains and deduplicates that request ID,
+// so querying the same ID is the only mutation-safe way to learn its result.
+const START_RESULT_RECONCILE_MS = 30_000;
+const START_RESULT_RECONCILE_INTERVAL_MS = 250;
 /** The public latest route is a source-freshness mailbox, never a long poll. */
 const LATEST_SOURCE_DEADLINE_MS = 500;
 const OPERATIONS: Record<string, DirectMotionOperation> = {
@@ -463,8 +468,6 @@ export class DirectMotionJobClient implements MotionJobTransport {
     const timeout = boundedTimeout(timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS);
     const requestId = createRequestId();
     const readOnly = operation === "status" || operation === "execution" || operation === "feedback";
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
     // Only continuous device-IK frames use the nonblocking mailbox route.
     // Start, stop, hold, heartbeat, safety, and all reads retain their exact
     // correlated Edge result semantics.
@@ -473,34 +476,54 @@ export class DirectMotionJobClient implements MotionJobTransport {
       : `/v1/droids/motion/direct/${operation}`;
     const url = new URL(`${this.endpoint}${path}`);
     url.searchParams.set("ref", this.ref);
-    try {
-      const response = await this.fetchImpl(url.toString(), {
-        method: "POST",
-        headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json", "x-vitrus-trace-id": requestId },
-        body: JSON.stringify({ request_id: requestId, payload, timeout_ms: timeout }),
-        signal: controller.signal,
-      });
-      // Do not turn a deadline abort during body consumption into a malformed
-      // JSON response. Fetch implementations may resolve headers first and only
-      // reject response.json() when the abort reaches the body reader.
-      let result: MotionErrorPayload | T | null;
+    const body = JSON.stringify({ request_id: requestId, payload, timeout_ms: timeout });
+    // Source-frame tests may inject a synthetic `now`; lifecycle waiting must
+    // use the real monotonic process clock so a frozen source clock cannot
+    // create an unbounded reconciliation loop.
+    const reconcileDeadline = performance.now() + START_RESULT_RECONCILE_MS;
+    while (true) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
       try {
-        result = await response.json() as MotionErrorPayload | T;
+        const response = await this.fetchImpl(url.toString(), {
+          method: "POST",
+          headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json", "x-vitrus-trace-id": requestId },
+          body,
+          signal: controller.signal,
+        });
+        // Do not turn a deadline abort during body consumption into a malformed
+        // JSON response. Fetch implementations may resolve headers first and only
+        // reject response.json() when the abort reaches the body reader.
+        let result: MotionErrorPayload | T | null;
+        try {
+          result = await response.json() as MotionErrorPayload | T;
+        } catch (error) {
+          if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+          result = null;
+        }
+        if (!response.ok) {
+          const responseFailure = responseError(result, response.status, response.statusText, requestId, readOnly);
+          if (operation === "start" && responseFailure.payload.code === "MOTION_APPLICATION_UNKNOWN" && performance.now() < reconcileDeadline) {
+            await new Promise(resolve => setTimeout(resolve, START_RESULT_RECONCILE_INTERVAL_MS));
+            continue;
+          }
+          throw responseFailure;
+        }
+        if (!result || typeof result !== "object") throw invalidResponse("direct motion service returned invalid JSON", requestId);
+        return result as T;
       } catch (error) {
-        if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
-        result = null;
+        if (error instanceof MotionControlError) throw error;
+        const applicationUnknown = controller.signal.aborted || (error instanceof Error && error.name === "AbortError")
+          ? new MotionControlError({ ok: false, error: `direct motion request timed out after ${timeout} ms`, code: readOnly ? "MOTION_REQUEST_TIMEOUT" : "MOTION_APPLICATION_UNKNOWN", domain: "transport", retryable: readOnly, trace_id: requestId }, 504)
+          : new MotionControlError({ ok: false, error: error instanceof Error ? error.message : String(error), code: readOnly ? "MOTION_TRANSPORT_ERROR" : "MOTION_APPLICATION_UNKNOWN", domain: "transport", retryable: readOnly, trace_id: requestId }, 503);
+        if (operation === "start" && applicationUnknown.payload.code === "MOTION_APPLICATION_UNKNOWN" && performance.now() < reconcileDeadline) {
+          await new Promise(resolve => setTimeout(resolve, START_RESULT_RECONCILE_INTERVAL_MS));
+          continue;
+        }
+        throw applicationUnknown;
+      } finally {
+        clearTimeout(timer);
       }
-      if (!response.ok) throw responseError(result, response.status, response.statusText, requestId, readOnly);
-      if (!result || typeof result !== "object") throw invalidResponse("direct motion service returned invalid JSON", requestId);
-      return result as T;
-    } catch (error) {
-      if (error instanceof MotionControlError) throw error;
-      if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
-        throw new MotionControlError({ ok: false, error: `direct motion request timed out after ${timeout} ms`, code: readOnly ? "MOTION_REQUEST_TIMEOUT" : "MOTION_APPLICATION_UNKNOWN", domain: "transport", retryable: readOnly, trace_id: requestId }, 504);
-      }
-      throw new MotionControlError({ ok: false, error: error instanceof Error ? error.message : String(error), code: readOnly ? "MOTION_TRANSPORT_ERROR" : "MOTION_APPLICATION_UNKNOWN", domain: "transport", retryable: readOnly, trace_id: requestId }, 503);
-    } finally {
-      clearTimeout(timer);
     }
   }
 }

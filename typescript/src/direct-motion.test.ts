@@ -268,6 +268,25 @@ test("ambiguous public mutations are never advertised as retryable", async () =>
   }
 });
 
+test("ambiguous start reconciles the retained result with the same request id", async () => {
+  let calls = 0;
+  const requestIds: string[] = [];
+  const client = new DirectMotionJobClient({
+    endpoint: "https://vitrus-dataplane.onrender.com", apiKey: "test-api-key", ref: "R06",
+    fetch: (async (_input, init) => {
+      calls += 1;
+      const envelope = JSON.parse(String(init?.body)) as { request_id: string };
+      requestIds.push(envelope.request_id);
+      if (calls === 1) return response({ ok: false, error: "direct_motion_application_unknown", request_id: envelope.request_id }, 504);
+      return response({ ok: true, job: job("hold"), initial_feedback: { fresh: true }, prime_receipt: { accepted: 1 } });
+    }) as typeof fetch,
+  });
+  const started = await client.startWithReceipt({ mode: "device_ik", owner: "sdk-control", jointNames: ["LEFT_SHOULDER_A"] });
+  expect(started.session.id).toBe("direct-job-1");
+  expect(calls).toBe(2);
+  expect(requestIds[0]).toBe(requestIds[1]);
+});
+
 test("definite native direct-control rejections preserve the native code and message", async () => {
   let calls = 0;
   const client = new DirectMotionJobClient({
