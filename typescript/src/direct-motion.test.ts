@@ -43,6 +43,7 @@ test("Droid.connect exposes native direct motion only through the public datapla
     const started = await droid.motion.direct.startWithReceipt({
       mode: "device_ik", owner: "mac-test", jointNames: ["LEFT_SHOULDER_A"],
       auxiliaryJointNames: ["LEFT_SHOULDER_A"], intentMode: "continuous_setpoint", targetLivenessMs: 3_000,
+      takeOver: true,
     });
     expect(started.initialFeedback).toEqual({ fresh: true });
     expect(started.primeReceipt).toEqual({ accepted: 1 });
@@ -93,7 +94,8 @@ test("Droid.connect exposes native direct motion only through the public datapla
     const startPayload = requests.find(({ url }) => url.pathname.endsWith("/start"))!.body.payload as Record<string, unknown>;
     expect(startPayload).toEqual({
       mode: "device_ik", owner: "mac-test", joint_names: ["LEFT_SHOULDER_A"],
-      auxiliary_joint_names: ["LEFT_SHOULDER_A"], intent_mode: "continuous_setpoint", target_liveness_ms: 3_000,
+      take_over: true, auxiliary_joint_names: ["LEFT_SHOULDER_A"],
+      intent_mode: "continuous_setpoint", target_liveness_ms: 3_000,
     });
     const updatePayload = requests.find(({ url }) => url.pathname.endsWith("/update"))!.body.payload as Record<string, unknown>;
     expect(updatePayload).toMatchObject({ job_id: "direct-job-1", epoch: 1, sequence: 1, controlled_chains: ["left_arm"] });

@@ -236,6 +236,7 @@ export class DirectMotionJobClient implements MotionJobTransport {
       mode: options.mode,
       owner: requiredText(options.owner, "owner"),
       joint_names: names,
+      ...(options.takeOver === true ? { take_over: true } : {}),
       ...(auxiliaryNames === undefined ? {} : { auxiliary_joint_names: auxiliaryNames }),
       ...(options.jobId ? { job_id: requiredText(options.jobId, "jobId") } : {}),
       ...(options.configurationRevision ? { configuration_revision: options.configurationRevision } : {}),

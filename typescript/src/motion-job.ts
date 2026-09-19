@@ -71,6 +71,12 @@ export type MotionJobStartOptions = {
   mode: MotionMode;
   owner: string;
   jointNames: string[];
+  /**
+   * Explicitly replace the active direct-motion owner while retaining the
+   * Edge-held pose and broker authority. A successful newer takeover fences
+   * every older job identity. Defaults to false.
+   */
+  takeOver?: boolean;
   /** Optional servo-only subset of jointNames. Available for device_ik jobs. */
   auxiliaryJointNames?: string[];
   jobId?: string;
