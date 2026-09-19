@@ -34,6 +34,7 @@ def test_edge_sdk_reads_pose_camera_and_sends_full_pose():
             assert body["sequence"] == 5
             assert body["points"][0]["position_m"] == [0.1, 0.2, 0.35]
             assert body["points"][0]["orientation_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+            assert body["ttl_ms"] == 5_000
             return httpx.Response(200, json={"ok": True, "job": {
                 "job_id": "job-1", "epoch": 2, "last_sequence": 5, "state": "active",
             }})
@@ -100,6 +101,40 @@ def test_edge_sdk_sends_atomic_pose_and_gripper_auxiliaries():
         "RIGHT_GRIPPER_LEFT_FINGER_A", "RIGHT_GRIPPER_RIGHT_FINGER_A"
     ]
     assert len(observed["update"]["auxiliary_joint_targets"]) == 2
+    assert observed["update"]["ttl_ms"] == 5_000
+
+
+def test_edge_sdk_bootstraps_native_stream_with_auxiliaries_only():
+    observed = {}
+
+    def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/api/v2/motion/start":
+            return httpx.Response(200, json={"ok": True, "job": {
+                "job_id": "job-bootstrap", "epoch": 1, "last_sequence": 0, "state": "armed",
+            }})
+        observed["update"] = body
+        return httpx.Response(200, json={"ok": True, "job": {
+            "job_id": "job-bootstrap", "epoch": 1, "last_sequence": 1, "state": "running",
+        }})
+
+    async def exercise():
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        sdk = VitrusEdgeClient(robot_id="r06", motion_endpoint="http://edge", http_client=http)
+        finger = "RIGHT_GRIPPER_LEFT_FINGER_A"
+        session = await sdk.start_device_ik(
+            owner="test", joint_names=["RIGHT_SHOULDER_A", finger],
+            auxiliary_joint_names=[finger],
+        )
+        await session.send_auxiliaries([{
+            "joint_name": finger, "position_deg": 12, "max_torque_nm": .15, "velocity_deg_s": 30,
+        }], controlled_chains=["RIGHT_ARM"])
+        await http.aclose()
+
+    asyncio.run(exercise())
+    assert observed["update"]["chain_targets"] == []
+    assert observed["update"]["controlled_chains"] == ["RIGHT_ARM"]
+    assert observed["update"]["auxiliary_joint_targets"][0]["position_deg"] == 12
 
 
 def test_device_name_sdk_uses_only_authenticated_public_routes():

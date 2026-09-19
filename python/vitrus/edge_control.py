@@ -24,6 +24,29 @@ def _finite_vector(value: Any, size: int, name: str) -> List[float]:
     return result
 
 
+def _auxiliary_targets(raw_targets: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result = []
+    for raw in raw_targets:
+        if not isinstance(raw, dict):
+            raise ValueError("auxiliary_joint_targets must contain objects")
+        allowed = {"joint_name", "position_deg", "max_torque_nm", "velocity_deg_s"}
+        if set(raw) - allowed:
+            raise ValueError("unsupported auxiliary target field")
+        name = str(raw.get("joint_name", "")).strip()
+        position = float(raw.get("position_deg"))
+        torque = float(raw.get("max_torque_nm", 0.15))
+        velocity = float(raw.get("velocity_deg_s", 30.0))
+        if not name or not all(math.isfinite(value) for value in (position, torque, velocity)):
+            raise ValueError("auxiliary target values must be finite")
+        if not 0 < torque <= 0.35 or not 0 < velocity <= 60:
+            raise ValueError("auxiliary target torque/speed exceeds the public SDK envelope")
+        result.append({"joint_name": name, "position_deg": position,
+                       "max_torque_nm": torque, "velocity_deg_s": velocity})
+    if not result:
+        raise ValueError("auxiliary_joint_targets cannot be empty")
+    return result
+
+
 @dataclass(frozen=True)
 class DeviceIkPose:
     chain: str
@@ -97,6 +120,7 @@ class MotionJobSession:
         body = self._identity()
         body.update({
             "sequence": self._sequence,
+            "ttl_ms": min(30_000, max(int(duration_ms) + 2_000, int(duration_ms) * 2)),
             "chain": str(chain),
             "controlled_chains": list(controlled_chains or [chain]),
             "task_mode": "pose",
@@ -130,27 +154,12 @@ class MotionJobSession:
             raise ValueError("duration_ms must be between 1 and 60000")
         auxiliary = None
         if auxiliary_joint_targets is not None:
-            auxiliary = []
-            for raw in auxiliary_joint_targets:
-                if not isinstance(raw, dict):
-                    raise ValueError("auxiliary_joint_targets must contain objects")
-                allowed = {"joint_name", "position_deg", "max_torque_nm", "velocity_deg_s"}
-                if set(raw) - allowed:
-                    raise ValueError("unsupported auxiliary target field")
-                name = str(raw.get("joint_name", "")).strip()
-                position_deg = float(raw.get("position_deg"))
-                torque = float(raw.get("max_torque_nm", 0.15))
-                velocity = float(raw.get("velocity_deg_s", 30.0))
-                if not name or not all(math.isfinite(value) for value in (position_deg, torque, velocity)):
-                    raise ValueError("auxiliary target values must be finite")
-                if not 0 < torque <= 0.35 or not 0 < velocity <= 60:
-                    raise ValueError("auxiliary target torque/speed exceeds the public SDK envelope")
-                auxiliary.append({"joint_name": name, "position_deg": position_deg,
-                                  "max_torque_nm": torque, "velocity_deg_s": velocity})
+            auxiliary = _auxiliary_targets(auxiliary_joint_targets)
         self._sequence += 1
         body = self._identity()
         body.update({
             "sequence": self._sequence,
+            "ttl_ms": min(30_000, max(int(duration_ms) + 2_000, int(duration_ms) * 2)),
             "chain": str(chain),
             "controlled_chains": list(controlled_chains or [chain]),
             "task_mode": "pose",
@@ -168,23 +177,54 @@ class MotionJobSession:
         )
         return self._adopt(response)
 
+    async def send_auxiliaries(
+        self,
+        auxiliary_joint_targets: Iterable[Dict[str, Any]],
+        *,
+        controlled_chains: Iterable[str],
+        duration_ms: int = 500,
+        intent_mode: str = "execute_goal",
+    ) -> Dict[str, Any]:
+        """Atomically update declared servo auxiliaries without invoking Cartesian IK."""
+        auxiliary = _auxiliary_targets(auxiliary_joint_targets)
+        chains = list(dict.fromkeys(str(chain).strip() for chain in controlled_chains if str(chain).strip()))
+        if not chains:
+            raise ValueError("controlled_chains cannot be empty")
+        if not 1 <= int(duration_ms) <= 60_000:
+            raise ValueError("duration_ms must be between 1 and 60000")
+        self._sequence += 1
+        body = self._identity()
+        body.update({
+            "sequence": self._sequence,
+            "ttl_ms": min(30_000, max(int(duration_ms) + 2_000, int(duration_ms) * 2)),
+            "controlled_chains": chains,
+            "chain_targets": [],
+            "auxiliary_joint_targets": auxiliary,
+            "intent_mode": intent_mode,
+        })
+        response = await self._client._motion_request(
+            "POST", "/api/v2/motion/update", body, self._client.request_timeout_s
+        )
+        return self._adopt(response)
+
     async def send_position(
         self,
         chain: str,
         position_m: Iterable[float],
         *,
-        duration_ms: int = 500,
+        duration_ms: int = 2500,
         intent_mode: str = "execute_goal",
         controlled_chains: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         """Send a position-prioritized Cartesian target without inventing orientation."""
         position = _finite_vector(list(position_m), 3, "position_m")
-        if not 1 <= int(duration_ms) <= 500:
-            raise ValueError("duration_ms must be between 1 and 500")
+        if not 1 <= int(duration_ms) <= 60_000:
+            raise ValueError("duration_ms must be between 1 and 60000")
         self._sequence += 1
         body = self._identity()
         body.update({
             "sequence": self._sequence,
+            "ttl_ms": min(30_000, max(int(duration_ms) + 2_000, int(duration_ms) * 2)),
             "chain": str(chain),
             "controlled_chains": list(controlled_chains or [chain]),
             "task_mode": "position_only",
