@@ -233,6 +233,28 @@ Hold/Stop discard unsent targets and retain a separate priority lane. After
 packet loss, publish a fresh current desired pose; do not replay an ambiguous
 command or automatically start a new DRIVE session.
 
+### Explicit direct-motion takeover
+
+An operator or application may replace the current direct-motion owner with one
+atomic start request:
+
+```ts
+const { session, receipt } = await device.motion.direct.startWithReceipt({
+  mode: "device_ik",
+  owner: "my-controller",
+  jointNames,
+  auxiliaryJointNames,
+  configurationRevision,
+  takeOver: true,
+});
+```
+
+`takeOver` is opt-in. A successful request fences the previous job identity,
+holds the robot's measured pose on the Edge, and transfers the existing broker
+lease to the new job without an intermediate STOP/reacquire cycle. The requested
+joint and auxiliary scopes must exactly match the active job. If the result is
+ambiguous, query direct-motion status; never replay the start blindly.
+
 On updated r05-edge, successive single-point TCP targets are interpolated from
 the current Cartesian reference with smoothstep translation and shortest-arc
 quaternion interpolation. The native joint tracker additionally enforces its
