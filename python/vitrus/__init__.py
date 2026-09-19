@@ -5,6 +5,7 @@ import os
 import uuid
 import inspect
 from .droid import Droid
+from .edge_control import CameraFrame, DeviceIkPose, EdgeControlError, MotionJobSession, VitrusDroidClient, VitrusEdgeClient
 from typing import (
     Any,
     Dict,
