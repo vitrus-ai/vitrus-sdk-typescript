@@ -28,6 +28,46 @@ The first argument may be a serial, display name/alias, or an object with
 display-name matching in the Bridge. `Droid` and `droidId` remain compatibility
 aliases; new client code should use `Device` and `deviceId`.
 
+## Fred Haise agent runtime
+
+`FredHaiseClient` talks to Fred's planning and supervision service. Its discovery
+response identifies `r06a` as the physical robot and `fred-haise` as the separate
+agent runtime. `planTrajectory()` returns a review-only plan, while
+`approvePlan()` returns a submission-for-validation receipt. Neither call is a
+robot motion receipt; physical authority remains with the Vitrus SDK and Edge
+safety boundary. The Fred `/api/v1` service must be running and configured for
+the supplied origin and CSRF token. In a browser, the browser supplies `Origin`;
+the `origin` option is used when this client runs in a server-side SDK process.
+
+```ts
+import { FredHaiseClient } from "vitrus";
+
+const fred = new FredHaiseClient({
+  baseUrl: "http://127.0.0.1:8898",
+  origin: "http://127.0.0.1:8898",
+  csrf: process.env.FRED_AGENT_CSRF!,
+});
+
+const { resources } = await fred.discovery();
+// [{ id: "r06a", type: "robot", ... }, { id: "fred-haise", type: "agent_runtime", ... }]
+const plan = await fred.planTrajectory({
+  terminal: "LEFT_ARM_TCP",
+  position_m: [0.2, -0.1, 0.3],
+  orientation_xyzw: [0, 0, 0, 1],
+});
+if (plan.status !== "review_only" || plan.execution_started) throw new Error("Unexpected plan receipt");
+
+// After an operator reviews this exact plan and chooses to submit it:
+// const receipt = await fred.approvePlan(plan.plan.id, plan.plan.hash);
+// receipt.status === "submitted_for_validation"; it does not confirm motion.
+```
+
+The example in [`examples/fred-haise-agent-runtime.mts`](examples/fred-haise-agent-runtime.mts)
+shows the discovery, task, status, preview, and approval calls through Fred's
+service. Run it only when Fred's `/api/v1` service is active. For the Mac UI proxy,
+use `baseUrl: "http://127.0.0.1:8899/fred/brain"` and
+`origin: "http://127.0.0.1:8899"` instead.
+
 ## Read a camera frame
 
 ```ts
