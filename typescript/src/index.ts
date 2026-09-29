@@ -4,6 +4,7 @@ export * from './golden-edge.js';
 export * from './motion-job.js';
 export * from './direct-motion.js';
 export * from './camera-live.js';
+export * from './fred-haise-client.js';
 export * from './ik-execution.js';
 
 export * from './droid-live.js';
